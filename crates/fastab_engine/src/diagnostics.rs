@@ -35,6 +35,9 @@ pub struct HookCatalogDiagnostics {
     pub adapter_entries: usize,
     pub descriptor_count: usize,
     pub parsed_descriptor_count: usize,
+    /// Retained one-shot sidecar allocation from snapshot hashing, not process footprint.
+    #[serde(default)]
+    pub captured_bytes: usize,
 }
 
 /// Parsed file resources; counts deduplicate paths, bytes deduplicate live trees.
@@ -123,5 +126,13 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("hook_catalog");
         let restored: super::EngineDiagnostics = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.hook_catalog, Default::default());
+    }
+
+    #[test]
+    fn catalog_snapshots_without_captured_bytes_still_deserialize() {
+        let mut legacy = serde_json::to_value(super::HookCatalogDiagnostics::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("captured_bytes");
+        let restored: super::HookCatalogDiagnostics = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.captured_bytes, 0);
     }
 }

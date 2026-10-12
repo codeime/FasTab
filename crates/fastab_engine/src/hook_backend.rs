@@ -4,8 +4,8 @@
 //! and returns empty — there is no QuickJS fallback.
 
 use std::cell::{Cell, RefCell};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
@@ -25,35 +25,63 @@ use crate::typed_hook::{
 const TYPED_HOOKS_FILE: &str = "typed-hooks.json";
 
 pub struct NativeHooks {
-    catalog: Option<RuntimeTypedHookCatalog>,
+    source: Option<NativeHookSource>,
+    // None inside the initialized cell means missing/rejected, not unloaded.
+    catalog: OnceLock<Option<RuntimeTypedHookCatalog>>,
+}
+
+struct NativeHookSource {
+    specs_dir: PathBuf,
+    snapshot: Option<DirectorySnapshot>,
 }
 
 impl NativeHooks {
     #[cfg(test)]
     pub(crate) fn from_catalog(catalog: crate::typed_hook::TypedHookCatalog) -> Self {
         Self {
-            catalog: Some(catalog.into_runtime()),
+            source: None,
+            catalog: OnceLock::from(Some(catalog.into_runtime())),
         }
     }
 
-    pub fn load(specs_dir: &Path, snapshot: Option<&DirectorySnapshot>) -> Self {
-        let typed_bytes = read_sidecar(specs_dir, snapshot, TYPED_HOOKS_FILE);
-        let catalog = typed_bytes
-            .as_deref()
-            .and_then(|bytes| match parse_typed_hook_catalog_bytes(bytes) {
-                Ok(catalog) => Some(catalog.into_runtime()),
-                Err(error) => {
-                    tracing::warn!(%error, "typed hook catalog rejected");
-                    None
-                },
-            });
-        Self { catalog }
+    /// Bind one generation without reading or parsing its sidecar. Only a
+    /// real dispatch calls `catalog`; static completion and diagnostics do not.
+    pub(crate) fn new(specs_dir: &Path, snapshot: Option<DirectorySnapshot>) -> Self {
+        Self {
+            source: Some(NativeHookSource {
+                specs_dir: specs_dir.to_path_buf(),
+                snapshot,
+            }),
+            catalog: OnceLock::new(),
+        }
+    }
+
+    fn catalog(&self) -> Option<&RuntimeTypedHookCatalog> {
+        self.catalog
+            .get_or_init(|| {
+                let source = self.source.as_ref()?;
+                let typed_bytes = read_sidecar(&source.specs_dir, source.snapshot.as_ref(), TYPED_HOOKS_FILE)?;
+                match parse_typed_hook_catalog_bytes(&typed_bytes) {
+                    Ok(catalog) => Some(catalog.into_runtime()),
+                    Err(error) => {
+                        tracing::warn!(%error, "typed hook catalog rejected");
+                        None
+                    },
+                }
+            })
+            .as_ref()
     }
 
     pub(crate) fn diagnostics(&self) -> crate::diagnostics::HookCatalogDiagnostics {
-        let Some(catalog) = self.catalog.as_ref() else {
+        let captured_bytes = self
+            .source
+            .as_ref()
+            .and_then(|source| source.snapshot.as_ref())
+            .map_or(0, DirectorySnapshot::captured_bytes);
+        let Some(catalog) = self.catalog.get().and_then(Option::as_ref) else {
             return crate::diagnostics::HookCatalogDiagnostics {
-                load_attempted: true,
+                load_attempted: self.catalog.get().is_some(),
+                captured_bytes,
                 ..Default::default()
             };
         };
@@ -65,6 +93,17 @@ impl NativeHooks {
             adapter_entries: catalog.adapters.len(),
             descriptor_count,
             parsed_descriptor_count,
+            captured_bytes,
+        }
+    }
+}
+
+impl Drop for NativeHooks {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.source.as_ref().and_then(|source| source.snapshot.as_ref()) {
+            // The worker's pristine Registry shares this snapshot; dropping
+            // just this owner would leave its unconsumed bytes there forever.
+            snapshot.release_captured_files();
         }
     }
 }
@@ -325,7 +364,7 @@ pub fn dispatch_generate_spec(hook_id: &str, tokens: &[String], cwd: &str, timeo
 }
 
 fn typed_entry<'a>(native: &'a NativeHooks, hook_id: &str) -> Result<Option<&'a TypedHookIr>, TypedHookError> {
-    let Some(catalog) = native.catalog.as_ref() else {
+    let Some(catalog) = native.catalog() else {
         return Ok(None);
     };
     match catalog.hooks.get(hook_id) {
@@ -335,7 +374,7 @@ fn typed_entry<'a>(native: &'a NativeHooks, hook_id: &str) -> Result<Option<&'a 
 }
 
 fn adapter_sha<'a>(native: &'a NativeHooks, hook_id: &str, field: &str) -> Option<&'a str> {
-    let entry = native.catalog.as_ref()?.adapters.get(hook_id)?;
+    let entry = native.catalog()?.adapters.get(hook_id)?;
     (entry.source_field == field).then_some(entry.function_body_sha256.as_str())
 }
 
@@ -811,7 +850,13 @@ mod tests {
 
     fn adapter_only_hooks(id: &str, field: &str, sha: &str) -> NativeHooks {
         use crate::typed_hook::parse_typed_hook_catalog;
-        let catalog = serde_json::json!({
+        NativeHooks::from_catalog(
+            parse_typed_hook_catalog(&adapter_only_catalog(id, field, sha)).expect("adapter catalog"),
+        )
+    }
+
+    fn adapter_only_catalog(id: &str, field: &str, sha: &str) -> JsonValue {
+        serde_json::json!({
             "version": 1,
             "kind": "typed-hook-expressions",
             "contracts": test_sidecar_contracts(),
@@ -823,8 +868,7 @@ mod tests {
                     "functionBodySha256": sha,
                 }
             }
-        });
-        NativeHooks::from_catalog(parse_typed_hook_catalog(&catalog).expect("adapter catalog"))
+        })
     }
 
     fn sleep_request(timeout_ms: i64) -> AdapterExecRequest {
@@ -939,7 +983,15 @@ mod tests {
                 ..ExecRule::default()
             },
         ]);
-        let native = Arc::new(adapter_only_hooks("make#custom#0", "custom", MAKE_TARGETS_SHA));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(TYPED_HOOKS_FILE),
+            adapter_only_catalog("make#custom#0", "custom", MAKE_TARGETS_SHA).to_string(),
+        )
+        .unwrap();
+        let snapshot = DirectorySnapshot::open(dir.path()).unwrap();
+        let native = Arc::new(NativeHooks::new(dir.path(), Some(snapshot)));
+        assert!(!native.diagnostics().load_attempted);
         let _bound = bind_native(Arc::clone(&native));
         let rows = dispatch_custom(
             "make#custom#0",
@@ -950,6 +1002,8 @@ mod tests {
             false,
         )
         .expect("make targets");
+        assert_eq!(native.diagnostics().adapter_entries, 1);
+        assert_eq!(native.diagnostics().captured_bytes, 0);
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["zeta", "alpha", "mid", "omega"]);
         assert_eq!(
@@ -959,8 +1013,33 @@ mod tests {
     }
 
     #[test]
+    fn skipped_or_cancelled_dispatch_does_not_initialize_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(TYPED_HOOKS_FILE), b"invalid JSON").unwrap();
+        let snapshot = DirectorySnapshot::open(dir.path()).unwrap();
+        let native = Arc::new(NativeHooks::new(dir.path(), Some(snapshot)));
+        let _bound = bind_native(Arc::clone(&native));
+        assert!(without_hooks(|| dispatch_trigger("demo#trigger#0", "a", "b")).is_none());
+        {
+            let token = crate::cancellation::CancellationToken::new();
+            token.cancel();
+            let _scope = crate::cancellation::enter(token);
+            assert!(dispatch_trigger("demo#trigger#0", "a", "b").is_none());
+        }
+        assert!(!native.diagnostics().load_attempted);
+        assert!(native.diagnostics().captured_bytes > 0);
+        assert!(dispatch_trigger("demo#trigger#0", "a", "b").is_none());
+        assert!(native.diagnostics().load_attempted);
+        assert!(!native.diagnostics().loaded);
+        assert_eq!(native.diagnostics().captured_bytes, 0);
+    }
+
+    #[test]
     fn native_miss_records_source_missing_and_returns_empty() {
-        let native = Arc::new(NativeHooks { catalog: None });
+        let native = Arc::new(NativeHooks {
+            source: None,
+            catalog: OnceLock::from(None),
+        });
         let _bound = bind_native(Arc::clone(&native));
         assert!(dispatch_trigger("missing#trigger#0", "a", "b").is_none());
         let record = last_diagnostic().expect("native miss records a diagnostic");

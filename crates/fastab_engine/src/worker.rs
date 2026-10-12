@@ -1172,9 +1172,9 @@ fn rebuild_engine(
             template.get_or_insert(registry).clone()
         },
     };
-    // from_registry loads the native-hook catalog and can itself block on I/O.
-    // Publish only the pristine index, before handing a separate clone to the
-    // mutable Engine, and before either constructor or completion work begins.
+    // Publish only the pristine index before handing a separate clone to the
+    // mutable Engine. Catalog parsing is deferred to the first hook dispatch;
+    // constructor and completion work still share the watchdog boundary.
     #[cfg(test)]
     tests::pause_initialization_if_requested(specs_dir, tests::InitializationStage::Checkpoint);
     checkpoint(registry.clone());
@@ -2842,12 +2842,25 @@ mod tests {
     fn catalog_wakes_idle_maintenance_without_any_spec_or_hook_result_deadline() {
         let dir = tempfile::tempdir().unwrap();
         write_catalog_fixture(dir.path());
-        let engine = Engine::from_registry(
-            dir.path(),
-            Registry::new(),
-            Arc::new(Mutex::new(AcceptanceIndex::default())),
+        let mut registry = Registry::new();
+        registry.insert(
+            serde_json::from_value(serde_json::json!({
+                "names": ["tool"], "args": [{"jsCustom": "tool#custom#0"}]
+            }))
+            .unwrap(),
         );
-        let (mut engine, result) = run_engine_attempt(engine, CompleteRequest::default(), WATCHDOG_UNDER_TEST).unwrap();
+        let engine = Engine::from_registry(dir.path(), registry, Arc::new(Mutex::new(AcceptanceIndex::default())));
+        let (mut engine, result) = run_engine_attempt(
+            engine,
+            CompleteRequest {
+                buffer: "tool ".into(),
+                cwd: dir.path().display().to_string(),
+                include_history: false,
+                ..CompleteRequest::default()
+            },
+            WATCHDOG_UNDER_TEST,
+        )
+        .unwrap();
         assert!(result.is_ok());
         assert!(engine.diagnostics().hook_catalog.loaded);
         assert_eq!(engine.diagnostics().hook_catalog.descriptor_count, 1);
@@ -2877,7 +2890,7 @@ mod tests {
         write_catalog_fixture(dir.path());
         let engine = Engine::from_registry(
             dir.path(),
-            Registry::new(),
+            Registry::load(dir.path()).unwrap(),
             Arc::new(Mutex::new(AcceptanceIndex::default())),
         );
         let token = CancellationToken::new();
@@ -2885,7 +2898,7 @@ mod tests {
         let (mut engine, result) =
             run_engine_attempt_with_token(engine, CompleteRequest::default(), WATCHDOG_UNDER_TEST, token).unwrap();
         assert!(result.unwrap_err().is::<CompletionCancelled>());
-        assert!(engine.diagnostics().hook_catalog.loaded);
+        assert_eq!(engine.diagnostics().hook_catalog, Default::default());
         let grace = Duration::from_secs(10);
         let deadline = engine
             .next_idle_deadline(grace)
@@ -2952,7 +2965,10 @@ mod tests {
         std::fs::write(
             dir.path().join("fast.json"),
             r#"{
-            "names":["fast"],"args":[{"cacheStrategy":"max-age","script":["/bin/echo","ready"]}]
+            "names":["fast"],"args":[{"generators":[
+                {"cacheStrategy":"max-age","script":["/bin/echo","ready"]},
+                {"jsCustom":"tool#custom#0"}
+            ]}]
         }"#,
         )
         .unwrap();

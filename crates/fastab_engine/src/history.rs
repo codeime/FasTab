@@ -192,6 +192,8 @@ pub(crate) struct HistoryStore {
     lines: Arc<Vec<Arc<str>>>,
     /// Spec primary name → values by slot, capped at [`MAX_CACHED_INDEXES`].
     index: Mutex<IndexCache>,
+    #[cfg(test)]
+    arg_values_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl HistoryStore {
@@ -199,6 +201,8 @@ impl HistoryStore {
         Self {
             lines,
             index: Mutex::new(IndexCache::default()),
+            #[cfg(test)]
+            arg_values_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -256,6 +260,8 @@ impl HistoryStore {
         shell: Option<&str>,
         slots: &[ArgSlot],
     ) -> Vec<String> {
+        #[cfg(test)]
+        self.arg_values_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut seen = HashSet::new();
         let mut out: Vec<String> = Vec::new();
         for slot in slots {
@@ -273,6 +279,11 @@ impl HistoryStore {
             }
         }
         out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arg_values_calls(&self) -> usize {
+        self.arg_values_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn index_for(
@@ -463,6 +474,34 @@ mod tests {
         };
         let methods = store.arg_values(&mut registry, None, None, &[method]);
         assert_eq!(methods, vec!["GET", "POST"]);
+    }
+
+    #[test]
+    fn argument_values_keep_slot_precedence_while_deduplicating_across_slots() {
+        let mut registry = registry_with(&[("curl", CURL)]);
+        let store = HistoryStore::from_lines(vec![
+            "curl -X GET GET".into(),
+            "curl -X POST POST".into(),
+            "curl -X GET url".into(),
+        ]);
+        let url = ArgSlot {
+            root: "curl".into(),
+            path: Vec::new(),
+            option: None,
+            index: 0,
+        };
+        let method = ArgSlot {
+            option: Some("-X".into()),
+            ..url.clone()
+        };
+        assert_eq!(
+            store.arg_values(&mut registry, None, None, &[url.clone(), method.clone(), url.clone()]),
+            ["url", "POST", "GET"]
+        );
+        assert_eq!(
+            store.arg_values(&mut registry, None, None, &[method, url]),
+            ["GET", "POST", "url"]
+        );
     }
 
     #[test]

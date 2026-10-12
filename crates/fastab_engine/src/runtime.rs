@@ -418,7 +418,7 @@ impl Engine {
         registry: Registry,
         acceptance: Arc<Mutex<rank::AcceptanceIndex>>,
     ) -> Self {
-        let native = Arc::new(NativeHooks::load(specs_dir, registry.snapshot().as_ref()));
+        let native = Arc::new(NativeHooks::new(specs_dir, registry.snapshot()));
         Self {
             specs_dir: specs_dir.to_path_buf(),
             registry,
@@ -471,10 +471,7 @@ impl Engine {
     }
 
     fn rebind_hosts(&mut self, registry: &Registry) {
-        self.native = Some(Arc::new(NativeHooks::load(
-            &self.specs_dir,
-            registry.snapshot().as_ref(),
-        )));
+        self.native = Some(Arc::new(NativeHooks::new(&self.specs_dir, registry.snapshot())));
         // Refresh can be followed by an immediate cancellation before the
         // attempt's settlement path. Preserve any existing grace clock.
         self.note_idle_native(std::time::Instant::now());
@@ -578,13 +575,12 @@ impl Engine {
         }
     }
 
-    /// Called only in the completion attempt, after generation refresh. The
-    /// snapshot verifies the re-read; a missing/rejected catalog stays loaded
-    /// as an empty owner rather than retrying every keystroke.
+    /// Bind a lazy owner after generation refresh. Only hook dispatch parses
+    /// the catalog; missing/rejected is retained as an initialized empty owner.
     fn ensure_native(&mut self) -> Arc<NativeHooks> {
         Arc::clone(
             self.native
-                .get_or_insert_with(|| Arc::new(NativeHooks::load(&self.specs_dir, self.registry.snapshot().as_ref()))),
+                .get_or_insert_with(|| Arc::new(NativeHooks::new(&self.specs_dir, self.registry.snapshot()))),
         )
     }
 
@@ -709,8 +705,19 @@ impl Engine {
     }
 
     pub fn complete(&mut self, request: CompleteRequest) -> anyhow::Result<CompleteResult> {
+        // Even cancellation before the first check must release bytes retained
+        // at construction. Refresh may bind a different snapshot, so guard it
+        // separately before the second cancellation check as well.
+        let _previous_capture = self
+            .registry
+            .snapshot()
+            .map(|snapshot| snapshot.release_captured_after_request());
         crate::cancellation::check()?;
         self.refresh_specs_generation();
+        let _capture = self
+            .registry
+            .snapshot()
+            .map(|snapshot| snapshot.release_captured_after_request());
         crate::cancellation::check()?;
         let idle = self.registry.checkpoint_idle();
         let hook_cache_was_empty = self.hook_cache.is_empty();
@@ -1019,11 +1026,157 @@ mod tests {
     }
 
     #[test]
+    fn static_completions_release_captured_bytes_without_loading_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_spec(
+            dir.path(),
+            "demo",
+            r#"{"names":["demo"],"subcommands":[{"names":["static"]}]}"#,
+        );
+        write_typed_custom(dir.path(), "demo#custom#0", "result");
+        let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), Frecency::default()).unwrap();
+        assert!(!engine.diagnostics().hook_catalog.load_attempted);
+        assert!(engine.diagnostics().hook_catalog.captured_bytes > 0);
+        for buffer in ["d", "demo "] {
+            let result = engine
+                .complete(CompleteRequest {
+                    buffer: buffer.into(),
+                    cwd: dir.path().display().to_string(),
+                    include_history: false,
+                    ..CompleteRequest::default()
+                })
+                .unwrap();
+            assert!(!result.suggestions.is_empty());
+            assert_eq!(engine.diagnostics().hook_catalog, Default::default());
+        }
+        let _bound = crate::hook_backend::bind_native(Arc::clone(engine.native.as_ref().unwrap()));
+        let rows =
+            crate::hook_backend::dispatch_custom("demo#custom#0", &[], "/tmp", "", Duration::from_secs(1), false)
+                .unwrap();
+        assert_eq!(
+            rows[0].name, "result",
+            "first real hook verifies and reads the released sidecar"
+        );
+        assert!(engine.diagnostics().hook_catalog.loaded);
+        assert_eq!(engine.diagnostics().hook_catalog.captured_bytes, 0);
+    }
+
+    #[test]
+    fn cold_history_and_cancellation_release_sidecar_without_loading_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_typed_custom(dir.path(), "demo#custom#0", "result");
+        for cancelled in [false, true] {
+            let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), Frecency::default()).unwrap();
+            assert!(engine.diagnostics().hook_catalog.captured_bytes > 0);
+            let token = crate::cancellation::CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let _scope = crate::cancellation::enter(token);
+            let result = engine.complete(CompleteRequest {
+                history_only: true,
+                ..CompleteRequest::default()
+            });
+            assert_eq!(result.is_err(), cancelled);
+            assert_eq!(engine.diagnostics().hook_catalog, Default::default());
+        }
+    }
+
+    #[test]
+    fn unused_sidecar_is_released_from_shared_snapshot_on_idle_owner_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        write_typed_custom(dir.path(), "demo#custom#0", "result");
+        let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), Frecency::default()).unwrap();
+        let snapshot = engine.registry.snapshot().unwrap();
+        assert!(snapshot.captured_bytes() > 0);
+        engine.release_idle_specs(std::time::Instant::now(), Duration::ZERO);
+        assert_eq!(
+            snapshot.captured_bytes(),
+            0,
+            "a pristine registry clone cannot pin unused sidecar bytes"
+        );
+        assert_eq!(engine.diagnostics().hook_catalog, Default::default());
+    }
+
+    #[test]
+    fn missing_or_rejected_catalog_is_not_retried_until_owner_rebinds() {
+        for malformed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            if malformed {
+                fs::write(dir.path().join("typed-hooks.json"), b"invalid JSON").unwrap();
+            }
+            let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), Frecency::default()).unwrap();
+            engine.complete(CompleteRequest::default()).unwrap();
+            assert_eq!(engine.diagnostics().hook_catalog, Default::default());
+            let dispatch = |engine: &mut Engine| {
+                let _bound = crate::hook_backend::bind_native(engine.ensure_native());
+                crate::hook_backend::dispatch_custom("demo#custom#0", &[], "/tmp", "", Duration::from_secs(1), false)
+            };
+            assert!(dispatch(&mut engine).is_none());
+            assert!(engine.diagnostics().hook_catalog.load_attempted);
+            assert!(!engine.diagnostics().hook_catalog.loaded);
+            write_typed_custom(dir.path(), "demo#custom#0", "fixed");
+            assert!(
+                dispatch(&mut engine).is_none(),
+                "an attempted empty owner must not retry"
+            );
+            assert!(engine.clear_caches_and_report());
+            assert!(!engine.diagnostics().hook_catalog.load_attempted);
+            assert_eq!(dispatch(&mut engine).unwrap()[0].name, "fixed");
+        }
+    }
+
+    #[test]
+    fn first_hook_after_static_completion_rejects_changed_sidecar_then_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_spec(
+            dir.path(),
+            "demo",
+            r#"{"names":["demo"],"args":[{"jsCustom":"demo#custom#0"}]}"#,
+        );
+        write_typed_custom(dir.path(), "demo#custom#0", "from-A");
+        let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), Frecency::default()).unwrap();
+        engine
+            .complete(CompleteRequest {
+                buffer: "d".into(),
+                ..CompleteRequest::default()
+            })
+            .unwrap();
+        assert_eq!(engine.diagnostics().hook_catalog, Default::default());
+        write_typed_custom(dir.path(), "demo#custom#0", "from-B");
+        let request = CompleteRequest {
+            buffer: "demo ".into(),
+            cwd: dir.path().display().to_string(),
+            include_history: false,
+            ..CompleteRequest::default()
+        };
+        let rejected = engine.complete(request.clone()).unwrap();
+        assert!(
+            !rejected
+                .suggestions
+                .iter()
+                .any(|row| row.name == "from-A" || row.name == "from-B")
+        );
+        assert!(engine.diagnostics().hook_catalog.load_attempted);
+        assert!(!engine.diagnostics().hook_catalog.loaded);
+        assert!(engine.registry.needs_refresh());
+        let refreshed = engine.complete(request).unwrap();
+        assert!(refreshed.suggestions.iter().any(|row| row.name == "from-B"));
+    }
+
+    #[test]
     fn catalog_idle_grace_survives_history_repeated_end_and_cancel_without_cached_results() {
         let dir = tempfile::tempdir().unwrap();
         write_typed_custom(dir.path(), "demo#custom#0", "result");
         let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), Frecency::default()).unwrap();
         engine.complete(CompleteRequest::default()).unwrap();
+        {
+            let _bound = crate::hook_backend::bind_native(Arc::clone(engine.native.as_ref().unwrap()));
+            assert!(
+                crate::hook_backend::dispatch_custom("demo#custom#0", &[], "/tmp", "", Duration::from_secs(1), false,)
+                    .is_some()
+            );
+        }
         let grace = Duration::from_secs(10);
         assert_eq!(engine.diagnostics().registry.cached_file_count, 0);
         assert!(engine.hook_cache.is_empty());
@@ -1071,6 +1224,7 @@ mod tests {
         let before = engine.complete(request.clone()).unwrap();
         assert!(before.suggestions.iter().any(|row| row.name == "result"));
         assert_eq!(engine.diagnostics().hook_catalog.parsed_descriptor_count, 1);
+        assert_eq!(engine.diagnostics().hook_catalog.captured_bytes, 0);
         let old_owner = Arc::downgrade(engine.native.as_ref().unwrap());
         engine.end_input();
         let grace = Duration::from_secs(10);
@@ -1156,7 +1310,8 @@ mod tests {
         fs::create_dir_all(&live).unwrap();
         write_typed_custom(&live, "demo#custom#0", "from-B");
         engine.refresh_specs_generation();
-        assert!(engine.diagnostics().hook_catalog.loaded);
+        assert!(!engine.diagnostics().hook_catalog.load_attempted);
+        assert!(engine.diagnostics().hook_catalog.captured_bytes > 0);
         let grace = Duration::from_secs(10);
         let deadline = engine
             .next_idle_deadline(grace)
@@ -1167,6 +1322,7 @@ mod tests {
             let _scope = crate::cancellation::enter(token);
             assert!(engine.complete(CompleteRequest::default()).is_err());
         }
+        assert_eq!(engine.diagnostics().hook_catalog.captured_bytes, 0);
         assert_eq!(engine.next_idle_deadline(grace), Some(deadline));
         engine.release_idle_specs(deadline, grace);
         assert!(!engine.diagnostics().hook_catalog.load_attempted);

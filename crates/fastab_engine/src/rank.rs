@@ -1,6 +1,8 @@
 //! Frecency ranking over spec suggestions, plus history command matches.
 
+#[cfg(test)]
 use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -229,8 +231,6 @@ pub(crate) fn normalize_history_shell(value: Option<&str>) -> HistoryShell {
 
 #[derive(Debug, Clone, Default)]
 pub struct Frecency {
-    /// command or `cmd sub` prefix -> (count, last_seen_unix_secs)
-    stats: HashMap<String, (u32, u64)>,
     /// Occurrence order, including repeats. Identical command text shares one
     /// `Arc<str>`; the `history` template reads this same list.
     lines: Arc<Vec<Arc<str>>>,
@@ -254,11 +254,10 @@ struct WordNode {
 
 impl Frecency {
     pub fn from_commands(commands: impl IntoIterator<Item = (String, u64)>) -> Self {
-        let mut stats = HashMap::new();
         let mut lines = Vec::new();
         let mut intern: HashSet<Arc<str>> = HashSet::new();
         let mut next_words = NextWords::default();
-        for (command, ts) in commands {
+        for (command, _) in commands {
             let command = command.trim();
             if command.is_empty() {
                 continue;
@@ -270,19 +269,10 @@ impl Frecency {
                 intern.insert(Arc::clone(&line));
                 line
             };
-            bump(&mut stats, command, ts);
-            let tokens: Vec<&str> = command.split_whitespace().collect();
-            if let Some(first) = tokens.first() {
-                bump(&mut stats, first, ts);
-            }
-            if tokens.len() >= 2 {
-                bump(&mut stats, &format!("{} {}", tokens[0], tokens[1]), ts);
-            }
             record_next_words(command, &mut next_words);
             lines.push(line);
         }
         Self {
-            stats,
             lines: Arc::new(lines),
             next_words,
         }
@@ -290,13 +280,6 @@ impl Frecency {
 
     pub(crate) fn command_lines(&self) -> Arc<Vec<Arc<str>>> {
         Arc::clone(&self.lines)
-    }
-
-    pub fn score(&self, key: &str) -> i64 {
-        match self.stats.get(key) {
-            Some((count, last)) => i64::from(*count) * 10_000 + i64::try_from(*last).unwrap_or(0) / 1_000,
-            None => 0,
-        }
     }
 
     pub fn history_suggestions(&self, query: &str, fuzzy: bool, include_empty_query: bool) -> Vec<Suggestion> {
@@ -772,14 +755,6 @@ fn history_priority_tenths(count: usize) -> i64 {
     }
 }
 
-fn bump(stats: &mut HashMap<String, (u32, u64)>, key: &str, ts: u64) {
-    let entry = stats.entry(key.to_string()).or_insert((0, 0));
-    entry.0 = entry.0.saturating_add(1);
-    if ts > entry.1 {
-        entry.1 = ts;
-    }
-}
-
 #[allow(dead_code)]
 pub fn apply(result: &mut CompleteResult, tokens: &[String], frecency: &Frecency) {
     apply_with_acceptance(result, tokens, frecency, &AcceptanceIndex::default(), "", false);
@@ -806,22 +781,28 @@ pub fn apply_with_acceptance(
         root_command
     };
 
-    if query.is_empty() {
-        result.suggestions.sort_by(|a, b| {
-            compare_auto_execute(a, b)
-                .then_with(|| compare_priority(b, a, history_counts, acceptance, root_command, !alphabetical))
-        });
-    } else {
-        // `lookup` has already filtered rows with the request's fuzzy flag.
-        // Running the scorer with fuzzy enabled here is safe for both modes:
-        // non-fuzzy results contain no scattered matches, while fuzzy results
-        // retain the old exact/prefix/fuzzy ordering.
-        result.suggestions.sort_by(|a, b| {
-            compare_auto_execute(a, b)
-                .then_with(|| compare_match(a, b, &query))
-                .then_with(|| compare_priority(b, a, history_counts, acceptance, root_command, !alphabetical))
-        });
-    }
+    // Cache only for this sort: matching allocates folded/UTF-16 strings,
+    // and history/acceptance lookup need only run once per candidate.
+    result.suggestions.sort_by_cached_key(|suggestion| {
+        // `lookup` already filtered using the request's fuzzy flag. Preserve
+        // exact/prefix/fuzzy buckets and each row's query-term override.
+        let match_key = if query.is_empty() {
+            None
+        } else {
+            best_match(suggestion, &query)
+        }
+        .map(|score| (score.bucket(), Reverse(score.score)))
+        .unwrap_or((u8::MAX, Reverse(0)));
+        let priority = effective_priority_score(suggestion, history_counts, acceptance, root_command, !alphabetical);
+        // This score is finite and nonnegative: bounded integer priority
+        // plus an optional u64 timestamp fraction. Its IEEE bits therefore
+        // have exactly the same order as the previous f64 comparison.
+        (
+            suggestion.kind != "auto-execute",
+            match_key,
+            Reverse(priority.to_bits()),
+        )
+    });
 
     // This mirrors the old `deduplicateSuggestions` guard. It intentionally
     // stays off for large result sets so a generator cannot pay an O(n²) cost
@@ -843,6 +824,7 @@ pub fn apply_with_acceptance(
     }
 }
 
+#[cfg(test)]
 fn compare_priority(
     left: &Suggestion,
     right: &Suggestion,
@@ -862,6 +844,7 @@ fn compare_priority(
         .unwrap_or(Ordering::Equal)
 }
 
+#[cfg(test)]
 fn compare_auto_execute(left: &Suggestion, right: &Suggestion) -> Ordering {
     let left_auto = left.kind == "auto-execute";
     let right_auto = right.kind == "auto-execute";
@@ -913,6 +896,7 @@ fn effective_priority_score(
     priority
 }
 
+#[cfg(test)]
 fn compare_match(left: &Suggestion, right: &Suggestion, query: &str) -> Ordering {
     let left_score = best_match(left, query);
     let right_score = best_match(right, query);
@@ -1246,6 +1230,94 @@ fn run_custom_history(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_ranking_matches_comparator_for_unicode_aliases_scopes_and_stable_ties() {
+        let frecency = Frecency::from_commands([
+            ("git co one".into(), 10),
+            ("git co two".into(), 20),
+            ("git status".into(), 30),
+        ]);
+        let scope = argument_scope(
+            "/project",
+            &ArgSlot {
+                root: "git".into(),
+                path: vec!["checkout".into()],
+                option: None,
+                index: 0,
+            },
+        )
+        .unwrap();
+        let mut acceptance = AcceptanceIndex::from_entries([
+            ("git".into(), "checkout".into(), 2_000_000_000_000),
+            ("git".into(), "status".into(), u64::MAX),
+        ]);
+        acceptance.record_scoped_at(&scope, "ΟΣ", 3_000_000_000_000);
+        let mut rows = Vec::new();
+        for priority in [0, 49, 50, 75, 76, 100] {
+            for name in [
+                "checkout",
+                "co",
+                "commit",
+                "status",
+                "ΟΣ",
+                "οσ",
+                "İ",
+                "../",
+                "↪",
+                "unmatched",
+            ] {
+                let mut row = Suggestion::new(name, priority.to_string(), "subcommand");
+                row.priority = priority;
+                if name == "co" {
+                    row.primary_name = Some("checkout".into());
+                    row.alias_names = vec!["checkout".into(), "co".into()];
+                    row.query_term = Some("co".into());
+                } else if name == "commit" {
+                    row.display_name = Some("co".into());
+                } else if name == "ΟΣ" {
+                    row.argument_value = true;
+                    row.acceptance_scope = Some(scope.clone());
+                } else if name == "↪" {
+                    row.kind = "auto-execute".into();
+                } else if name == "unmatched" {
+                    row.query_term = Some(String::new());
+                }
+                rows.push(row);
+            }
+        }
+        // More than 50 rows keeps deduplication off, so every stable tie is
+        // checked, including differently-described rows with identical names.
+        for query in ["", "co", "s", "ΟΣ", "i", "unmatched"] {
+            for alphabetical in [false, true] {
+                let tokens = vec!["git".into(), query.into()];
+                let counts = frecency.next_word_counts(&completion_prefix(&tokens, query));
+                let mut expected = rows.clone();
+                expected.sort_by(|left, right| {
+                    compare_auto_execute(left, right)
+                        .then_with(|| {
+                            if query.is_empty() {
+                                Ordering::Equal
+                            } else {
+                                compare_match(left, right, query)
+                            }
+                        })
+                        .then_with(|| compare_priority(right, left, counts, &acceptance, "git", !alphabetical))
+                });
+                let mut result = CompleteResult {
+                    suggestions: rows.clone(),
+                    search_term: query.into(),
+                    match_term: query.into(),
+                    ..CompleteResult::default()
+                };
+                apply_with_acceptance(&mut result, &tokens, &frecency, &acceptance, "git", alphabetical);
+                assert_eq!(
+                    result.suggestions, expected,
+                    "query={query:?}, alphabetical={alphabetical}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn equal_match_priority_keeps_input_order_without_shell_frecency_tie_break() {

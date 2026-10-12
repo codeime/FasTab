@@ -27,8 +27,9 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-/// Files the opener already read while hashing the tree. `NativeHooks::load`
-/// takes `typed-hooks.json` so the 4.6 MB sidecar is not read and hashed twice.
+/// Files the opener already read while hashing the tree. The first hook
+/// dispatch takes `typed-hooks.json`, avoiding a second read/hash. A request
+/// that needs no hooks releases it and later dispatches use verified reads.
 const CAPTURED_ON_OPEN: &[&str] = &["typed-hooks.json"];
 const HASH_READ_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -51,6 +52,16 @@ struct SnapshotInner {
 
 /// One-shot bodies captured while hashing. Debug prints names only.
 struct CapturedFiles(Mutex<HashMap<PathBuf, Vec<u8>>>);
+
+/// Release unused captured bytes on every request exit, including cancellation
+/// or unwind. The shared snapshot keeps its generation and file digests.
+pub(crate) struct CapturedFilesGuard(DirectorySnapshot);
+
+impl Drop for CapturedFilesGuard {
+    fn drop(&mut self) {
+        self.0.release_captured_files();
+    }
+}
 
 impl fmt::Debug for CapturedFiles {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -273,6 +284,33 @@ impl DirectorySnapshot {
     /// and still compare against the digest recorded at open.
     pub(crate) fn take_captured_file(&self, relative: &Path) -> Option<Vec<u8>> {
         self.inner.captured_files.0.lock().ok()?.remove(relative)
+    }
+
+    pub(crate) fn release_captured_after_request(self) -> CapturedFilesGuard {
+        CapturedFilesGuard(self)
+    }
+
+    pub(crate) fn release_captured_files(&self) {
+        let captured = std::mem::take(
+            &mut *self
+                .inner
+                .captured_files
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        drop(captured);
+    }
+
+    pub(crate) fn captured_bytes(&self) -> usize {
+        self.inner
+            .captured_files
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .map(Vec::capacity)
+            .sum()
     }
 
     /// Return names directly below a directory from the captured tree. This

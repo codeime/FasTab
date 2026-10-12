@@ -1,6 +1,6 @@
 //! Native generators: files, argv scripts, git refs, npm scripts/deps.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, LazyCell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -287,12 +287,12 @@ pub(crate) fn generate_for_arg_with_search_term(
     cwd: &str,
     fuzzy: bool,
 ) -> Vec<Suggestion> {
-    generate_for_arg_with_history(arg, tokens, query, search_term, cwd, fuzzy, &[])
+    generate_for_arg_with_history(arg, tokens, query, search_term, cwd, fuzzy, Vec::new)
 }
 
-/// Like [`generate_for_arg_with_search_term`], with the values a `history`
-/// template offers: what earlier commands put in this same argument slot,
-/// most recent first (`crate::history::HistoryStore::arg_values`).
+/// Build history values only when a History generator actually runs. One
+/// request shares the result across generators; cache refiltering and pending
+/// debounce runs never invoke the provider.
 pub(crate) fn generate_for_arg_with_history(
     arg: &ArgSpec,
     tokens: &[String],
@@ -300,11 +300,12 @@ pub(crate) fn generate_for_arg_with_history(
     search_term: &str,
     cwd: &str,
     fuzzy: bool,
-    history_values: &[String],
+    history_values: impl FnOnce() -> Vec<String>,
 ) -> Vec<Suggestion> {
     // `search_term` is deliberately raw for insertion, while every generator
     // sees the parser token's inner text.  In particular, passing `'src/m`
     // through to filegen would make it look for a literal `'src` directory.
+    let history_values = LazyCell::new(history_values);
     let normalized_search_term = crate::lookup::parser_inner_text(search_term);
     let arg_query =
         if arg.meta.get_query_term.is_some() || arg.js_get_query_term.is_some() || arg.meta.js_get_query_term.is_some()
@@ -390,7 +391,7 @@ pub(crate) fn generate_for_arg_with_history(
                     arg,
                     generator,
                     tokens,
-                    history_values,
+                    &history_values,
                     &gen_query,
                     &normalized_search_term,
                     cwd,
@@ -412,6 +413,9 @@ pub(crate) fn generate_for_arg_with_history(
         // insertion still receives the raw token through the result below.
         session.search_term = normalized_search_term.clone();
     });
+    if crate::cancellation::is_cancelled() {
+        return Vec::new();
+    }
     if pending {
         set_pending_generators(debounce_ms);
     }
@@ -685,7 +689,7 @@ fn generate_from_generator(
     arg: &ArgSpec,
     generator: &GeneratorSpec,
     tokens: &[String],
-    history_values: &[String],
+    history_values: &LazyCell<Vec<String>, impl FnOnce() -> Vec<String>>,
     query: &str,
     normalized_search_term: &str,
     cwd: &str,
@@ -751,6 +755,9 @@ fn generate_from_generator(
             snapshot.split_on.as_deref(),
         ));
     }
+    if crate::cancellation::is_cancelled() {
+        return Vec::new();
+    }
     let templates = if arg.generators.is_empty() && generator.templates.is_empty() {
         arg.templates.as_slice()
     } else {
@@ -788,7 +795,14 @@ fn generate_from_generator(
         ));
     }
     if templates.contains(&Template::History) {
-        template_rows.extend(history_template_suggestions(history_values, query, fuzzy));
+        if crate::cancellation::is_cancelled() {
+            return Vec::new();
+        }
+        let values = LazyCell::force(history_values);
+        if crate::cancellation::is_cancelled() {
+            return Vec::new();
+        }
+        template_rows.extend(history_template_suggestions(values, query, fuzzy));
     }
     if let Some(hook) = generator.js_filter_template_suggestions.as_deref()
         && let Some(filtered) = crate::hook_backend::dispatch_filter_template_suggestions(hook, &template_rows, tokens)
@@ -2100,7 +2114,9 @@ mod tests {
             ..ArgSpec::default()
         };
         let values = vec!["feature".to_string(), "main".to_string(), "fix/1".to_string()];
-        let rows = generate_for_arg_with_history(&arg, &["git".into(), "checkout".into()], "", "", "/", false, &values);
+        let rows = generate_for_arg_with_history(&arg, &["git".into(), "checkout".into()], "", "", "/", false, || {
+            values.clone()
+        });
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, vec!["feature", "main", "fix/1"]);
         assert!(rows.iter().all(|row| row.kind == "arg"), "{rows:?}");
@@ -2112,10 +2128,150 @@ mod tests {
             "f",
             "/",
             false,
-            &values,
+            || values.clone(),
         );
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, vec!["feature", "fix/1"]);
+    }
+
+    #[test]
+    fn history_provider_runs_once_for_multiple_consumers_and_never_for_a_cache_hit() {
+        install_session(GeneratorSession::default());
+        let arg = ArgSpec {
+            name: "lazy-history-multiple".into(),
+            generators: vec![
+                GeneratorSpec {
+                    templates: vec![Template::History],
+                    ..GeneratorSpec::default()
+                },
+                GeneratorSpec {
+                    templates: vec![Template::History],
+                    ..GeneratorSpec::default()
+                },
+            ],
+            ..ArgSpec::default()
+        };
+        let builds = Cell::new(0);
+        let rows = generate_for_arg_with_history(&arg, &["tool".into(), "w".into()], "w", "w", "/", false, || {
+            builds.set(builds.get() + 1);
+            vec!["west".into(), "web".into(), "api".into()]
+        });
+        assert_eq!(builds.get(), 1);
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["west", "web"]
+        );
+        let rows = generate_for_arg_with_history(&arg, &["tool".into(), "we".into()], "we", "we", "/", false, || {
+            panic!("cache refilter must not call HistoryStore::arg_values")
+        });
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["west", "web"]
+        );
+        install_session(GeneratorSession::default());
+    }
+
+    #[test]
+    fn history_provider_waits_for_debounce_and_obeys_trigger_changes() {
+        install_session(GeneratorSession::default());
+        let arg = ArgSpec {
+            name: "lazy-history-debounce".into(),
+            templates: vec![Template::History],
+            debounce_ms: Some(200),
+            ..ArgSpec::default()
+        };
+        let builds = Cell::new(0);
+        let run = |arg: &ArgSpec, term: &str| {
+            let rows =
+                generate_for_arg_with_history(arg, &["tool".into(), term.into()], term, term, "/", false, || {
+                    builds.set(builds.get() + 1);
+                    vec!["west".into(), "web".into(), "api".into()]
+                });
+            (
+                rows.into_iter().map(|row| row.name).collect::<Vec<_>>(),
+                take_pending_generators().0,
+            )
+        };
+        let (rows, pending) = run(&arg, "w");
+        assert!(pending);
+        assert!(rows.is_empty());
+        assert_eq!(builds.get(), 0);
+        let (rows, pending) = run(&arg, "w");
+        assert!(!pending);
+        assert_eq!(rows, ["west", "web"]);
+        assert_eq!(builds.get(), 1);
+        let (rows, pending) = run(&arg, "we");
+        assert!(pending);
+        assert_eq!(rows, ["west", "web"]);
+        assert_eq!(builds.get(), 1);
+        let (rows, pending) = run(&arg, "we");
+        assert!(!pending);
+        assert_eq!(rows, ["west", "web"]);
+        assert_eq!(builds.get(), 2);
+
+        install_session(GeneratorSession::default());
+        let triggered = ArgSpec {
+            name: "lazy-history-trigger".into(),
+            generators: vec![GeneratorSpec {
+                templates: vec![Template::History],
+                trigger: Some(GeneratorTrigger {
+                    on: "threshold".into(),
+                    length: Some(1),
+                    string: None,
+                    js_trigger: None,
+                }),
+                ..GeneratorSpec::default()
+            }],
+            ..ArgSpec::default()
+        };
+        let _ = run(&triggered, "w");
+        assert_eq!(builds.get(), 3);
+        let _ = run(&triggered, "we");
+        assert_eq!(builds.get(), 4);
+        let _ = run(&triggered, "web");
+        assert_eq!(builds.get(), 4);
+        let static_arg = ArgSpec {
+            name: "no-history-consumer".into(),
+            ..ArgSpec::default()
+        };
+        let _ = generate_for_arg_with_history(&static_arg, &["tool".into()], "", "", "/", false, || {
+            panic!("no History template has a consumer")
+        });
+        install_session(GeneratorSession::default());
+    }
+
+    #[test]
+    fn cancelled_generator_does_not_publish_partial_rows_or_cache_them() {
+        install_session(GeneratorSession::default());
+        let arg = ArgSpec {
+            name: "cancelled-history-provider".into(),
+            templates: vec![Template::History],
+            suggestions: vec![crate::ir::SuggestionSeed {
+                names: vec!["static-before-cancellation".into()],
+                ..crate::ir::SuggestionSeed::default()
+            }],
+            ..ArgSpec::default()
+        };
+        let token = crate::cancellation::CancellationToken::new();
+        let scope = crate::cancellation::enter(token.clone());
+        let rows = generate_for_arg_with_history(&arg, &["tool".into()], "", "", "/", false, || {
+            assert!(token.cancel());
+            vec!["partial-history".into()]
+        });
+        assert!(rows.is_empty());
+        let session = take_session();
+        assert!(!session.entries[0].ran);
+        assert!(session.entries[0].results.is_empty());
+        drop(scope);
+        install_session(session);
+        let rows = generate_for_arg_with_history(&arg, &["tool".into()], "", "", "/", false, || {
+            vec!["fresh-history".into()]
+        });
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["static-before-cancellation", "fresh-history"]
+        );
+        install_session(GeneratorSession::default());
     }
 
     #[test]

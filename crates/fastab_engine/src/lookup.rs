@@ -2050,14 +2050,6 @@ fn first_token_result(
     }
 }
 
-fn arg_uses_history_template(arg: &ArgSpec) -> bool {
-    arg.templates.contains(&Template::History)
-        || arg
-            .generators
-            .iter()
-            .any(|generator| generator.templates.contains(&Template::History))
-}
-
 pub fn complete(registry: &mut Registry, request: &CompleteRequest) -> CompleteResult {
     complete_with_settings(registry, request, &fastab_settings::settings::Settings::new())
 }
@@ -2232,16 +2224,6 @@ pub(crate) fn complete_with_settings(
     // options. Keep that ordering so a generated git alias does not jump
     // behind the static option list while ranking is still settling.
     if let Some(active) = context.active_arg.as_ref() {
-        let history_values = if arg_uses_history_template(&active.arg) {
-            crate::generate::history_store().arg_values(
-                registry,
-                request.alias.as_deref(),
-                request.current_shell.as_deref(),
-                &context.history_slots,
-            )
-        } else {
-            Vec::new()
-        };
         let mut active_suggestions = crate::generate::generate_for_arg_with_history(
             &active.arg,
             &tokens,
@@ -2249,7 +2231,14 @@ pub(crate) fn complete_with_settings(
             &search_term,
             &request.cwd,
             fuzzy,
-            &history_values,
+            || {
+                crate::generate::history_store().arg_values(
+                    registry,
+                    request.alias.as_deref(),
+                    request.current_shell.as_deref(),
+                    &context.history_slots,
+                )
+            },
         );
         if active.arg.templates.contains(&Template::Help) {
             active_suggestions.extend(help_template_suggestions(
@@ -3975,6 +3964,52 @@ mod tests {
             .collect();
         // Most recent first; `-v` is an option, not a pathspec value.
         assert_eq!(history, vec!["other", "file"]);
+    }
+
+    #[test]
+    fn cached_history_generator_does_not_rebuild_values_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wscat.json"),
+            r#"{"names":["wscat"],"options":[{"names":["-c"],"args":[{
+                "name":"URL","templates":["history"]
+            }]}]}"#,
+        )
+        .unwrap();
+        let mut registry = Registry::load(dir.path()).unwrap();
+        let store = Arc::new(crate::history::HistoryStore::from_lines(vec![
+            "wc -c wss://old".into(),
+            "wscat -c ws://plain".into(),
+            "wc -c wss://recent".into(),
+            "wc -c wss://old".into(),
+        ]));
+        crate::generate::set_history(Arc::clone(&store));
+        crate::generate::install_session(crate::generate::GeneratorSession::default());
+        let mut request = CompleteRequest {
+            buffer: "wc -c w".into(),
+            cwd: dir.path().display().to_string(),
+            current_shell: Some("/usr/local/bin/fish".into()),
+            alias: Some("alias wc 'wscat'\n".into()),
+            include_history: false,
+            ..CompleteRequest::default()
+        };
+        let first = complete(&mut registry, &request);
+        let names = |result: &CompleteResult| {
+            result
+                .suggestions
+                .iter()
+                .filter(|row| row.kind == "arg")
+                .map(|row| row.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&first), ["wss://old", "wss://recent", "ws://plain"]);
+        assert_eq!(store.arg_values_calls(), 1);
+        request.buffer = "wc -c ws".into();
+        let cached = complete(&mut registry, &request);
+        assert_eq!(names(&cached), names(&first));
+        assert_eq!(store.arg_values_calls(), 1, "cache hit must not even call arg_values");
+        crate::generate::set_history(Arc::default());
+        crate::generate::install_session(crate::generate::GeneratorSession::default());
     }
 
     #[test]
