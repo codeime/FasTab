@@ -101,6 +101,9 @@ fn parse_number(input: &[u8]) -> Option<u8> {
 /// Internal state for VTE processor.
 #[derive(Debug, Default)]
 struct ProcessorState {
+    /// Whether an escape sequence or UTF-8 character may still be incomplete.
+    output_incomplete: bool,
+
     /// Last processed character for repetition.
     preceding_char: Option<char>,
 
@@ -163,10 +166,37 @@ impl Processor {
         H: Handler,
     {
         if self.state.sync_state.timeout.is_none() {
-            let mut performer = Performer::new(&mut self.state, handler);
-            self.parser.advance(&mut performer, &[byte]);
+            self.advance_parser_byte(handler, byte);
         } else {
             self.advance_sync(handler, byte);
+        }
+    }
+
+    /// Whether injected output can follow the bytes parsed so far without
+    /// splitting an escape sequence or UTF-8 character. This is conservative:
+    /// ignored sequences without a completion callback wait for the next
+    /// printable character or dispatched sequence. Synchronized buffering
+    /// remains unsafe until its bytes have been replayed through the parser.
+    #[inline]
+    pub fn is_output_boundary(&self) -> bool {
+        !self.state.output_incomplete && self.state.sync_state.timeout.is_none()
+    }
+
+    #[inline]
+    fn advance_parser_byte<H>(&mut self, handler: &mut H, byte: u8)
+    where
+        H: Handler,
+    {
+        if byte >= 0x80 {
+            self.state.output_incomplete = true;
+        }
+        let mut performer = Performer::new(&mut self.state, handler);
+        self.parser.advance(&mut performer, &[byte]);
+        // VTE dispatches OSC/unhook on ESC, before the following ST '\\'. A
+        // UTF-8 start can first print a replacement for an earlier partial
+        // character and then start a new partial character without a callback.
+        if byte == 0x1b || matches!(byte, 0xc2..=0xf4) {
+            self.state.output_incomplete = true;
         }
     }
 
@@ -178,8 +208,7 @@ impl Processor {
         // Process all synchronized bytes.
         for i in 0..self.state.sync_state.buffer.len() {
             let byte = self.state.sync_state.buffer[i];
-            let mut performer = Performer::new(&mut self.state, handler);
-            self.parser.advance(&mut performer, &[byte]);
+            self.advance_parser_byte(handler, byte);
         }
 
         // Resetting state after processing makes sure we don't interpret buffered sync escapes.
@@ -962,12 +991,17 @@ where
 {
     #[inline]
     fn print(&mut self, c: char) {
+        self.state.output_incomplete = false;
         self.handler.input(c);
         self.state.preceding_char = Some(c);
     }
 
     #[inline]
     fn execute(&mut self, byte: u8) {
+        // Other C0 controls can execute inside an unfinished sequence.
+        if matches!(byte, 0x18 | 0x1a) {
+            self.state.output_incomplete = false;
+        }
         match byte {
             C0::HT => self.handler.put_tab(1),
             C0::BS => self.handler.backspace(),
@@ -1029,6 +1063,9 @@ where
 
     #[inline]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        if bell_terminated {
+            self.state.output_incomplete = false;
+        }
         macro_rules! unhandled {
             () => {{
                 if self.handler.unhandled_osc_dispatch(params, bell_terminated) == HandledStatus::Unhandled {
@@ -1258,6 +1295,7 @@ where
     #[allow(clippy::cognitive_complexity)]
     #[inline]
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], has_ignored_intermediates: bool, action: char) {
+        self.state.output_incomplete = false;
         macro_rules! unhandled {
             () => {{
                 if self
@@ -1429,6 +1467,7 @@ where
 
     #[inline]
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.state.output_incomplete = false;
         macro_rules! unhandled {
             () => {{
                 if self.handler.unhandled_esc_dispatch(intermediates, ignore, byte) == HandledStatus::Unhandled {

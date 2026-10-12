@@ -193,6 +193,15 @@ impl InsertionRetry {
     }
 }
 
+#[derive(Default)]
+struct CsiUState {
+    // Fastab's successfully written, unpaired push; not the terminal's stack
+    // or another application's keyboard mode. Complete shell hooks hand this
+    // ownership back before an application runs and acquire it after return.
+    owned: bool,
+    desired: bool,
+}
+
 struct MainLoopControl<'a> {
     remote_sender: &'a RemoteSender,
     master: &'a mut (dyn AsyncMasterPty + Send),
@@ -201,7 +210,7 @@ struct MainLoopControl<'a> {
     key_interceptor: &'a mut KeyInterceptor,
     terminal: &'a mut dyn Terminal,
     stdout: &'a mut (dyn tokio::io::AsyncWrite + Unpin),
-    csi_u_set: &'a mut bool,
+    csi_u: &'a mut CsiUState,
     bracketed_paste: bool,
 }
 
@@ -247,19 +256,27 @@ impl MainLoopControl<'_> {
                 }
             },
             MainLoopEvent::SetCsiU => {
-                // Send CSI > 1 u
-                self.stdout.write_all(b"\x1b[>1u").await?;
-                self.stdout.flush().await?;
-                *self.csi_u_set = true;
+                self.csi_u.desired = true;
             },
             MainLoopEvent::UnsetCsiU => {
-                // Send CSI < u
-                self.stdout.write_all(b"\x1b[<u").await?;
-                self.stdout.flush().await?;
-                *self.csi_u_set = false;
+                self.csi_u.desired = false;
             },
             // SSH remote-install prompting is currently disabled.
             MainLoopEvent::PromptSSH { .. } => {},
+        }
+        Ok(())
+    }
+
+    fn csi_u_pending(&self) -> bool {
+        self.csi_u.desired != self.csi_u.owned
+    }
+
+    async fn flush_csi_u(&mut self) -> Result<()> {
+        if self.csi_u_pending() {
+            let sequence: &[u8] = if self.csi_u.desired { b"\x1b[>1u" } else { b"\x1b[<u" };
+            self.stdout.write_all(sequence).await?;
+            self.stdout.flush().await?;
+            self.csi_u.owned = self.csi_u.desired;
         }
         Ok(())
     }
@@ -279,15 +296,47 @@ async fn process_pty_bytes(
     events: &LocalEvents,
     control: &mut MainLoopControl<'_>,
 ) -> Result<()> {
-    for byte in bytes {
+    let old_delayed_count = term.get_delayed_events_count();
+    let mut forwarded = 0;
+    for (index, byte) in bytes.iter().enumerate() {
         processor.advance(term, *byte);
-        if events.has_pending() {
+        let boundary = processor.is_output_boundary();
+        if events.has_pending() || (boundary && control.csi_u_pending()) {
+            // The real terminal must see all output up to this OSC before
+            // applying its controls. In particular, CSI-u pushes/pops belong
+            // to the screen selected by preceding alternate-screen changes.
+            // Drain non-output controls immediately. VTE can emit OSC events
+            // at ESC; only the desired CSI-u state waits for complete ST or a
+            // replacement sequence. An unterminated OSC chain cannot retain
+            // an ever-growing queue, and repeated modes own at most one push.
+            let end = index + 1;
+            control.stdout.write_all(&bytes[forwarded..end]).await?;
+            forwarded = end;
             control.bracketed_paste = term
                 .mode()
                 .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
             control.drain_local(events).await?;
+            if boundary {
+                control.flush_csi_u().await?;
+            }
         }
     }
+    control.stdout.write_all(&bytes[forwarded..]).await?;
+
+    // Preserve the delayed prompt policy, but forward this read's entire raw
+    // output before controls produced by the end-of-read flush.
+    let delayed_count = term.get_delayed_events_count();
+    if delayed_count > 0 && delayed_count == old_delayed_count {
+        term.flush_delayed_events();
+        control.bracketed_paste = term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        control.drain_local(events).await?;
+    }
+    if processor.is_output_boundary() {
+        control.flush_csi_u().await?;
+    }
+    control.stdout.flush().await?;
     Ok(())
 }
 
@@ -928,7 +977,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
             }
         }
 
-        let mut csi_u_set = false;
+        let mut csi_u = CsiUState::default();
 
         let result: Result<()> = 'select_loop: loop {
             if first_time && term.shell_state().has_seen_prompt {
@@ -976,7 +1025,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                 res = main_loop_rx.recv_async() => {
                     match res {
                         Ok(event) => {
-                            MainLoopControl {
+                            let mut control = MainLoopControl {
                                 remote_sender: &remote_sender,
                                 master: master.as_mut(),
                                 deferred_pty_input: &mut deferred_pty_input,
@@ -984,9 +1033,13 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 key_interceptor: &mut key_interceptor,
                                 terminal: &mut terminal,
                                 stdout: &mut stdout,
-                                csi_u_set: &mut csi_u_set,
+                                csi_u: &mut csi_u,
                                 bracketed_paste: term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
-                            }.apply(event).await?;
+                            };
+                            control.apply(event).await?;
+                            if processor.is_output_boundary() {
+                                control.flush_csi_u().await?;
+                            }
                         }
                         Err(err) => warn!("Failed to recv: {err}"),
                     };
@@ -1009,7 +1062,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                         debug!(?event, ?raw, %preexec,  "Got key event");
 
                                         // if we are in CSI u mode we try to encode first, otherwise we try to send the raw bytes first
-                                        let raw = if csi_u_set {
+                                        let raw = if csi_u.owned {
                                             event.key.encode(event.modifiers, key_code_encode_mode, true)
                                                 .ok()
                                                 .map(|s| s.into_bytes().into()).or(raw)
@@ -1177,7 +1230,6 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                         Ok(size) => {
                             trace!("Read {size} bytes from master");
 
-                            let old_delayed_count = term.get_delayed_events_count();
                             let mut control = MainLoopControl {
                                 remote_sender: &remote_sender,
                                 master: master.as_mut(),
@@ -1186,22 +1238,10 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 key_interceptor: &mut key_interceptor,
                                 terminal: &mut terminal,
                                 stdout: &mut stdout,
-                                csi_u_set: &mut csi_u_set,
+                                csi_u: &mut csi_u,
                                 bracketed_paste: term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
                             };
                             process_pty_bytes(&write_buffer[..size], &mut processor, &mut term, &local_events, &mut control).await?;
-
-                            let delayed_count = term.get_delayed_events_count();
-
-                            // We have delayed events and did not receive delayed events. Flush all
-                            // delayed events now.
-                            if delayed_count > 0 && delayed_count == old_delayed_count {
-                                term.flush_delayed_events();
-                                control.drain_local(&local_events).await?;
-                            }
-
-                            stdout.write_all(&write_buffer[..size]).await?;
-                            stdout.flush().await?;
 
                             if can_send_edit_buffer(&term) {
                                 let cursor_coordinates = get_cursor_coordinates(&terminal);
@@ -1415,11 +1455,18 @@ mod tests {
             )
         }
 
-        #[tokio::test]
-        async fn osc_burst_drains_local_controls_in_parser_order_without_self_send() {
+        struct ParserOutput {
+            bytes: Vec<u8>,
+            immediate_modes: Vec<bool>,
+            csi_u_set: bool,
+            delayed_events: usize,
+        }
+
+        async fn capture_pty_reads(reads: &[&[u8]], csi_u: bool, delay_prompt: bool) -> ParserOutput {
             let sender = RemoteSender::test_disconnected();
             let events = LocalEvents::default();
-            let mut term = parser_term(&sender, &events, true);
+            let mut term = parser_term(&sender, &events, csi_u);
+            term.set_windows_delay_end_prompt(delay_prompt);
             let mut processor = Processor::new();
             let (socket, _peer) = UnixStream::pair().unwrap();
             let mut master = SocketMaster(socket);
@@ -1427,8 +1474,13 @@ mod tests {
             let mut inserts = VecDeque::new();
             let mut interceptor = KeyInterceptor::new();
             let mut terminal = ModeTerminal::default();
-            let (mut stdout, mut capture) = tokio::io::duplex(4096);
-            let mut csi_u_set = false;
+            let (mut stdout, mut capture) = tokio::io::duplex(16384);
+            let captured_output = tokio::spawn(async move {
+                let mut output = Vec::new();
+                capture.read_to_end(&mut output).await.unwrap();
+                output
+            });
+            let mut csi_u = CsiUState::default();
             let mut control = MainLoopControl {
                 remote_sender: &sender,
                 master: &mut master,
@@ -1437,28 +1489,228 @@ mod tests {
                 key_interceptor: &mut interceptor,
                 terminal: &mut terminal,
                 stdout: &mut stdout,
-                csi_u_set: &mut csi_u_set,
+                csi_u: &mut csi_u,
                 bracketed_paste: false,
             };
-            // Each iteration produces five control events, far beyond the old
-            // 16-slot channel in a single PTY read. Parsing must apply Prompt
-            // before PreExec and keep CSI-u changes in that same order.
-            let input = b"\x1b]697;NewCmd\x07\x1b]697;PreExec\x07".repeat(64);
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                process_pty_bytes(&input, &mut processor, &mut term, &events, &mut control),
-            )
+            tokio::time::timeout(Duration::from_secs(2), async {
+                for bytes in reads {
+                    process_pty_bytes(bytes, &mut processor, &mut term, &events, &mut control).await?;
+                    // Every read, including ones ending inside an OSC/ST,
+                    // settles its events rather than retaining queue entries.
+                    assert!(!events.has_pending());
+                }
+                Ok::<_, anyhow::Error>(())
+            })
             .await
             .unwrap()
             .unwrap();
-            assert_eq!(terminal.0, [false, true].repeat(64));
             assert!(!events.has_pending());
             assert!(events.pop().is_none());
-            assert!(!csi_u_set);
             drop(stdout);
-            let mut output = Vec::new();
-            capture.read_to_end(&mut output).await.unwrap();
-            assert_eq!(output, b"\x1b[>1u\x1b[<u".repeat(64));
+            ParserOutput {
+                bytes: captured_output.await.unwrap(),
+                immediate_modes: terminal.0,
+                csi_u_set: csi_u.owned,
+                delayed_events: term.get_delayed_events_count(),
+            }
+        }
+
+        #[tokio::test]
+        async fn osc_burst_drains_local_controls_in_parser_order_without_self_send() {
+            // Each iteration produces five control events, far beyond the old
+            // 16-slot channel in a single PTY read. Verify raw output as well as
+            // generated controls, so forwarding the whole read later fails.
+            let input = b"\x1b]697;NewCmd\x07\x1b]697;PreExec\x07".repeat(64);
+            let output = capture_pty_reads(&[&input], true, false).await;
+            assert_eq!(output.immediate_modes, [false, true].repeat(64));
+            assert!(!output.csi_u_set);
+            assert_eq!(
+                output.bytes,
+                b"\x1b]697;NewCmd\x07\x1b[>1u\x1b]697;PreExec\x07\x1b[<u".repeat(64)
+            );
+        }
+
+        #[tokio::test]
+        async fn csi_u_controls_follow_screen_transitions_across_pty_read_boundaries() {
+            let cases: &[(&[u8], &[u8], &[bool], bool)] = &[
+                (b"ordinary\r\noutput", b"ordinary\r\noutput", &[], false),
+                (
+                    b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x07prompt> ",
+                    b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x07\x1b[>1uprompt> ",
+                    &[false],
+                    true,
+                ),
+                (
+                    b"\x1b]697;NewCmd\x07prompt> command\x1b]697;PreExec\x07\x1b[?1049hscreen",
+                    b"\x1b]697;NewCmd\x07\x1b[>1uprompt> command\x1b]697;PreExec\x07\x1b[<u\x1b[?1049hscreen",
+                    &[false, true],
+                    false,
+                ),
+                (
+                    b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x1b\\prompt> ",
+                    b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x1b\\\x1b[>1uprompt> ",
+                    &[false],
+                    true,
+                ),
+                (
+                    b"\x1b]697;NewCmd\x1b\\prompt> command\x1b]697;PreExec\x1b\\\x1b[?1049hscreen",
+                    b"\x1b]697;NewCmd\x1b\\\x1b[>1uprompt> command\x1b]697;PreExec\x1b\\\x1b[<u\x1b[?1049hscreen",
+                    &[false, true],
+                    false,
+                ),
+                // OSC can also end by starting another escape sequence.
+                // Controls must wait for its final byte, even with a C0 LF
+                // executing midway through CSI parsing.
+                (
+                    b"\x1b[?1049hscreen\x1b]697;NewCmd\x1b[?1049\nlprompt> ",
+                    b"\x1b[?1049hscreen\x1b]697;NewCmd\x1b[?1049\nl\x1b[>1uprompt> ",
+                    &[false],
+                    true,
+                ),
+                (
+                    b"\x1b]697;NewCmd\x1b]0;title\x07prompt> ",
+                    b"\x1b]697;NewCmd\x1b]0;title\x07\x1b[>1uprompt> ",
+                    &[false],
+                    true,
+                ),
+                (
+                    b"\x1b]697;NewCmd\x1bP0qpayload\x1b\\prompt> ",
+                    b"\x1b]697;NewCmd\x1bP0qpayload\x1b\\\x1b[>1uprompt> ",
+                    &[false],
+                    true,
+                ),
+                // Synchronized output replays both mode requests at its end;
+                // their final disabled state needs no push or pop.
+                (
+                    b"\x1bP=1s\x1b\\\x1b]697;NewCmd\x07\x1b]697;PreExec\x07\x1bP=2s\x1b\\tail",
+                    b"\x1bP=1s\x1b\\\x1b]697;NewCmd\x07\x1b]697;PreExec\x07\x1bP=2s\x1b\\tail",
+                    &[false, true],
+                    false,
+                ),
+                (
+                    b"\x1b]697;NewCmd\x1b\\\x1b]697;NewCmd\x07\x1b]697;PreExec\x07\x1b]697;PreExec\x1b\\tail",
+                    b"\x1b]697;NewCmd\x1b\\\x1b[>1u\x1b]697;NewCmd\x07\x1b]697;PreExec\x07\x1b[<u\x1b]697;PreExec\x1b\\tail",
+                    &[false, false, true, true],
+                    false,
+                ),
+                (
+                    b"\x1b]697;PreExec\x07\x1b]697;PreExec\x1b\\tail",
+                    b"\x1b]697;PreExec\x07\x1b]697;PreExec\x1b\\tail",
+                    &[true, true],
+                    false,
+                ),
+                // Give up our push before the application's alternate screen
+                // and protocol push; reacquire only after its pop and return.
+                (
+                    b"\x1b]697;NewCmd\x07cmd\x1b]697;PreExec\x1b\\\x1b[?1049h\x1b[>4uapp\x1b[<u\x1b[?1049l\x1b]697;NewCmd\x1b\\prompt",
+                    b"\x1b]697;NewCmd\x07\x1b[>1ucmd\x1b]697;PreExec\x1b\\\x1b[<u\x1b[?1049h\x1b[>4uapp\x1b[<u\x1b[?1049l\x1b]697;NewCmd\x1b\\\x1b[>1uprompt",
+                    &[false, true, false],
+                    true,
+                ),
+            ];
+            for &(input, expected, modes, csi_u_set) in cases {
+                let assert_output = |output: ParserOutput| {
+                    assert_eq!(output.bytes, expected);
+                    assert_eq!(output.immediate_modes, modes);
+                    assert_eq!(output.csi_u_set, csi_u_set);
+                };
+                assert_output(capture_pty_reads(&[input], true, false).await);
+                // Every split covers partial CSI/OSC sequences and their
+                // terminators; byte reads also cover more than two chunks.
+                for split in 1..input.len() {
+                    assert_output(capture_pty_reads(&[&input[..split], &input[split..]], true, false).await);
+                }
+                let byte_reads: Vec<_> = input.chunks(1).collect();
+                assert_output(capture_pty_reads(&byte_reads, true, false).await);
+            }
+        }
+
+        #[tokio::test]
+        async fn delayed_prompt_controls_follow_the_read_that_flushes_them() {
+            let prompt = b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x07";
+            let pending = capture_pty_reads(&[prompt], true, true).await;
+            assert_eq!(pending.bytes, prompt);
+            assert!(pending.immediate_modes.is_empty());
+            assert!(!pending.csi_u_set);
+            assert_eq!(pending.delayed_events, 1);
+
+            let output = capture_pty_reads(&[prompt, b"prompt> \x1b]697;PreExec\x07tail"], true, true).await;
+            assert_eq!(
+                output.bytes,
+                b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x07prompt> \x1b]697;PreExec\x07tail\x1b[>1u"
+            );
+            assert_eq!(output.immediate_modes, [true, false]);
+            assert!(output.csi_u_set);
+            assert_eq!(output.delayed_events, 0);
+
+            // A pending prompt's CSI-u request waits through partial CSI,
+            // then writes at the earliest boundary before later UTF-8 output.
+            let output = capture_pty_reads(&[prompt, b"\x1b[3", b"1m\xe4\xb8", b"\xad"], true, true).await;
+            assert_eq!(
+                output.bytes,
+                b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x07\x1b[31m\x1b[>1u\xe4\xb8\xad"
+            );
+            assert_eq!(output.immediate_modes, [false]);
+            assert!(output.csi_u_set);
+            assert_eq!(output.delayed_events, 0);
+
+            let output = capture_pty_reads(&[prompt, b"\xe4\xb8", b"\xad"], true, true).await;
+            assert_eq!(
+                output.bytes,
+                b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x07\xe4\xb8\xad\x1b[>1u"
+            );
+            assert_eq!(output.immediate_modes, [false]);
+            assert!(output.csi_u_set);
+            assert_eq!(output.delayed_events, 0);
+
+            let output = capture_pty_reads(&[prompt, b"\xc2", b"\xc2", b"\x80"], true, true).await;
+            assert_eq!(
+                output.bytes,
+                b"\x1b[?1049hscreen\x1b[?1049l\x1b]697;NewCmd\x07\xc2\xc2\x80\x1b[>1u"
+            );
+            assert_eq!(output.immediate_modes, [false]);
+            assert!(output.csi_u_set);
+            assert_eq!(output.delayed_events, 0);
+
+            // CAN can end the opening DCS in ground state while activating
+            // synchronized buffering; its unparsed half-CSI is still unsafe.
+            let output = capture_pty_reads(
+                &[b"\x1b]697;NewCmd\x07\x1bP=1s\x18", b"\x1b[3", b"1m\x1bP=2s\x1b\\"],
+                true,
+                true,
+            )
+            .await;
+            assert_eq!(
+                output.bytes,
+                b"\x1b]697;NewCmd\x07\x1bP=1s\x18\x1b[31m\x1bP=2s\x1b\\\x1b[>1u"
+            );
+            assert_eq!(output.immediate_modes, [false]);
+            assert!(output.csi_u_set);
+            assert_eq!(output.delayed_events, 0);
+        }
+
+        #[tokio::test]
+        async fn csi_u_disabled_still_forwards_raw_prompt_and_preexec_output_once() {
+            let input = b"before\x1b]697;NewCmd\x07prompt\x1b]697;PreExec\x07after";
+            let output = capture_pty_reads(&[input], false, false).await;
+            assert_eq!(output.bytes, input);
+            assert_eq!(output.immediate_modes, [false, true]);
+            assert!(!output.csi_u_set);
+        }
+
+        #[tokio::test]
+        async fn unterminated_osc_chain_drains_each_read_and_keeps_only_the_final_csi_u_state() {
+            let input = b"\x1b]697;NewCmd\x1b]697;PreExec".repeat(2048);
+            let mut reads: Vec<&[u8]> = input.chunks(127).collect();
+            reads.push(b"\x1b]697;NewCmd\x07tail");
+            let output = capture_pty_reads(&reads, true, false).await;
+            let mut expected = input;
+            expected.extend_from_slice(b"\x1b]697;NewCmd\x07\x1b[>1utail");
+            assert_eq!(output.bytes, expected);
+            let mut modes = [false, true].repeat(2048);
+            modes.push(false);
+            assert_eq!(output.immediate_modes, modes);
+            assert!(output.csi_u_set);
         }
 
         #[tokio::test]

@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::poll_fn;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -73,6 +75,7 @@ struct Shared {
     state: Mutex<State>,
     closed: watch::Sender<bool>,
     queued: Notify,
+    responses_changed: Notify,
 }
 
 impl Shared {
@@ -166,6 +169,7 @@ pub fn channel() -> (FigtermSender, Outbox) {
             state: Mutex::new(State::default()),
             closed,
             queued: Notify::new(),
+            responses_changed: Notify::new(),
         }),
     };
     (sender.clone(), Outbox { sender })
@@ -266,6 +270,7 @@ impl FigtermSender {
         )?;
         if let Some((nonce, pending)) = pending {
             state.responses.insert(nonce, pending);
+            self.shared.responses_changed.notify_one();
         }
         Ok(())
     }
@@ -280,10 +285,45 @@ impl FigtermSender {
         if let Some(pending) = state.responses.remove(&nonce) {
             let _ = pending.reply.send(response);
         }
+        self.shared.responses_changed.notify_one();
     }
 
-    pub(crate) fn maintain(&self) {
-        Shared::prune_responses(&mut self.shared.state.lock());
+    fn maintain(&self) -> Option<Instant> {
+        let mut state = self.shared.state.lock();
+        Shared::prune_responses(&mut state);
+        state.responses.values().map(|pending| pending.deadline).min()
+    }
+
+    /// Maintain RPC ownership independently of the legacy heartbeat. With no
+    /// outstanding replies this task waits on notifications, without a timer.
+    pub(crate) async fn maintain_responses(&self) {
+        loop {
+            let changed = self.shared.responses_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let deadline = self.maintain();
+            tokio::select! {
+                biased;
+                _ = self.closed() => return,
+                _ = &mut changed => {},
+                _ = poll_fn(|cx| {
+                    let mut state = self.shared.state.lock();
+                    // The oneshot registers this task for receiver cancellation.
+                    // No extra watcher/task per pending RPC is retained.
+                    if state.responses.values_mut().any(|pending| pending.reply.poll_closed(cx).is_ready()) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }) => {},
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {},
+            }
+        }
     }
 
     pub fn close(&self) {
@@ -452,8 +492,83 @@ mod tests {
         assert_eq!(sender.diagnostics().pending_messages, 0);
         let (command, mut reply) = FigtermCommand::run_process("x".into(), vec![], None, vec![], Some(Duration::ZERO));
         sender.send(command).unwrap();
-        sender.maintain();
+        assert!(sender.maintain().is_none());
         assert_eq!(sender.diagnostics().pending_responses, 0);
         assert!(reply.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn maintenance_rearms_for_a_new_earlier_rpc_without_a_heartbeat() {
+        use std::future::Future;
+
+        let (sender, _receiver) = channel();
+        let (long_command, mut long_reply) = FigtermCommand::run_process("long".into(), vec![], None, vec![], None);
+        sender.send(long_command).unwrap();
+        let maintenance = sender.maintain_responses();
+        tokio::pin!(maintenance);
+        // Park the real maintenance future on the long deadline before adding
+        // a shorter RPC. No heartbeat task is present in this fixture.
+        poll_fn(|cx| {
+            assert!(maintenance.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let (short_command, short_reply) =
+            FigtermCommand::run_process("short".into(), vec![], None, vec![], Some(Duration::from_millis(10)));
+        sender.send(short_command).unwrap();
+        let expired = async {
+            tokio::select! {
+                result = short_reply => assert!(result.is_err()),
+                _ = &mut maintenance => panic!("maintenance exited before retirement"),
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), expired).await.unwrap();
+        assert_eq!(sender.diagnostics().pending_responses, 1);
+        assert!(matches!(
+            long_reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        sender.respond(0, hostbound::response::Response::Error("fixture response".into()));
+        assert!(matches!(long_reply.await, Ok(hostbound::response::Response::Error(_))));
+        assert_eq!(sender.diagnostics().pending_responses, 0);
+        sender.close();
+        maintenance.await;
+    }
+
+    #[tokio::test]
+    async fn receiver_cancellation_wakes_maintenance_and_releases_the_rpc() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        #[derive(Default)]
+        struct WakeFlag(AtomicBool);
+
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let (sender, _receiver) = channel();
+        let (command, reply) = FigtermCommand::run_process("fixture".into(), vec![], None, vec![], None);
+        sender.send(command).unwrap();
+        let maintenance = sender.maintain_responses();
+        tokio::pin!(maintenance);
+        let wake = Arc::new(WakeFlag::default());
+        let waker = Waker::from(wake.clone());
+        let mut context = Context::from_waker(&waker);
+        assert!(maintenance.as_mut().poll(&mut context).is_pending());
+        wake.0.store(false, Ordering::Relaxed);
+        drop(reply);
+        assert!(wake.0.load(Ordering::Relaxed));
+        assert!(maintenance.as_mut().poll(&mut context).is_pending());
+        assert_eq!(sender.diagnostics().pending_responses, 0);
+        sender.close();
+        assert!(maintenance.as_mut().poll(&mut context).is_ready());
     }
 }

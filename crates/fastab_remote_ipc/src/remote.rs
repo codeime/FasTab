@@ -85,6 +85,10 @@ pub async fn handle_remote_ipc(
         .tasks
         .spawn(handle_outgoing(writer, clientbound_rx, clientbound_tx.clone()));
     connection.tasks.spawn(send_pings(clientbound_tx.clone()));
+    let maintenance = clientbound_tx.clone();
+    connection.tasks.spawn(async move {
+        maintenance.maintain_responses().await;
+    });
 
     let mut reader = BufferedReader::new(reader);
     // A hook can itself await work. Retirement must also cancel that wait,
@@ -330,7 +334,10 @@ async fn send_pings(outgoing: FigtermSender) {
             biased;
             _ = outgoing.closed() => break,
             _ = interval.tick() => {
-                outgoing.maintain();
+                // Keep the original heartbeat for old peers and forwarded
+                // connections. There is no negotiated capability to omit it.
+                // Its write deadline still detects a peer with a closed read
+                // half, even while no application frame is being sent.
                 if outgoing.send_packet(Clientbound {
                     packet: Some(clientbound::Packet::Ping(())),
                 }).is_err() {

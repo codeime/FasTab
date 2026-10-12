@@ -64,10 +64,12 @@ impl EventHandler {
         }
     }
 
-    fn send_full_context_hook(&self, message: Hostbound) {
+    fn send_full_context_hook(&self, build_message: impl FnOnce() -> Hostbound) {
         if let Some(sender) = self.socket_sender.current() {
+            // Capture the ready generation before cloning env/alias. Admission
+            // still rejects this sender if that generation retires meanwhile.
             let _ = sender.try_send_with_context(
-                message,
+                build_message(),
                 ContextAdmission {
                     full_context: true,
                     environment_epoch: Some(shell_context_epoch()),
@@ -82,10 +84,6 @@ impl EventListener for EventHandler {
         debug!(?event, ?shell_state, "Handling event");
         match event {
             Event::Prompt => {
-                let context = shell_state_to_context(shell_state);
-                let hook = new_prompt_hook(Some(context));
-                let message = hook_to_message(hook);
-
                 let insert_on_new_cmd = INSERT_ON_NEW_CMD.lock().unwrap().take();
 
                 if let Some(cwd) = &shell_state.local_context.current_working_directory {
@@ -108,31 +106,34 @@ impl EventListener for EventHandler {
 
                 self.local_events.push(MainLoopEvent::SetImmediateMode(false));
 
-                self.send_full_context_hook(message);
+                self.send_full_context_hook(|| {
+                    hook_to_message(new_prompt_hook(Some(shell_state_to_context(shell_state))))
+                });
 
                 if self.csi_u_enabled {
                     self.local_events.push(MainLoopEvent::SetCsiU);
                 }
             },
             Event::PreExec => {
-                let context = shell_state_to_context(shell_state);
-                let hook = new_preexec_hook(Some(context));
-                let message = hook_to_message(hook);
-
                 self.local_events.push(MainLoopEvent::UnlockInterception);
                 self.local_events.push(MainLoopEvent::SetImmediateMode(true));
 
-                self.send_full_context_hook(message);
+                self.send_full_context_hook(|| {
+                    hook_to_message(new_preexec_hook(Some(shell_state_to_context(shell_state))))
+                });
 
                 if self.csi_u_enabled {
                     self.local_events.push(MainLoopEvent::UnsetCsiU);
                 }
             },
             Event::CommandInfo(command_info) => {
-                let context = shell_state_to_context(shell_state);
-                let hook = new_postexec_hook(context, command_info.command.clone(), command_info.exit_code);
-                let message = hook_to_message(hook);
-                self.send_full_context_hook(message);
+                self.send_full_context_hook(|| {
+                    hook_to_message(new_postexec_hook(
+                        shell_state_to_context(shell_state),
+                        command_info.command.clone(),
+                        command_info.exit_code,
+                    ))
+                });
 
                 if let Err(err) = self.history_sender.send(HistoryCommand::Insert(command_info.clone())) {
                     error!(%err, "Sender error");
@@ -153,5 +154,52 @@ impl EventListener for EventHandler {
         if let Err(err) = fastab_log::set_log_level(level.unwrap_or_else(|| LevelFilter::INFO.to_string())) {
             error!(%err, "Failed to set log level");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::term::CommandInfo;
+
+    #[test]
+    fn disconnected_hooks_skip_construction_but_keep_controls_and_history() {
+        let (history_sender, history) = flume::unbounded();
+        let local_events = LocalEvents::default();
+        let handler = EventHandler::new(
+            RemoteSender::test_disconnected(),
+            history_sender,
+            local_events.clone(),
+            true,
+        );
+        handler.send_full_context_hook(|| panic!("disconnected context must not be constructed"));
+        let shell_state = ShellState::default();
+        handler.send_event(Event::Prompt, &shell_state);
+        assert!(matches!(
+            local_events.pop(),
+            Some(MainLoopEvent::SetImmediateMode(false))
+        ));
+        assert!(matches!(local_events.pop(), Some(MainLoopEvent::SetCsiU)));
+        handler.send_event(Event::PreExec, &shell_state);
+        assert!(matches!(local_events.pop(), Some(MainLoopEvent::UnlockInterception)));
+        assert!(matches!(
+            local_events.pop(),
+            Some(MainLoopEvent::SetImmediateMode(true))
+        ));
+        assert!(matches!(local_events.pop(), Some(MainLoopEvent::UnsetCsiU)));
+        let command = CommandInfo {
+            command: Some("fixture".into()),
+            shell: None,
+            pid: None,
+            session_id: None,
+            cwd: None,
+            start_time: None,
+            end_time: None,
+            username: None,
+            exit_code: Some(0),
+        };
+        handler.send_event(Event::CommandInfo(&command), &shell_state);
+        assert!(matches!(history.try_recv(), Ok(HistoryCommand::Insert(saved)) if saved.command == command.command));
+        assert!(local_events.pop().is_none());
     }
 }
