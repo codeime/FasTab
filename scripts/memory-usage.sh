@@ -64,7 +64,10 @@ is_product_image() {
 
 collect_pids() {
     local snapshot pid command mapped_file mapped start verified
-    snapshot=$(ps -Ao pid=,command=)
+    if ! snapshot=$(ps -Ao pid=,command=); then
+        echo "Cannot read process list; memory usage is unknown." >&2
+        return 1
+    fi
     while read -r pid command; do
         [[ $command =~ $CANDIDATE ]] || continue
         start=$(ps -p "$pid" -o lstart= 2>/dev/null) || continue
@@ -127,13 +130,18 @@ human() {
 
 report() {
     # `mapfile` would be tidier but macOS still ships bash 3.2.
-    local args=() pid
+    local args=() pid pids
+    # A process substitution hides collect_pids failures from this shell.
+    # Do not report an inaccessible process list as zero running processes.
+    pids=$(collect_pids) || return 1
     while read -r pid; do
-        [[ -n $pid ]] && args+=(-p "$pid")
-    done < <(collect_pids)
+        if [[ -n $pid ]]; then
+            args+=(-p "$pid")
+        fi
+    done <<<"$pids"
 
     if [[ ${#args[@]} -eq 0 ]]; then
-        echo "No Fastab processes running."
+        echo "No verified Fastab processes found."
         return
     fi
 

@@ -234,3 +234,201 @@
 3. 候选包核对各运行进程的 commit/UUID 与实际磁盘文件身份，再用相同隔离 PTY 负载对照 R1/R2/R7/R8：两次 2 MiB 粘贴、12/60 秒取样、无效 UTF-8、同批 32 OSC、EOF/child exit。核对字节/hash/事件边界和全部任务退出。
 4. 普通使用覆盖候选显示→Tab→清空、设置反复开关、快速终端切换、多标签、停止读取的 socket/重新连接、冷文件图标及长时空闲。记录 phys_footprint/peak、CPU/wakeups、队列/窗口/缓存数、恢复延迟，分别报告主进程和每个 fterm，不仅给合计。
 5. 不可返回的 OS 调用仍可能留下 watchdog abandoned thread；本次准确计数并限制队列/原生图标槽，没有证明可强杀线程，也没有引入全局降级阈值。数值 capacity/估算载荷不等于物理页；raw view capacity 不代表共享 backing 全大小。同步 SQLite 持久化仍位于 supervisor，慢磁盘极端场景需后续独立证据。强制 abort 无法执行异步生命周期 hook，正常关闭仍按原顺序通知；abort 的保证是会话、socket、队列及子任务不遗留。
+
+## 7. 2026-10-12 复核与性能跟进
+
+本节源码基线为 `921cb894`，记录后续工作区修改。没有本地编译或执行 Rust 回归，也没有替换、重启安装版。下面的运行数字属于旧安装版，不是新修改的性能验收。
+
+### 当前安装版内存证据
+
+10:38（Asia/Shanghai）读取同一 desktop PID 37046，启动时间仍为 10 月 10 日 14:08:16：
+
+| 指标 | 本次观测 |
+| --- | --- |
+| desktop phys_footprint / peak | 38.1 / 88.4 MiB |
+| heap live allocation | 14,447,920 bytes，约 13.78 MiB |
+| malloc dirty+swap fragmentation | 约 13.2 MiB，不是可保证归还的页数 |
+| engine registry / hook results / hook catalog | 全部为空或 unloaded |
+| history | 175 行、7,311 bytes |
+| completion submitted / completed / cancelled | 23 / 20 / 3，与前次记录相同 |
+| AXUIElement / NSLock | 37 / 16 个；未列出 GPUIWindow、GPUIView、GPUIPanel、CAMetalLayer |
+| IME / 两个 fterm footprint | 9.2 / 5.8 / 5.4 MiB |
+| 四个进程合计 | 58.5 MiB |
+
+证据来自 `scripts/memory-usage.sh --peak`、已安装 CLI 的 `dump-state engine`、`vmmap -summary 37046` 和 `/tmp/fastab-20261012-37046-heap.txt`。本次未见 engine 缓存残留，且这段时间请求数没有增长，不能据此证明活跃输入负载下没有增长。仍不加入未经新实验验证的 allocator 强制回收，也不把静态资源计数等同于物理内存降幅。
+
+采样期间另确认一个诊断错误：沙箱拒绝 `ps` 时，旧脚本因 process substitution 未传播失败，仍输出“No Fastab processes running”。现在显式传播失败并报告 unknown；这与成功枚举后确实没有进程分开处理。
+
+### 已实施的热路径优化
+
+| 路径 | 原有重复工作 | 本次改动及语义约束 |
+| --- | --- | --- |
+| `fastab_engine/src/rank.rs` | 排序每次比较重复计算两行的大小写/模糊匹配分数，遍历历史 alias 和 acceptance | 单次排序使用 cached key，每候选至多评分一次；保留 auto-execute、逐行 query term、匹配桶、优先级、alphabetical、稳定平分及现有小列表去重。临时 key 会增加紧凑 scratch，未宣称该项降低峰值内存。 |
+| `fastab_engine/src/filegen.rs` | 收集、排序全部匹配目录项，最后只取 49；文件名比较逐字符分配 String | 保留最多 49 项的 max-heap，扫描序作为稳定并列顺序；最终仅排序保留项。文件名小写用字符迭代，不改成有上下文规则的整串 Unicode 小写。过滤、隐藏项顺序、目录后缀、symlink、单独的 `../` 条件和其预留槽不变。 |
+| `fastab_gpui/src/overlay.rs` | 比较新旧列表及恢复选中项时，为每行复制四个身份字段 | 借用字段比较；替换旧列表前查得新索引，保留选中项消失、无旧选中项和隐藏三个分支语义。公开 owned identity API 保留。 |
+| `fastab_gpui/src/list.rs` | 每次 render 将全部同类显示名复制为小写字符串数组，再建立引用数组求前缀 | 只持有一个前缀字符串，逐字符 ASCII 不区分大小写比较，在 UTF-8 边界截断，前缀为空即结束。沿用类型和父目录过滤，不用 suggestions revision 缓存显示名。 |
+
+目录项为 D 时，候选保存从 O(D) 降至最多 49 项，仍需遍历整个目录；排序评分次数从通常随 O(N log N) 比较增长改为 O(N)。这是源码复杂度和所有权变化，尚无新安装版耗时或物理内存对照数字。最终 suggestions 没有全局条数/字节 cap，不能将单源 49 项上限解释为整个补全列表上限。
+
+新增回归保留在现有模块：ranking 使用旧比较器核对 Unicode、alias、query override、scoped/global acceptance 和稳定顺序；filegen 对照旧全排序，覆盖 2,000 项候选与 320 项真实目录、Unicode 和隐藏项；GPUI 覆盖 Unicode 字符边界、ASCII-only 折叠、单匹配及显示名更新，复用现有选择/滚动回归。
+
+### CSI-u 修复与审查边界
+
+条件回归只在 `qterm.csi-u.enabled=true`（默认 false）时触发：同一 PTY read 包含退出备用屏幕与 NewCmd，旧 HEAD 会先发送启用 CSI-u，再转发原始退出序列，将模式 push 到错误屏幕。该问题不能解释默认配置下的普通 Tab 或内存问题。
+
+修复先转发事件之前的原始输出，再及时清空本地控制队列；只有 CSI-u 输出等待完整边界，不为每个普通字节调用 stdout write。VTE 在 OSC 的 ST 首字节 ESC 就派发事件，不能在 ESC 与反斜杠之间插入控制，因此边界标记跟随实际 parser 回调，也覆盖未完成 UTF-8 和同步输出缓冲。
+
+独立 review 又发现，若所有事件都等待完整边界，连续未终止的 OSC 链会让本地队列无界增长。最终仅用 `desired` / `owned` 两个 bool 保留键盘模式请求：重复启停幂等，在最早安全边界发送差异，完整写入且 flush 成功后才更新 `owned`。它表示 Fastab 尚未配对退出的一次 push，不宣称跟踪终端的实际模式栈；输入编码继续读取 `owned`。正常 shell 的 PreExec 在应用切屏/push 前退出，NewCmd 在应用返回后进入。
+
+回归检查完整输出字节序列，包括 BEL/ST 的全部两段切分和逐字节 read、应用 push/pop 与备用屏幕交接、重复启停、延迟 prompt、UTF-8 和同步 replay，以及 2,048 次未终止 OSC 链且每次 read 后队列为空。对于缺失终止符、直接被跨屏序列中止的畸形 hook，只保证原始字节不被插断和控制状态有界，不保证恢复任意外部程序改写的键盘模式栈。
+
+### 本轮检查结果
+
+CSI-u、engine 排序/目录扫描、GPUI 热路径分别经过独立 Astra 审查，发现的问题已修正，最终实际 diff 无新增发现。六个修改的 Rust 文件直接 `rustfmt --check`、`git diff --check` 和诊断脚本 `bash -n` 通过；脚本实际验证了进程枚举被拒绝时非零退出、可访问时正常报告。没有执行 Rust 测试或本地构建，shellcheck 也因本机无可用版本未执行。
+
+### 待完成的验证与研究项
+
+- 远端 CI 执行 `fastab_term`、`alacritty_terminal`、`fastab_engine`、`fastab_gpui` 现有及新增回归，以及 workspace fmt/clippy。当前工作区的测试源码不代表测试已经通过；前一批 CI success 不覆盖本节修改。
+- 候选安装包用相同 50/500/10,000 行 ranking、大目录补全和候选重绘负载记录耗时、分配/footprint、恢复延迟；保持原始结果顺序与内容一致。对照须核对运行进程身份。
+- Apple Terminal/iTerm 通用 AX caret 路径仍是 GPUI 前台同步查询，缺少 xterm 的总预算和失败退避。这次没有捕获到该路径变慢的运行证据，暂不改变 AX timeout，后续应先取得同一终端操作的主线程采样再决定改法。xterm 已有预算/失败退避，不重复实现；标题布局也已有 GPUI 帧缓存，不能把每次 layout 调用计为全新 CoreText shaping。
+
+## 8. 按需执行专项研究（2026-10-12）
+
+本节保留第七节之后的研究依据与实施方案，**实施结果和审查修复见第九节**。研究检查对象为 `921cb894` 加当时未提交的优化；本节行号是研究时位置。主代理核查展示需求、设置刷新和 host 队列；Astra ultra 核查 engine，GPT-6.1 Sol 分别核查 native UI/AX 与 fterm/IPC，并对设置与队列结论独立反证。没有本地构建、执行测试、重启或替换安装版，也没有新增运行时收益测量。
+
+优化目标分成三类：开始前确认有消费者；执行中消费者消失则取消；结束后仅保留恢复所需状态。缓存已经有数量上限，不代表每次填充都有必要；窗口已经隐藏，也不代表所有后台工作都停止。下列优先级指实施顺序，不是缺陷严重等级。
+
+### D1：隐藏时不生成候选，同时保留首次 Tab 的入口
+
+**已确认的缺口。** `fastab_desktop/src/overlay.rs:785` 在 onlyShowOnTab 下设置隐藏后仍继续提交普通补全；Esc 的 `suppress_until_shown` 也只限制展示。`:994` 还允许隐藏结果的 pending generator 继续 debounce。空白输入、重复输入、无 caret、粘贴/历史召回后的单次抑制已有门控，不能说所有隐藏状态都在扫描。
+
+**不能只添加 return。** `overlay.rs:594` 的 global intercept 依赖 `has_items && has_position`，`fastab_term/src/interceptor.rs:240` 只有开启 global intercept 才识别隐藏状态的 Tab。完全不生成行后，首次 Tab 可能绕过 Fastab；同时停止隐藏 caret 查询又可能形成“Tab 等 caret、caret 等 Tab”的循环。`showAutocompleteFromTab` 在只有一行时立即插入（`overlay.rs:1105`），而显式 Show 只展示；两者必须继续区分。
+
+**方案。** 把“存在可以显式请求的输入”与“存在可接受的结果”分成独立状态。隐藏时只更新最新输入和上下文，不提交 Complete 或续跑 debounce；启用补全且有适用输入时，显式 Show/Tab 的请求入口同时独立于已有 rows 和已有 caret。接收意图后，缺 caret 则主动进入 WaitingForCaret 并请求位置，拿到当前 session/cursor/input generation 的结果和有效 caret 后再展示或执行原有 Tab 行为。普通自动补全保持即时。空结果、失败、取消、无 caret、切换 session 时必须结算该意图，不能永久吞掉 Tab，也不能把保留的旧行直接插进新输入。
+
+**第二阶段。** 当前隐藏十秒后刻意保留非空 rows 和其 PNG（`fastab_gpui/src/overlay.rs:304`、`overlay/file_icons.rs:351`），用于恢复。先完成上述按需恢复协议，再考虑长期隐藏仅保留输入、选中身份等最小状态，按现有宽限释放行 payload；不能先清 rows 再发现 Tab 入口失效。该方向可能减少隐藏期间持有量，代价是下一次 Show 的冷生成延迟，不承诺固定 MiB。
+
+**验收。** 真实 `FigtermCommand::InsertText` 路径覆盖首次 Tab、多/单/零候选、危险/自动执行行、连续 Tab、Esc 后继续输入、过期单行结果、caret 丢失恢复和跨终端切换。隐藏打字时 Complete 提交数应不增长，显式 Show 后必须能恢复。
+
+### D2：过期的目录扫描尽早停止
+
+**已确认。** `fastab_engine/src/filegen.rs:60` 按请求打开目标目录，不递归；`:66` 循环没有 cancellation 检查。外层 `generate.rs:340/400` 只在生成器前后检查取消，因此旧请求可能扫完整个目录才退出。49 项 heap 限制保存量，不限制目录遍历次数。默认相同路径 query 复用结果，prefix 改变会重扫（`generate.rs:577`）。
+
+**方案。** 在打开目录前、取下一项前和昂贵步骤前检查当前 attempt 取消；生成器执行完脚本后、开始文件模板前再检查一次。取消返回必须沿用整个 attempt 的取消结算，不能发布半份结果或更新 generator cache。保留完整扫描所需的排序语义，不能读到 49 项就停。普通本地迭代可协作取消，但一次已经阻塞的 `read_dir`/metadata 系统调用不能靠布尔检查中断；慢挂载仍受现有 attempt watchdog/占槽约束。
+
+**验收。** 真实目录迭代中途取消，确认后续项不继续消费、未发布部分结果，新请求可接替；未取消时与旧完整排序结果一致。应记录 entries visited、cancel-to-finish 和峰值候选数，不能只断言空结果。
+
+### D3：历史数据只构造有消费者的部分
+
+**D3a：删除无人使用的统计表，优先级高、边界小。** `rank.rs:258` 为每条历史构造完整命令、首 token、前两 token 的 `Frecency.stats`，独立复制字符串（`:275`）。唯一读取是 `score()`（`:297`），本次全仓 Rust 调用核查没有消费者；`rank` 为私有模块，Frecency 未公开 re-export。当前排序在 `apply_with_acceptance` 使用 `NextWords`，不消费这张表。可以删除 stats、专属 bump/score，保留行 intern、NextWords 和 acceptance 逻辑。收益随历史规模变化；第七节的小历史样本不支持推算大的常驻降幅。`HistoryStore` 的诊断 bytes 也不能当作所有 Frecency 辅助结构的总量。
+
+**D3b：generator cache 命中时不要先复制 history values。** `lookup.rs:2235` 只要当前参数含 history template，就先执行 `HistoryStore::arg_values`；`history.rs:269` 为去重和返回值分别复制字符串。随后 `generate.rs:386` 可能仅 refilter 已缓存 generator rows，完全不用刚创建的 values。例如纯 history 模板的 `wscat -c w` → `wscat -c ws`，没有 trigger/debounce/path 模板时即走此路径。应将 values 改成惰性 provider，仅实际执行 History generator 时取值，同一请求多个消费者共用一次结果。
+
+**约束与验收。** 核对完整候选次序、重复历史权重、slot 去重顺序、alias/shell 上下文、debounce 与多 generator。构建计数应证明 cache hit 不调用 arg_values。不能用 `include_history=false` 一刀切跳过全部历史，因为它只控制历史行合并，普通候选排名仍使用 NextWords。已有索引缓存、逐历史行取消继续保留。
+
+### D4：没有实际 hook 调用时不解析整个 catalog
+
+**已确认。** `runtime.rs:421` 首次构造加载 NativeHooks；闲置卸载后，普通请求在 lookup 前又无条件 `ensure_native`（`:811`）。单独输入 `g` 的首 token 分支不需要 hook，也可能付全 catalog 加载成本。descriptor 表达式树本来就按需解析，不能重复报告为“每次解析所有 hook”。安装版 sidecar 约 4.5 MiB 是文件体积，不是预期内存收益。
+
+**方案与必要配套。** 按 snapshot generation 绑定惰性 owner，在第一个 `dispatch_*` 初始化。`snapshot.rs:618` 已为避免二次读/hash 截留 sidecar 原始 bytes；只删 eager load 会让 bytes 留在共享 snapshot，可能增加常驻量。首次请求使用 hook 则消费 captured bytes；请求结束仍未使用则释放原始 bytes，以后需要时按同一 snapshot digest 校验重读。初始化失败的“已加载但缺失/拒绝”与“未加载”不能混为一谈，取消/idle deadline 和跨 generation 一致性不能退化。
+
+**验收。** 冷首 token/纯静态补全 catalog 初始化数为零，且没有未释放的 captured bytes；首次真实 hook 正确加载；sidecar 缺失、替换、拒绝、取消和空闲恢复行为不变。此方案会把第一次 hook 的成本延后，部分路径多读一次，列在低风险改动之后。
+
+### D5：只为真正需要系统图标的可见行加载
+
+**已确认。** `overlay.rs:1748` 对全部最终 suggestions 做 lookup；`overlay/file_icons.rs:99` 取前八个未缓存 file/folder，与 viewport 无关。`fastab_gpui/src/list.rs:1432` 优先显示有效 `icon_identifier`，但这些行仍可能生成永远不会显示的 native PNG。GPUI 的 `uniform_list` 已只渲染可见 range，不存在这里的“全列表渲染”问题。
+
+**分两步。** 先用与 renderer 共用的纯判定排除有效显式图标；不能仅检查 `icon_identifier.is_some()`，未知 identifier 仍需要 fallback。再由实际可见 range/选中与滚动变化驱动 native 请求，立即显示 bundled fallback。保持单 native worker、每批预算、最新 pending 和 generation 检查；正在执行的同步 AppKit 调用仍占槽。隐藏后的新 batch 已有 visible gate，不能说当前隐藏会无限调用 NSWorkspace。
+
+**验收。** 有效/未知显式图标、初始 viewport、向下滚动、快速切换目录/隐藏；provider 计数证明未展示/被显式图标覆盖的行不触发 native 查询，迟到结果不覆盖新行。隐藏十秒仍由 rows 引用的 decoded PNG 是实际持有路径，但不能将少查几个图标等同于固定 footprint 降幅。
+
+### D6：caret 查询也服从补全需求
+
+**已确认。** `remote_ipc/mod.rs:142` 每个非空 buffer 独立发布 EditBufferChanged；host → `platform/macos.rs:560` 刷新位置，`:1112` 无全局/单终端 disable 或 overlay demand gate。即使 completion 入口已返回，仍可能走 AX 或发送 IME 通知。已有前台 terminal 筛选、window/leaf 缓存、xterm 预算/失败退避、PID/window/epoch 校验，不能把它描述为没有任何保护。
+
+**方案。** 先跳过明确禁用的按键驱动 refresh；然后与 D1 共用需求状态：自动展示、显式 Show 或 WaitingForCaret 才请求位置。不能直接用 `visible`，否则首帧需要 caret、caret 又等待首帧会形成循环依赖。暂停时继续维护 focus/session 身份失效；恢复请求新 caret，不复用另一窗口的位置。
+
+**验收。** 全局禁用/单终端禁用时查询计数不增长，重新启用、首个字符、Show、切窗后正确恢复；覆盖 Otty/IME 路径和 xterm AX 路径。收益主要是输入期间主线程时间，不是空白终端每次光标闪烁都会走 AX。
+
+### D7：设置变化按影响范围刷新，并合并重复通知
+
+**已确认并独立复核。** `settings_ui.rs:144/152` 的设置写入都发送 ReloadCredentials；`file_watcher.rs:82` 随后的文件 Create/Modify 可能再次发送，相同内容没有短路。`gpui_host.rs:89` 在启用状态调用强制 recomplete。因此语言、字体、静默启动这类变化，在仍有可用输入/caret 时也会提交补全；不能写成“每次改设置必扫描”，因为空输入/无 caret/结束输入仍有门控，generator 也可能命中缓存。
+
+**方案。** 传递变化 key 或比较设置快照：展示设置只 apply/notify/relayout，补全语义 key 才重算；文件事件加载后等于前快照则跳过重复业务刷新。保留外部 ftab 写配置的通知，并对 UI 直接通知与 watcher 回声使用同一版本/内容去重。写失败不能发布一次虚假的成功刷新；失败反馈作为实现时的边界一起处理，不扩展设置业务。
+
+**验收。** 字体/语言变化更新 UI 且 Complete 计数不增加；fuzzy/history/sort 等确需刷新；UI 写入加 watcher 回声只生效一次；外部写入、删除 key、快速连改和真正结束输入均正确。
+
+### D8：在 host 队列入口减少已经过时的输入快照
+
+**源码确认的条件性积压风险。** `event_loop.rs:58` 是 unbounded；`remote_ipc/mod.rs:132` 为每条输入复制 buffer/cwd 入队，随后另发 caret refresh；`gpui_host.rs:408` 逐条处理。fterm 按 PTY read 批次取 buffer、其 outbox 有界、overlay 重复输入/WaitingForCaret、engine mailbox 均有保护，但没有替代 host 队列的合并。主线程被慢 AX 等工作占据时，旧文本和无用刷新可能排队；本轮未测得实际积压量，不将其归因为当前空闲内存。
+
+**方案需要额外设计。** 先把带 session 的 buffer 与对应 refresh 意图作为一个可排序单元；只对确认可替换的连续输入合并。保留 Tab/Insert/EndInput、focus/session 变化和真实 caret 结果的顺序屏障；空白 buffer 自身会结束输入，也必须作为隐式 EndInput 屏障，默认所有非明确可替换事件均阻断合并。两次 send_event 来自多 producer，不能假定始终相邻。还要保留 typing、paste、backspace 与 self-insertion 的来源语义，否则合并连打后可能被误认为粘贴并隐藏列表。可先从相同输入/重复 refresh 去重起步。
+
+**验收。** 控制 consumer 暂停，量化消息数和 payload 字节；输入/Tab/Insert/EndInput/切窗交错，以及删空后立即重新输入，最终文本、插入次数及抑制规则一致。不能直接换成阻塞 bounded.send，同线程回调可能重现“给自己发满队列”的死锁；不能无声丢弃控制消息。优先级低于边界清楚的惰性构造改动。
+
+### D9：desktop 不在线时，不构造发不出去的完整 shell context
+
+**已确认。** `fastab_term/src/event_handler.rs:85/118/132` 的 Prompt/PreExec/CommandInfo 先调用 `shell_state_to_context`，深复制 env、alias 和 context，直到 `:67` 才检查 ready sender。desktop 退出但旧 fterm 继续运行时，这些临时数据被直接丢弃；edit-buffer 路径已提前检查，不重复修改。
+
+**方案。** 发送辅助函数接收构造闭包，先取 ready generation 再构造消息，最终入队仍校验 generation。Prompt 的 cwd 更新、本地控制、pending insert、CommandInfo 历史保存和 UpdateShellContext 不能停，确保重连后第一次补全状态正确。检查后刚好断连仍可白做一次构造，接受这个有限竞态。
+
+**验收。** 断连时构造计数为零，但本地控制/历史正常；更新 env/alias 后重连，首个 context 正确；旧 generation 消息不可入队。主要减少断连后使用终端时的临时分配，完全空闲无事件时不会有这项收益。
+
+### D10：空闲 IPC 维护按期限唤醒，心跳兼容单独处理
+
+**既有事实的新节能方向。** `fastab_remote_ipc/src/remote.rs:325` 每连接五秒 maintain 加 Ping，fterm `message.rs:508` 回 Pong，desktop 更新 last_receive。本仓 last_receive 无判活消费者已在 R3 记录，不能算新泄漏。maintain 清理的是 pending RPC 取消/期限；可按最早 pending deadline 安排 timer，无 pending 不设维护 timer。
+
+**协议限制。** 不由本仓没有读端推导所有旧 peer/转发链都不依赖 Ping。拆出期限维护后，停发或降低心跳需双方协商；旧 peer 保持既有策略，保留 Ping/Pong 接收。移除探测会改变部分半关闭连接发现时机，不能偷偷改变可靠性。现有写 deadline、outbox 预算与退役机制保留。
+
+**验收。** 新旧 peer、转发链、早期限插入、取消、超时、半关闭、停读、重连和首次 Insert/Tab。当前名义每连接每分钟 12 次往返，收益重点是多标签 idle wakeups，未测得实际节能/内存值；列为后续实验。
+
+### 实施顺序与统一验收
+
+1. **第一批：边界小且可独立验证。** D3a 无用 stats、D3b history 惰性 values、D5 有效显式图标跳过、D9 断连惰性 context；D2 目录取消单独处理，保持原有完整排序。
+2. **第二批：需求状态统一。** D1 显式 Show/Tab 协议与 D6 caret demand 联动；D7 设置影响分类与去重。D5 viewport 驱动、隐藏 rows 进一步释放建立在恢复协议明确之后。
+3. **第三批：复杂或需兼容实验。** D4 catalog 与 captured bytes 共同设计；D8 host 输入合并；D10 心跳/维护拆分。先做可观察性与受控回放，再决定是否实施。
+
+验收同时记录 work avoided（扫描项、history provider/catalog/native icon/AX 调用、context 构造、Complete 提交、队列字节和唤醒）与真实 phys_footprint/恢复延迟。没有需求时计数不增长，需求回来时第一次操作正确，二者都必须成立。源码回归在远端 CI 执行；已安装旧包的数字不用于证明新方案收益。
+
+
+## 9. 按需执行实施与逐项审查（2026-10-12）
+
+本节记录 D1–D10 提交前的实施和审查证据。每项完成了实施者自审与独立源码复核；D1/D6 由 Astra ultra 实现、主代理与 GPT-6.1 Sol 复核，D4 由两名独立 Astra ultra 分别实现和审查，D5/D8 由 Astra ultra 复核，D2/D3/D7 由 GPT-6.1 Sol 交叉复核，D9/D10 由主代理复核。下表的回归均为现有 Rust 模块中的测试源码，**没有在本机编译或执行，不能称为测试已通过**。
+
+| 项目 | 实施结果 | 审查与回归重点 |
+| --- | --- | --- |
+| D1 隐藏需求 | onlyShowOnTab/Esc 隐藏时停止 Complete 与 debounce；Show/Tab 保存当前输入意图，主动请求新 caret；10 秒后释放隐藏 rows、文本容量、PNG，仅留选中身份。 | 真实 FigtermCommand::InsertText 路径覆盖冷 Tab、安全单行、多行/空结果、过期结果、连续 Tab、超时及切换输入；复核修复重新启用时没有恢复 global Tab 拦截入口；继续输入取消已显示 loading 的显式请求时，统一走完整隐藏/清 loading/停放窗口/10 秒回收。ShowIntent 直接拥有超时任务，结算即取消，避免长 scriptTimeout 下积累已失效计时器。 |
+| D2 目录取消 | read_dir 前、next 前及分类/过滤前检查取消；脚本结束到模板执行间增加取消边界；取消丢弃全部部分行，不填充缓存。 | 真实 ReadDir 第 5 项取消（包括错误项）后不消费第 6 项；记录访问数、保留峰值和取消耗时；正常请求仍完整遍历并保持原 top-49 排序。 |
+| D3 历史 | 删除无调用者的 Frecency.stats/bump/score；history values 由请求内 LazyCell 在实际 History generator 执行时构建一次。 | 真实 lookup→HistoryStore 覆盖 fish alias、shell/slot、重复历史；cache hit、debounce、trigger、多 generator 与取消不缓存；保留 NextWords 和 acceptance 排名。 |
+| D4 catalog | generation 绑定的惰性 owner，首次真实 typed/native dispatch 才解析；未加载与已加载但缺失/拒绝分别记录。 | 请求正常/取消/unwind、刷新前后和 idle owner Drop 释放未消费 captured bytes；共享 pristine snapshot 不再钉住原始 sidecar。后续读取仍按 snapshot digest 验证；诊断新增 captured_bytes，兼容旧快照且不触发加载。 |
+| D5 文件图标 | 有效显式图标跳过 native；由 UniformListDecoration 的真实 viewport 请求，沿用最多 8 个未缓存图标/批、64 个缓存与单 native worker；移出 viewport 的行释放 PNG 引用。 | 复核发现 render_items 也会用于离屏尺寸测量，改为 decoration 后避免第 0 行误请求及反复替换批次。真实 GPUI 绘制/滚动/重绘用例覆盖回调；provider/缓存用例覆盖显式/未知图标、迟到结果、隐藏释放。 |
+| D6 caret | host 传递 overlay demand；无需求、全局禁用、单终端禁用时跳过按键驱动 AX/IME 查询，仍保留 focus/session 失效链。 | Show 先进入 WaitingForCaret 再请求位置；重新启用恢复入口；无需求/全局禁用的实际 refresh 入口断言查询计数不增加。真实 Otty/IME 和 xterm/AX 验收待新包。 |
+| D7 设置 | 补全语义快照决定是否 recomplete；展示变化只 apply/notify/relayout；UI 通知与 watcher 回声共享快照，文件相同内容短路。 | 修复 watcher 二次读失败却记录成功快照的问题：直接安装首次验证成功的同一 Map。UI 写失败不发布成功刷新；展示/fuzzy/history/sort/删除 key 与重复事件均有分类回归。 |
+| D8 host 输入队列 | buffer 与对应 caret refresh 组成一个有序单元，只合并尚未消费的连续完全相同非空输入。 | 所有其他事件、空白 EndInput、session/cursor/cwd/文本变化均为屏障；保留逐字符、粘贴及 self-insertion 语义。暂停消费者时 1,000 个相同输入仅占 1 个队列项；修复接收端关闭、已取出但未消费的项仍被误判为成功发送。 |
+| D9 断连 context | 先取得 ready generation，再执行完整 shell context 构造闭包；最终入队继续校验 generation。 | 断连时构造闭包不执行，但 Prompt/PreExec 本地控制、pending insert、cwd 和 CommandInfo 历史保存继续；重连链沿用原 generation admission。 |
+| D10 RPC 维护 | 维护任务按最早 pending RPC deadline 等待，新增/响应/取消唤醒重算；无 pending 不设置维护 timer。 | 新增更早 deadline 和 oneshot 取消真实 waker 回归；保留 outbox 预算、写期限和连接退役。现有 5 秒 Ping/Pong 保持兼容。 |
+
+### 整体复核补充修复
+
+整体审查确认并修复了四处单项审查未覆盖的交互问题：
+
+- **冷 Show 旧候选。** 新 Show/Tab 在隐藏窗口后立即释放旧 rows/search/参数说明，仅保留选中身份；超过 200ms 的 loading 不再使旧候选重新可操作。
+- **部分结果的 Tab 结算。** 当前输入的非空部分结果成功定位后，即消费最初的 Show/Tab 意图；空 pending 仍等待，最终空结果才回放。任何成功插入也统一消费意图，防止 Enter/点击后 hide 再补发 Tab。显式 Show 的参数展示标记独立保留到同一输入的最终结果，避免提前结算后动态参数变化又隐藏候选；输入变化、取消和成功插入均清除该标记。
+- **临时模糊模式。** 保存的 fuzzy 默认值与快捷键的临时模式分开记录。字体、宽度、语言及 watcher 回声不重置临时模式或当前结果的匹配模式；保存的默认值改变时才更新模式，由补全语义快照安排重新计算。
+- **隐藏输入的设置 IO。** fterm 先判断无修饰 Tab，再刷新 onlyShowOnTab 设置；普通按键和带修饰的 Tab 不触发该文件读取，长生命周期终端仍在每次符合条件的 Tab 上读取最新值。
+
+回归源码覆盖真实 controller/InsertText outbox、部分结果到最终结果、未定位结果转为空结果、展示设置回声以及设置读取次数。GPUI 无原生窗口的测试中，成功定位通过生产结算入口建模；原生窗口定位与真实 shell 按键顺序仍需新包验收。所有新增回归均待远端 CI 编译和执行。
+
+### 本轮明确保留的边界
+
+- **D8 不合并不同文本。** 现有事件没有足够的 typing/paste 来源信息；粗暴取最后一条会改变隐藏/插入语义。队列整体仍无界，本轮削减相同输入突发与独立 refresh 消息，不声称已解决任意不同文本的积压，也未新增会阻塞主线程的 bounded.send。
+- **D10 不停发旧心跳。** 当前握手没有 capability，Unix socket 也可能承载 SSH 转发，不能可靠区分安全的本地链路。按第八节协议实验边界只实施期限维护拆分；不宣称多标签空闲唤醒已经消失。
+- **Tab 回放不是跨 IPC 的原子 compare-and-drop。** 发送前同时验证 controller 的输入和最新 FigtermSession buffer/cursor；切换输入/session 后不回放。现有 InsertText 的 insertion_buffer 会修复文本，不能拿它当条件写入。本轮保持协议，desktop 检查到 fterm 实际写入之间的用户按键竞态仍需未来的协议级条件插入处理。
+- **取消仍是协作式。** 已阻塞的文件系统调用或 AppKit native icon 调用不能被布尔检查中断；既有 watchdog、单工作槽和迟到结果拒收继续生效。
+- **不推算物理内存收益。** 少构造/少解析/少查询与释放引用不能直接换算为 phys_footprint；分配器页和系统框架缓存仍可能驻留。
+
+### 验证与交付边界
+
+本地仅做源码与实际 diff 审查、直接 rustfmt 格式检查及 git diff --check，未生成本地构建缓存，未替换运行中的 Fastab/IME/终端。远端 CI 仍需覆盖 fastab_engine、fastab_desktop、fastab_gpui、fastab_term、fastab_remote_ipc 和 alacritty_terminal 的回归，以及 workspace Clippy（-D warnings）。
+
+新包验收应分开记录冷启动/纯静态补全/首次 hook/大目录快速改字/滚动图标/onlyShowOnTab/设置关闭后闲置 10 秒的工作计数、恢复延迟和 phys_footprint，并核对二进制身份。Otty 无 caret、连续 Tab 与切窗使用真实输入路径；多标签 RPC/半关闭/重连维持既有可靠性。本轮的源码审查结果不替代这些运行验收。
