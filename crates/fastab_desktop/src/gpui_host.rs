@@ -17,7 +17,7 @@ use tray_icon::TrayIcon;
 
 use crate::event::{Event, ShowMessageNotification, WindowEvent};
 use crate::overlay::OverlayController;
-use crate::platform::PlatformState;
+use crate::platform::{PlatformBoundEvent, PlatformState};
 use crate::tray::{self, get_context_menu, get_icon};
 use crate::webview::notification::WebviewNotificationsState;
 use crate::webview::{DASHBOARD_ID, FigIdMap, WindowId};
@@ -54,12 +54,20 @@ pub struct DesktopHost {
     pub window_target: EventLoopWindowTarget,
     pub overlay: OverlayController,
     pub settings: Option<crate::settings_ui::SettingsHandle>,
+    pub completion_settings: crate::settings_refresh::CompletionSettings,
     pub tray: TrayIcon,
 }
 
 impl DesktopHost {
     pub fn dispatch(&mut self, event: Event, cx: &mut App) {
         match event {
+            Event::GpuiOverlayVisibleRows {
+                generation,
+                revision,
+                range,
+            } => {
+                self.overlay.request_visible_icons(generation, revision, range, cx);
+            },
             Event::JevSettingsChanged => self.overlay.reload_jev(cx),
             Event::JevCredentialsLoaded { epoch, credentials } => {
                 self.overlay.jev_credentials_loaded(epoch, credentials);
@@ -87,12 +95,16 @@ impl DesktopHost {
                 self.tray.set_menu(Some(Box::new(get_context_menu(is_logged_in))));
             },
             Event::ReloadCredentials => {
+                let needs_completion = self
+                    .completion_settings
+                    .refresh(&fastab_settings::settings::Settings::new());
                 let autocomplete_enabled = autocomplete_should_run();
                 self.overlay.apply_theme(cx);
                 self.overlay.set_enabled(autocomplete_enabled, cx);
-                if autocomplete_enabled {
+                if autocomplete_enabled && needs_completion {
                     self.overlay.recomplete(cx);
                 }
+                self.overlay.relayout_and_sync(cx);
             },
             Event::ReloadAccessibility => {
                 self.tray.set_menu(Some(Box::new(get_context_menu(true))));
@@ -148,6 +160,10 @@ impl DesktopHost {
                 }
             },
             Event::PlatformBoundEvent(native_event) => {
+                #[cfg(target_os = "macos")]
+                self.platform_state
+                    .inner()
+                    .set_caret_demand(self.overlay.wants_caret(cx));
                 #[cfg(target_os = "macos")]
                 if let crate::platform::PlatformBoundEvent::ExternalWindowFocusChanged { app, window } = &native_event {
                     // AX discovery may have blocked since this event was produced.
@@ -221,6 +237,25 @@ impl DesktopHost {
                     }
                 });
             },
+            Event::GpuiOverlayInput(input) => {
+                if let Some(input) = input.take() {
+                    let needs_caret = !input.buffer.trim().is_empty();
+                    self.dispatch(
+                        Event::GpuiOverlayBuffer {
+                            buffer: input.buffer,
+                            cwd: input.cwd,
+                            cursor: input.cursor,
+                            session_id: input.session_id,
+                        },
+                        cx,
+                    );
+                    // Establish the input/session before querying AX/IME. Both
+                    // halves occupy one queue slot and cannot interleave.
+                    if needs_caret {
+                        self.dispatch(Event::PlatformBoundEvent(PlatformBoundEvent::EditBufferChanged), cx);
+                    }
+                }
+            },
             Event::GpuiOverlayBuffer {
                 buffer,
                 cwd,
@@ -235,6 +270,9 @@ impl DesktopHost {
             },
             Event::GpuiOverlayEndInput { session_id } => {
                 self.overlay.end_input(session_id, cx);
+            },
+            Event::GpuiOverlayShowExpired { token } => {
+                self.overlay.expire_show(token, cx);
             },
             Event::GpuiOverlayLoadingExpired { generation } => {
                 self.overlay.expire_loading(generation, cx);

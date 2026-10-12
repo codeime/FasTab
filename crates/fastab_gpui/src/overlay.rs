@@ -12,6 +12,9 @@ use crate::macos::{
     OVERLAY_WINDOW_TITLE, harden_overlay_window_handle, park_overlay_window_handle, try_set_overlay_frame_handle,
 };
 
+/// Notification from the laid out suggestion viewport.
+pub type VisibleRowsCallback = Arc<dyn Fn(std::ops::Range<usize>, (u64, u64)) + Send + Sync>;
+
 /// Shared overlay entity: visibility, selection, and the suggestion rows.
 pub struct OverlayState {
     pub visible: bool,
@@ -80,8 +83,12 @@ pub struct OverlayState {
     /// real keystroke if the terminal emits no acknowledgement.
     suppress_unchanged_completion: Option<(String, u32)>,
     pub has_changed_index: bool,
+    /// Only the selected row's identity survives hidden payload retirement.
+    retained_selection: Option<crate::list::SelectionIdentity>,
     pub on_click_insert: Option<Arc<dyn Fn(crate::list::ClickInsert) + Send + Sync>>,
     pub on_disable_dev_mode: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub on_visible_range: Option<VisibleRowsCallback>,
+    icon_result_revision: u64,
     pub ai_preview: Option<crate::AiPreview>,
     /// Changes synchronously with UI content so queued acceptance cannot
     /// target a row from before a local click or refresh.
@@ -131,8 +138,11 @@ impl OverlayState {
             suppress_next_completion: false,
             suppress_unchanged_completion: None,
             has_changed_index: false,
+            retained_selection: None,
             on_click_insert: None,
             on_disable_dev_mode: None,
+            on_visible_range: None,
+            icon_result_revision: 0,
             ai_preview: None,
             ai_revision: 0,
             ai_promoted_from: None,
@@ -141,6 +151,10 @@ impl OverlayState {
 
     pub fn effective_font_size(&self) -> f32 {
         self.font_size * self.size_scale
+    }
+
+    pub fn icon_request_revision(&self) -> (u64, u64) {
+        (self.icon_result_revision, self.suggestions_revision)
     }
 
     pub fn effective_row_height(&self) -> f32 {
@@ -197,13 +211,14 @@ impl OverlayState {
         search_term: String,
         match_term: String,
     ) {
+        self.icon_result_revision = self.icon_result_revision.wrapping_add(1);
         self.invalidate_ai();
         let content_changed = self.items.len() != items.len()
             || self
                 .items
                 .iter()
                 .zip(&items)
-                .any(|(old, new)| crate::list::selection_identity(old) != crate::list::selection_identity(new));
+                .any(|(old, new)| !crate::list::same_selection_identity(old, new));
         // A new query can legitimately return the same rows in the same
         // order. It is still a new completion context: an old mouse-wheel
         // offset may leave the selected row outside the viewport. Do not
@@ -215,20 +230,35 @@ impl OverlayState {
         }
         let will_be_visible = !self.suppress_until_shown && (!items.is_empty() || self.has_current_arg());
         let keep = if self.has_changed_index && will_be_visible {
-            self.selected_item().map(crate::list::selection_identity)
+            self.selected_item().map(|selected| {
+                items
+                    .iter()
+                    .position(|item| crate::list::same_selection_identity(item, selected))
+            })
         } else {
             None
         };
+        let restored = self
+            .retained_selection
+            .take()
+            .and_then(|(name, kind, insert_value, description)| {
+                items.iter().position(|item| {
+                    item.name == name
+                        && item.kind == kind
+                        && item.insert_value == insert_value
+                        && item.description == description
+                })
+            });
+        if restored.is_some() {
+            self.has_changed_index = true;
+        }
+        let keep = keep.or_else(|| restored.map(Some));
         self.items = items;
         self.search_term = search_term;
         self.match_term = match_term;
         self.loading = false;
-        if let Some(identity) = keep {
-            if let Some(index) = self
-                .items
-                .iter()
-                .position(|item| crate::list::selection_identity(item) == identity)
-            {
+        if let Some(index) = keep {
+            if let Some(index) = index {
                 self.selected = index;
             } else {
                 self.selected = 0;
@@ -289,6 +319,7 @@ impl OverlayState {
 
     pub fn clear_suggestions(&mut self) {
         self.invalidate_ai();
+        self.retained_selection = None;
         if !self.items.is_empty() {
             self.suggestions_revision = self.suggestions_revision.wrapping_add(1);
         }
@@ -301,8 +332,25 @@ impl OverlayState {
         self.has_changed_index = false;
     }
 
-    /// Return storage left by an ended input after the idle grace period.
-    /// Nonempty rows and parser context still belong to explicit Tab recovery.
+    /// Retire hidden rows and their decoded PNGs after the existing grace.
+    /// Explicit Show regenerates from the controller's current input snapshot.
+    pub fn release_hidden_payload(&mut self) {
+        if self.visible {
+            return;
+        }
+        self.invalidate_ai();
+        let selection = self
+            .has_changed_index
+            .then(|| self.selected_item())
+            .flatten()
+            .map(crate::list::selection_identity)
+            .or_else(|| self.retained_selection.take());
+        self.clear_suggestions();
+        self.retained_selection = selection;
+        self.release_empty_capacity();
+    }
+
+    /// Return empty storage left by an ended input after the idle grace.
     pub fn release_empty_capacity(&mut self) {
         if self.items.is_empty() {
             self.items.shrink_to_fit();
@@ -448,6 +496,33 @@ impl Default for OverlayState {
 mod tests {
     use super::*;
     use crate::list::SuggestionItem;
+
+    #[test]
+    fn hidden_payload_retires_rows_but_restores_selected_identity() {
+        let mut overlay = OverlayState::new();
+        let rows = vec![
+            SuggestionItem {
+                name: "checkout".into(),
+                ..Default::default()
+            },
+            SuggestionItem {
+                name: "cherry-pick".into(),
+                description: "Apply a commit".into(),
+                ..Default::default()
+            },
+        ];
+        overlay.set_suggestions(rows.clone(), "ch".into());
+        overlay.move_selection(1);
+        overlay.hide_until_shown();
+        overlay.release_hidden_payload();
+        assert_eq!(overlay.items.capacity(), 0);
+        assert_eq!(overlay.search_term.capacity(), 0);
+        assert!(overlay.suppress_until_shown);
+        overlay.suppress_until_shown = false;
+        overlay.set_suggestions(rows, "ch".into());
+        assert_eq!(overlay.selected_item().unwrap().name, "cherry-pick");
+        assert!(overlay.has_changed_index);
+    }
 
     #[test]
     fn hide_keeps_items_and_esc_suppresses_auto_show() {
@@ -736,9 +811,11 @@ mod tests {
             ..SuggestionItem::default()
         };
         let first_identity = crate::list::selection_identity(&first);
+        let before = first.clone();
         first.display_name = Some("After".into());
         first.query_term = Some("after".into());
         assert_eq!(first_identity, crate::list::selection_identity(&first));
+        assert!(crate::list::same_selection_identity(&before, &first));
     }
 
     #[test]

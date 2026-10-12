@@ -65,6 +65,18 @@ enum CompletionDisplayState {
     WaitingForCaret,
 }
 
+/// Explicit visibility requests are independent of retained rows and caret state.
+/// A Tab intent belongs to one exact input; it must never accept a newer result.
+struct ShowIntent {
+    input: LastInput,
+    token: u64,
+    tabs: usize,
+    result_ready: bool,
+    // Dropping an intent cancels its timer as well. A long script budget must
+    // not keep one detached timeout alive for every completed/cancelled Show.
+    _expiry: gpui::Task<()>,
+}
+
 /// How long a request may run before `···` replaces the list. Fig's
 /// `App.tsx` started this timer as soon as any generator was `loading`.
 const LOADING_THRESHOLD: Duration = Duration::from_millis(200);
@@ -112,11 +124,18 @@ pub struct OverlayController {
     /// when its result arrives too late to be displayed.
     loading_owner: Arc<AtomicU64>,
     enabled: bool,
+    /// Last applied saved preference, separate from the temporary shortcut mode.
+    configured_fuzzy_search: bool,
     figterm_state: Arc<FigtermState>,
     platform_state: Arc<PlatformState>,
     last_position: Arc<Mutex<Option<WindowPosition>>>,
     last_input: Arc<Mutex<Option<LastInput>>>,
     completion_display: CompletionDisplayState,
+    show_intent: Option<ShowIntent>,
+    /// Keep explicit Show's argument visibility through same-input debounce
+    /// follow-ups after the first displayed rows have consumed its Tab.
+    explicit_show_pending: bool,
+    show_token: u64,
     /// Buffer we expect the shell to report back after our own insertion.
     /// Stands in for the legacy `justInserted` flag, which kept the paste
     /// heuristic from mistaking an accepted completion for a paste.
@@ -128,6 +147,34 @@ pub struct OverlayController {
 }
 
 impl OverlayController {
+    pub(crate) fn request_visible_icons(
+        &mut self,
+        generation: u64,
+        revision: (u64, u64),
+        range: std::ops::Range<usize>,
+        cx: &mut App,
+    ) {
+        if self.generation.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        let Some(input) = self.last_input.lock().unwrap_or_else(|err| err.into_inner()).clone() else {
+            return;
+        };
+        self.file_icons.update(cx, |icons, cx| {
+            if icons.prepare_visible(&input.cwd, &self.state, revision, range, cx) {
+                icons.finish_batch(&self.state, &self.handle, cx);
+                icons.load_requested(
+                    &input.cwd,
+                    self.state.downgrade(),
+                    self.handle.clone(),
+                    self.generation.clone(),
+                    generation,
+                    cx,
+                );
+            }
+        });
+    }
+
     pub fn start(
         cx: &mut App,
         engine: EngineClient,
@@ -138,7 +185,7 @@ impl OverlayController {
         let session_id = Arc::new(Mutex::new(None));
         let state = cx.new(|_| {
             let mut overlay = OverlayState::new();
-            apply_settings(&mut overlay);
+            apply_settings(&mut overlay, None);
             overlay
         });
         let click_session = session_id.clone();
@@ -147,7 +194,16 @@ impl OverlayController {
         let click_proxy = proxy.clone();
         let disable_session = session_id.clone();
         let disable_proxy = proxy.clone();
+        let icon_proxy = proxy.clone();
+        let icon_generation = generation.clone();
         state.update(cx, |overlay, _cx| {
+            overlay.on_visible_range = Some(Arc::new(move |range, revision| {
+                let _ = icon_proxy.send_event(Event::GpuiOverlayVisibleRows {
+                    generation: icon_generation.load(Ordering::Relaxed),
+                    revision,
+                    range,
+                });
+            }));
             overlay.on_click_insert = Some(Arc::new(move |click| {
                 let Some(session_id) = *click_session.lock().unwrap_or_else(|err| err.into_inner()) else {
                     return;
@@ -179,6 +235,7 @@ impl OverlayController {
             }
         });
         let handle = Arc::new(Mutex::new(None));
+        let configured_fuzzy_search = state.read(cx).fuzzy_search;
         let mut controller = Self {
             state,
             handle,
@@ -190,11 +247,15 @@ impl OverlayController {
             enabled: gpui_overlay_enabled()
                 && !fastab_settings::settings::get_bool_or("autocomplete.disable", false)
                 && PlatformState::accessibility_is_enabled().unwrap_or(true),
+            configured_fuzzy_search,
             figterm_state,
             platform_state,
             last_position: Arc::new(Mutex::new(None)),
             last_input: Arc::new(Mutex::new(None)),
             completion_display: CompletionDisplayState::Idle,
+            show_intent: None,
+            explicit_show_pending: false,
+            show_token: 0,
             self_insertion: Arc::new(Mutex::new(None)),
             proxy,
             jev: ai::JevRuntime::default(),
@@ -308,9 +369,11 @@ impl OverlayController {
         // in-process writes also update it before dispatching this event.
         // Reloading here would take a blocking file lock on the UI thread,
         // including after an AI input edit triggers a background save.
-        self.state.update(cx, |overlay, cx| {
-            apply_settings(overlay);
+        let previous_fuzzy_search = self.configured_fuzzy_search;
+        self.configured_fuzzy_search = self.state.update(cx, |overlay, cx| {
+            let configured = apply_settings(overlay, Some(previous_fuzzy_search));
             cx.notify();
+            configured
         });
         self.reload_jev_if_changed(cx);
     }
@@ -338,6 +401,7 @@ impl OverlayController {
     }
 
     fn retire_completion(&mut self) {
+        self.explicit_show_pending = false;
         self.completion_display = CompletionDisplayState::Idle;
         if let Some(session) = self.current_session() {
             self.notify_input_ended(session);
@@ -345,13 +409,28 @@ impl OverlayController {
     }
 
     pub fn set_enabled(&mut self, enabled: bool, cx: &mut App) {
+        let was_enabled = self.enabled;
         self.enabled = enabled && gpui_overlay_enabled();
         if !self.enabled {
             self.dismiss(cx);
+        } else if !was_enabled
+            && self.has_showable_input()
+            && !self.state.read(cx).only_show_on_tab
+            && !self.state.read(cx).suppress_until_shown
+        {
+            *self.last_position.lock().unwrap_or_else(|err| err.into_inner()) = None;
+            self.completion_display = CompletionDisplayState::WaitingForCaret;
+            let _ = self.proxy.send_event(Event::PlatformBoundEvent(
+                crate::platform::PlatformBoundEvent::EditBufferChanged,
+            ));
         }
+        // Re-enabling Tab-only completion restores its explicit entry point
+        // immediately, even when no edit-buffer notification follows.
+        self.sync_own_intercept(cx);
     }
 
     pub fn hide(&mut self, cx: &mut App) {
+        self.cancel_show();
         self.retire_completion();
         self.cancel_jev(cx);
         self.bump_generation();
@@ -381,6 +460,7 @@ impl OverlayController {
     }
 
     pub fn hide_until_shown(&mut self, cx: &mut App) {
+        self.cancel_show();
         self.retire_completion();
         self.cancel_jev(cx);
         // Hiding is a cancellation boundary too. Otherwise an in-flight
@@ -406,6 +486,7 @@ impl OverlayController {
     }
 
     pub fn dismiss(&mut self, cx: &mut App) {
+        self.cancel_show();
         self.retire_completion();
         self.cancel_jev(cx);
         self.bump_generation();
@@ -423,6 +504,11 @@ impl OverlayController {
     }
 
     pub fn clear_caret_position(&mut self, cx: &mut App) {
+        if self.show_intent.is_some() {
+            *self.last_position.lock().unwrap_or_else(|err| err.into_inner()) = None;
+            self.hide_until_shown(cx);
+            return;
+        }
         let resume = self.completion_display != CompletionDisplayState::Idle;
         *self.last_position.lock().unwrap_or_else(|err| err.into_inner()) = None;
         self.hide(cx);
@@ -442,7 +528,6 @@ impl OverlayController {
     pub fn apply_position(&mut self, position: WindowPosition, platform_state: &PlatformState, cx: &mut App) {
         *self.last_position.lock().unwrap_or_else(|err| err.into_inner()) = Some(position);
         if self.completion_display == CompletionDisplayState::WaitingForCaret && self.enabled {
-            self.completion_display = CompletionDisplayState::Idle;
             self.recomplete(cx);
         }
         // Kept argument hints do not make a hidden overlay visible. In
@@ -460,6 +545,7 @@ impl OverlayController {
                 cx,
             )
         });
+        self.settle_show_layout(positioned);
         self.sync_own_intercept_for_layout(positioned, cx);
         self.update_layout_retry(positioned, cx);
     }
@@ -481,8 +567,9 @@ impl OverlayController {
         )
     }
 
-    fn relayout_and_sync(&mut self, cx: &mut App) -> bool {
+    pub(crate) fn relayout_and_sync(&mut self, cx: &mut App) -> bool {
         let positioned = self.relayout(cx);
+        self.settle_show_layout(positioned);
         self.sync_own_intercept_for_layout(positioned, cx);
         self.update_layout_retry(positioned, cx);
         positioned
@@ -545,6 +632,7 @@ impl OverlayController {
         }
 
         let positioned = self.relayout(cx);
+        self.settle_show_layout(positioned);
         self.sync_own_intercept_for_layout(positioned, cx);
         if positioned || !self.layout_retry_needed(positioned, cx) {
             self.cancel_layout_retry();
@@ -588,7 +676,12 @@ impl OverlayController {
             positioned,
             has_last_position,
         });
-        set_intercept_flags(&self.figterm_state, session_id, visible_intercept, global_intercept);
+        set_intercept_flags(
+            &self.figterm_state,
+            session_id,
+            visible_intercept,
+            global_intercept || self.has_showable_input(),
+        );
     }
 
     fn sync_intercept(&self, figterm_state: &FigtermState, cx: &App) {
@@ -606,46 +699,177 @@ impl OverlayController {
             figterm_state,
             session_id,
             overlay.visible && has_items && has_position,
-            has_items && has_position,
+            self.has_showable_input(),
         );
     }
 
+    fn has_showable_input(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.platform_state.inner().terminal_completion_disabled() {
+            return false;
+        }
+        self.enabled
+            && !fastab_settings::settings::get_bool_or("autocomplete.disable", false)
+            && self
+                .last_input
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .as_ref()
+                .is_some_and(|input| {
+                    Some(input.session_id) == self.current_session()
+                        && !input.buffer.trim().is_empty()
+                        && !cursor_is_inside_word(&input.buffer, input.cursor)
+                })
+    }
+
+    pub(crate) fn wants_caret(&self, cx: &App) -> bool {
+        self.has_showable_input()
+            && (self.show_intent.is_some()
+                || self.completion_display != CompletionDisplayState::Idle
+                || self.state.read(cx).visible)
+    }
+
     fn show_kept_items(&mut self, cx: &mut App) {
-        if self
-            .last_position
+        self.request_show(false, cx);
+    }
+
+    fn request_show(&mut self, from_tab: bool, cx: &mut App) {
+        if !self.has_showable_input() {
+            return;
+        }
+        let input = self
+            .last_input
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .is_none()
-        {
-            // A Show key can already be in transit when the caret disappears.
-            // Keep the request for the next valid caret without marking a
-            // parked window visible and cancelling its idle retirement.
-            self.hide(cx);
-            self.state
-                .update(cx, |overlay, _cx| overlay.suppress_until_shown = false);
-            self.completion_display = CompletionDisplayState::WaitingForCaret;
-            return;
+            .clone()
+            .unwrap();
+        if let Some(intent) = &self.show_intent {
+            if intent.input == input {
+                if from_tab && intent.tabs > 0 {
+                    // Repeated Tab before the first result belongs to the
+                    // shell's own completion cycle. Return both together;
+                    // never apply two edits against one pre-insert snapshot.
+                    let mut intent = self.show_intent.take().unwrap();
+                    intent.tabs += 1;
+                    self.return_tabs(&intent, intent.tabs);
+                    self.hide_until_shown(cx);
+                } else if from_tab {
+                    self.show_intent.as_mut().unwrap().tabs = 1;
+                }
+                return;
+            }
         }
-        // Hidden rows contain strings, not spec ownership. Explicitly showing
-        // them may need to resume generators retired with the hidden input.
-        if self.completion_display == CompletionDisplayState::Idle {
-            self.state
-                .update(cx, |overlay, _cx| overlay.suppress_until_shown = false);
-            self.recomplete(cx);
-        }
-        let can_show = {
-            let overlay = self.state.read(cx);
-            !overlay.items.is_empty() || overlay.loading || overlay.has_current_arg()
-        };
-        if !can_show {
-            return;
-        }
+        self.cancel_show();
+        self.retire_completion();
+        self.bump_generation();
+        self.take_loading_owner();
         self.state.update(cx, |overlay, cx| {
+            overlay.hide();
+            // Hidden input may have changed since these rows were produced.
+            // Keep only selection identity: loading must not expose old edits.
+            overlay.release_hidden_payload();
             overlay.suppress_until_shown = false;
-            overlay.visible = true;
             cx.notify();
         });
-        self.relayout_and_sync(cx);
+        self.park_window(cx);
+        self.show_token = self.show_token.wrapping_add(1);
+        let token = self.show_token;
+        let proxy = self.proxy.clone();
+        let executor = cx.background_executor().clone();
+        let deadline = ui_completion_deadline().saturating_add(LOADING_THRESHOLD);
+        let expiry = cx.spawn(async move |_cx| {
+            executor.timer(deadline).await;
+            let _ = proxy.send_event(Event::GpuiOverlayShowExpired { token });
+        });
+        self.show_intent = Some(ShowIntent {
+            input,
+            token,
+            tabs: usize::from(from_tab),
+            result_ready: false,
+            _expiry: expiry,
+        });
+        self.explicit_show_pending = true;
+        // Always request fresh geometry. A retained caret can belong to the
+        // previous pane, or precede hidden typing that moved this cursor.
+        *self.last_position.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        self.completion_display = CompletionDisplayState::WaitingForCaret;
+        self.sync_own_intercept(cx);
+        let _ = self.proxy.send_event(Event::PlatformBoundEvent(
+            crate::platform::PlatformBoundEvent::EditBufferChanged,
+        ));
+    }
+
+    fn show_input_is_current(&self, intent: &ShowIntent) -> bool {
+        self.current_session() == Some(intent.input.session_id)
+            && self.last_input.lock().unwrap_or_else(|err| err.into_inner()).as_ref() == Some(&intent.input)
+            && self
+                .figterm_state
+                .with(&intent.input.session_id, |session| {
+                    session.dead_since.is_none()
+                        && session.edit_buffer.text == intent.input.buffer
+                        && session.edit_buffer.cursor == i64::from(intent.input.cursor)
+                })
+                .unwrap_or(false)
+    }
+
+    fn return_tabs(&self, intent: &ShowIntent, tabs: usize) {
+        if tabs == 0 || !self.show_input_is_current(intent) {
+            return;
+        }
+        // `insertion_buffer` repairs divergent buffers in fterm; it is not a
+        // compare-and-drop precondition. Never send an old snapshot as repair.
+        let _ = self.figterm_state.with(&intent.input.session_id, |session| {
+            if session.edit_buffer.text != intent.input.buffer
+                || session.edit_buffer.cursor != i64::from(intent.input.cursor)
+            {
+                return;
+            }
+            let _ = session.send(FigtermCommand::InsertText {
+                insertion: Some("\t".repeat(tabs)),
+                deletion: Some(0),
+                offset: None,
+                immediate: Some(false),
+                insertion_buffer: None,
+                insert_during_command: None,
+            });
+        });
+    }
+
+    fn accept_single_show_result(&self, result: &CompleteResult) -> bool {
+        !result.pending_generators
+            && self
+                .show_intent
+                .as_ref()
+                .is_some_and(|intent| intent.tabs == 1 && self.show_input_is_current(intent))
+            && result.suggestions.len() == 1
+            && {
+                let item = &result.suggestions[0];
+                !item.is_dangerous
+                    && safe_tab_row(&item.kind, item.insert_value.as_deref().or(Some(&item.name)))
+                    && item
+                        .separator_to_add
+                        .as_deref()
+                        .is_none_or(|value| !value.contains(['\n', '\r']))
+            }
+    }
+
+    fn settle_show_layout(&mut self, positioned: bool) {
+        if positioned && self.show_intent.as_ref().is_some_and(|intent| intent.result_ready) {
+            self.show_intent = None;
+        }
+    }
+
+    fn cancel_show(&mut self) {
+        if let Some(intent) = self.show_intent.take() {
+            self.return_tabs(&intent, intent.tabs);
+        }
+    }
+
+    pub fn expire_show(&mut self, token: u64, cx: &mut App) {
+        if self.show_intent.as_ref().is_none_or(|intent| intent.token != token) {
+            return;
+        }
+        self.hide_until_shown(cx);
     }
 
     pub fn complete_buffer(
@@ -684,6 +908,7 @@ impl OverlayController {
             loading_threshold,
         } = options;
         if self.current_session().is_some_and(|current| current != session_id) {
+            self.show_intent = None;
             self.retire_completion();
         }
         let switched_session = self.set_session(session_id);
@@ -704,8 +929,21 @@ impl OverlayController {
             cursor,
             session_id,
         };
+        if self
+            .show_intent
+            .as_ref()
+            .is_some_and(|intent| intent.input != next_input)
+        {
+            // This input supersedes the intercepted Tab: do not replay it,
+            // but retire the same native/loading resources as any other hide.
+            self.show_intent = None;
+            self.hide_until_shown(cx);
+        }
         let (duplicate_input, previous_input) = {
             let mut last_input = self.last_input.lock().unwrap_or_else(|err| err.into_inner());
+            if last_input.as_ref() != Some(&next_input) {
+                self.explicit_show_pending = false;
+            }
             let duplicate = should_skip_duplicate_input(last_input.as_ref(), &next_input, force);
             (duplicate, last_input.replace(next_input))
         };
@@ -716,14 +954,18 @@ impl OverlayController {
             .filter(|input| input.session_id == session_id)
             .map(|input| input.buffer);
         let self_inserted = self.take_self_insertion().is_some_and(|predicted| predicted == buffer);
-        if !self.enabled {
+        #[cfg(target_os = "macos")]
+        let terminal_disabled = self.platform_state.inner().terminal_completion_disabled();
+        #[cfg(not(target_os = "macos"))]
+        let terminal_disabled = false;
+        if !self.enabled && !terminal_disabled {
             #[cfg(target_os = "macos")]
             {
                 // AX grant can land while the cached `enabled` flag is still false (notification
                 // lag). Re-read the live TCC flag so the first keystroke after granting works.
-                if macos_utils::accessibility::accessibility_is_enabled()
-                    && gpui_overlay_enabled()
+                if gpui_overlay_enabled()
                     && !fastab_settings::settings::get_bool_or("autocomplete.disable", false)
+                    && macos_utils::accessibility::accessibility_is_enabled()
                 {
                     self.enabled = true;
                 }
@@ -733,7 +975,7 @@ impl OverlayController {
         if input_ended {
             self.notify_input_ended(session_id);
         }
-        if !self.enabled || input_ended || cursor_is_inside_word(&buffer, cursor) {
+        if !self.enabled || terminal_disabled || input_ended || cursor_is_inside_word(&buffer, cursor) {
             self.dismiss(cx);
             set_intercept(&figterm_state, session_id, false, false);
             return;
@@ -782,11 +1024,17 @@ impl OverlayController {
             return;
         }
 
-        if self.state.read(cx).only_show_on_tab
+        if !force
+            && self.state.read(cx).only_show_on_tab
             && only_show_on_tab_hides_until_shown(previous_buffer.as_deref(), &buffer)
         {
             self.hide_until_shown(cx);
             self.sync_intercept(&figterm_state, cx);
+        }
+        if self.state.read(cx).suppress_until_shown && self.show_intent.is_none() {
+            self.retire_completion();
+            self.sync_intercept(&figterm_state, cx);
+            return;
         }
 
         // A buffer can precede the caret event in the host queue. Keep only
@@ -798,8 +1046,11 @@ impl OverlayController {
             .unwrap_or_else(|err| err.into_inner())
             .is_none()
         {
-            self.hide(cx);
+            if self.show_intent.is_none() {
+                self.hide(cx);
+            }
             self.completion_display = CompletionDisplayState::WaitingForCaret;
+            self.sync_intercept(&figterm_state, cx);
             return;
         }
 
@@ -920,6 +1171,7 @@ impl OverlayController {
                 cx,
             )
         });
+        self.settle_show_layout(positioned);
         self.sync_own_intercept_for_layout(positioned, cx);
         self.update_layout_retry(positioned, cx);
     }
@@ -949,6 +1201,7 @@ impl OverlayController {
             return;
         }
         if result.is_err() {
+            self.cancel_show();
             // A failed attempt produced nothing to show, so the recorded input
             // must not keep the duplicate guard armed: the terminal
             // republishing the same buffer is then the only path back to a
@@ -961,6 +1214,15 @@ impl OverlayController {
                 .pending_generators
                 .then_some(complete.debounce_ms.unwrap_or(200).max(0) as u64)
         });
+        let explicit_show = self.show_intent.is_some() || self.explicit_show_pending;
+        let accept_single = result
+            .as_ref()
+            .is_ok_and(|complete| self.accept_single_show_result(complete));
+        if accept_single {
+            // Apply the fresh row without opening a native window just to
+            // accept it. Retained rows are never used by the hidden Tab path.
+            self.state.update(cx, |overlay, _| overlay.suppress_until_shown = true);
+        }
         let ai_candidates = result.as_ref().ok().and_then(|complete| self.prepare_jev(complete));
         let positioned = self.file_icons.update(cx, |icons, cx| {
             icons.begin_batch();
@@ -974,27 +1236,37 @@ impl OverlayController {
                 &self.last_position,
                 &self.platform_state,
                 icons,
+                !explicit_show,
                 cx,
             );
             icons.finish_batch(&self.state, &self.handle, cx);
-            icons.load_requested(
-                cwd,
-                self.state.downgrade(),
-                self.handle.clone(),
-                self.generation.clone(),
-                generation,
-                cx,
-            );
             if !self.state.read(cx).visible {
                 icons.schedule_idle(self.state.downgrade(), self.handle.clone(), cx);
             }
             positioned
         });
         self.update_layout_retry(positioned, cx);
-        if !self.state.read(cx).visible && pending.is_none() {
-            // Esc/Tab-only mode can keep useful rows without pinning the
-            // registry. A pending generator must finish first: an initially
-            // empty list can be waiting for its only source of suggestions.
+        if pending.is_none() {
+            self.explicit_show_pending = false;
+        }
+        if accept_single {
+            self.state.update(cx, |overlay, _| overlay.suppress_until_shown = false);
+            self.insert_selected(false, &self.figterm_state.clone(), cx);
+            return;
+        }
+        if let Some(intent) = &mut self.show_intent {
+            // Fresh partial rows are already actionable once positioned.
+            // Loading or an empty pending result still owes the original Tab.
+            intent.result_ready = !self.state.read(cx).items.is_empty();
+            if !intent.result_ready && pending.is_none() {
+                self.cancel_show();
+            }
+        }
+        self.settle_show_layout(positioned);
+        self.sync_own_intercept_for_layout(positioned, cx);
+        if self.state.read(cx).suppress_until_shown || (!self.state.read(cx).visible && pending.is_none()) {
+            // Empty final results have no display consumer. An initially
+            // empty pending result still belongs to the active demand.
             self.retire_completion();
             self.cancel_jev(cx);
             return;
@@ -1020,7 +1292,10 @@ impl OverlayController {
     /// `loading` through the whole wait — so the follow-up only gets whatever
     /// is left of the threshold, not a fresh one.
     pub fn apply_debounced_complete(&mut self, generation: u64, waited_ms: u64, cx: &mut App) {
-        if self.generation.load(Ordering::Relaxed) != generation {
+        if self.generation.load(Ordering::Relaxed) != generation
+            || !self.wants_caret(cx)
+            || self.state.read(cx).suppress_until_shown
+        {
             return;
         }
         let loading_threshold = LOADING_THRESHOLD.saturating_sub(Duration::from_millis(waited_ms));
@@ -1041,6 +1316,12 @@ impl OverlayController {
     }
 
     fn recomplete_with(&mut self, options: RequestOptions, cx: &mut App) {
+        if self.completion_display == CompletionDisplayState::Idle
+            && self.show_intent.is_none()
+            && !self.state.read(cx).visible
+        {
+            return;
+        }
         let Some(current_session) = self.current_session() else {
             return;
         };
@@ -1067,6 +1348,15 @@ impl OverlayController {
             return;
         }
         self.reconcile_jev_context(cx);
+        if self.show_intent.is_some()
+            && matches!(
+                action,
+                "insertCommonPrefix" | "insertCommonPrefixOrInsertSelected" | "insertCommonPrefixOrNavigateDown"
+            )
+        {
+            self.request_show(true, cx);
+            return;
+        }
         let (visible, loading, has_items) = {
             let overlay = self.state.read(cx);
             (overlay.visible, overlay.loading, !overlay.items.is_empty())
@@ -1102,13 +1392,7 @@ impl OverlayController {
             // reveal the kept rows; accepting the sole row is reserved for
             // the hidden-overlay Tab shortcut below.
             "showAutocomplete" => self.show_kept_items(cx),
-            "showAutocompleteFromTab" => {
-                if self.state.read(cx).items.len() == 1 {
-                    self.insert_selected(false, figterm_state, cx);
-                } else {
-                    self.show_kept_items(cx);
-                }
-            },
+            "showAutocompleteFromTab" => self.request_show(true, cx),
             "toggleAutocomplete" => {
                 let visible = self.state.read(cx).visible;
                 if visible {
@@ -1471,7 +1755,7 @@ impl OverlayController {
     }
 
     fn insert_text(
-        &self,
+        &mut self,
         insertion: &str,
         deletion: i64,
         execute: bool,
@@ -1482,7 +1766,7 @@ impl OverlayController {
     }
 
     fn insert_text_with_offset(
-        &self,
+        &mut self,
         insertion: &str,
         deletion: i64,
         offset: Option<i64>,
@@ -1521,6 +1805,10 @@ impl OverlayController {
         });
         match sent {
             Some(Ok(())) => {
+                // A successful user edit consumes the explicit request even
+                // if its layout acknowledgement has not reached us yet.
+                self.show_intent = None;
+                self.explicit_show_pending = false;
                 fastab_telemetry::count("autocomplete_accepted");
                 true
             },
@@ -1543,7 +1831,7 @@ impl OverlayController {
     }
 }
 
-fn apply_settings(overlay: &mut OverlayState) {
+fn apply_settings(overlay: &mut OverlayState, previous_fuzzy_search: Option<bool>) -> bool {
     let metrics = overlay_metrics();
     overlay.theme = resolve_overlay_theme();
     overlay.font_family = metrics.font_family;
@@ -1558,8 +1846,14 @@ fn apply_settings(overlay: &mut OverlayState) {
     overlay.list_width = legacy_list_width(configured_width, configured_history_mode.as_deref()).max(150) as f32;
     overlay.max_list_height =
         fastab_settings::settings::get_int_or("autocomplete.height", DEFAULT_MAX_LIST_HEIGHT as i64).max(40) as f32;
-    overlay.fuzzy_search = fastab_settings::settings::get_bool_or("autocomplete.fuzzySearch", true);
-    overlay.effective_fuzzy_search = overlay.fuzzy_search;
+    let fuzzy_search = fastab_settings::settings::get_bool_or("autocomplete.fuzzySearch", true);
+    // Presentation refreshes must not reset the shortcut's temporary mode or
+    // the matching mode supplied by the current result. A changed saved
+    // preference is separately classified by CompletionSettings for recompute.
+    if previous_fuzzy_search != Some(fuzzy_search) {
+        overlay.fuzzy_search = fuzzy_search;
+        overlay.effective_fuzzy_search = fuzzy_search;
+    }
     overlay.only_show_on_tab = fastab_settings::settings::get_bool_or("autocomplete.onlyShowOnTab", false);
     overlay.first_token_completion = fastab_settings::settings::get_bool_or("autocomplete.firstTokenCompletion", false);
     overlay.navigate_to_history = fastab_settings::settings::get_bool_or("autocomplete.navigateToHistory", false);
@@ -1585,6 +1879,7 @@ fn apply_settings(overlay: &mut OverlayState) {
     }
     overlay.show_dev_banner = fastab_settings::settings::get_bool_or("autocomplete.developerModeNPM", false);
     overlay.description_hint = description_hint_from_settings();
+    fuzzy_search
 }
 
 fn resolve_scroll_wrap_around(configured: Option<bool>, navigate_to_history: bool) -> bool {
@@ -1725,15 +2020,15 @@ fn apply_complete_result(
     result: anyhow::Result<CompleteResult>,
     session_id: Uuid,
     figterm_state: &FigtermState,
-    cwd: &str,
+    _cwd: &str,
     last_position: &Mutex<Option<WindowPosition>>,
     platform_state: &PlatformState,
-    file_icons: &mut file_icons::FileIconCache,
+    _file_icons: &mut file_icons::FileIconCache,
+    allow_arg_hide: bool,
     cx: &mut App,
 ) -> bool {
     match result {
         Ok(result) => {
-            let mut uncached_icons = 0;
             let effective_fuzzy = result.fuzzy;
             let (current_arg_name, current_arg_description) = result
                 .current_arg
@@ -1745,7 +2040,7 @@ fn apply_complete_result(
                 .suggestions
                 .into_iter()
                 .map(|s| SuggestionItem {
-                    icon_png: file_icons.lookup(cwd, &s.name, &s.kind, &mut uncached_icons),
+                    icon_png: None,
                     name: s.name,
                     description: s.description,
                     kind: s.kind,
@@ -1772,7 +2067,8 @@ fn apply_complete_result(
             };
             state.update(cx, |overlay, cx| {
                 overlay.effective_fuzzy_search = effective_fuzzy;
-                if overlay.only_show_on_tab
+                if allow_arg_hide
+                    && overlay.only_show_on_tab
                     && current_arg_identity_changed(&overlay.current_arg_name, &current_arg_name)
                 {
                     overlay.hide_until_shown();
@@ -2381,6 +2677,10 @@ fn apply_shortcut_palette_deletion(
 /// `onlyShowOnTab` hides until Tab on a new trailing-space argument, not
 /// whenever the list is already hidden (that upgraded paste/Esc-keypress
 /// hides into a latch). Extra spaces on the same token are not a new arg.
+fn safe_tab_row(kind: &str, insert_value: Option<&str>) -> bool {
+    !matches!(kind, "auto-execute" | "special") && insert_value.is_none_or(|value| !value.contains(['\n', '\r']))
+}
+
 fn only_show_on_tab_hides_until_shown(previous: Option<&str>, current: &str) -> bool {
     let Some(previous) = previous.filter(|previous| !previous.is_empty()) else {
         return !current.is_empty();
@@ -2952,7 +3252,10 @@ mod tests {
             );
             assert!(!overlay.relayout(cx));
             assert!(overlay.handle.lock().unwrap().is_none());
-            assert!(overlay.state.read(cx).has_current_arg());
+            assert!(
+                !overlay.state.read(cx).has_current_arg(),
+                "hidden payload retired with the window"
+            );
         });
     }
 
@@ -3080,7 +3383,11 @@ mod tests {
             overlay.hide(cx);
             refresh_settings(&mut overlay, cx);
         });
-        assert_eq!(snapshot().requests.completed, 3);
+        assert_eq!(
+            snapshot().requests.completed,
+            2,
+            "hidden settings refresh must not complete"
+        );
 
         cx.update(|cx| {
             overlay.end_input(session, cx);
@@ -3088,15 +3395,15 @@ mod tests {
             overlay.end_input(session, cx);
             refresh_settings(&mut overlay, cx);
         });
-        assert_eq!(snapshot().requests.submitted, 3, "ended input must not be resubmitted");
+        assert_eq!(snapshot().requests.submitted, 2, "ended input must not be resubmitted");
         wait_for_release();
 
         // pre-exec keeps the UUID: a new real buffer, even with identical
         // text, must be allowed to complete and establish the next input.
         cx.update(|cx| complete_input(&mut overlay, cx));
         let resumed = snapshot();
-        assert_eq!(resumed.requests.submitted, 4);
-        assert_eq!(resumed.requests.completed, 4);
+        assert_eq!(resumed.requests.submitted, 3);
+        assert_eq!(resumed.requests.completed, 3);
         assert_eq!(
             resumed.engine.expect("initialized engine").registry.cached_file_count,
             1
@@ -3110,7 +3417,7 @@ mod tests {
             overlay.apply_position(position, &platform_state, cx);
             overlay.apply_position(position, &platform_state, cx);
         });
-        assert_eq!(snapshot().requests.completed, 5);
+        assert_eq!(snapshot().requests.completed, 4);
 
         // An explicit Esc cancels that automatic resume; only explicit Show
         // may recompute retained input after the spec has been released.
@@ -3120,9 +3427,12 @@ mod tests {
             overlay.apply_position(position, &platform_state, cx);
         });
         wait_for_release();
-        assert_eq!(snapshot().requests.submitted, 5);
-        cx.update(|cx| overlay.show(cx));
-        assert_eq!(snapshot().requests.completed, 6);
+        assert_eq!(snapshot().requests.submitted, 4);
+        cx.update(|cx| {
+            overlay.show(cx);
+            overlay.apply_position(position, &platform_state, cx);
+        });
+        assert_eq!(snapshot().requests.completed, 5);
 
         // Switching to a session with no caret must still retire the old
         // owner, even though no new request is submitted to the worker.
@@ -3138,9 +3448,9 @@ mod tests {
             );
         });
         wait_for_release();
-        assert_eq!(snapshot().requests.submitted, 6);
+        assert_eq!(snapshot().requests.submitted, 5);
         cx.update(|cx| overlay.apply_position(position, &platform_state, cx));
-        assert_eq!(snapshot().requests.completed, 7);
+        assert_eq!(snapshot().requests.completed, 6);
 
         // A focus change is stronger than a transient missing caret. A caret
         // from another pane and a settings refresh cannot revive old input.
@@ -3150,7 +3460,7 @@ mod tests {
             refresh_settings(&mut overlay, cx);
         });
         wait_for_release();
-        assert_eq!(snapshot().requests.submitted, 7);
+        assert_eq!(snapshot().requests.submitted, 6);
     }
 
     #[test]

@@ -122,6 +122,13 @@ pub fn selection_identity(item: &SuggestionItem) -> SelectionIdentity {
     )
 }
 
+pub(crate) fn same_selection_identity(left: &SuggestionItem, right: &SuggestionItem) -> bool {
+    left.name == right.name
+        && left.kind == right.kind
+        && left.insert_value == right.insert_value
+        && left.description == right.description
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClickInsert {
     pub name: String,
@@ -607,16 +614,32 @@ pub fn common_prefix_for(selected: usize, items: &[SuggestionItem], typed: &str)
     if matches!(type_filter.kind.as_str(), "" | "special" | "auto-execute") {
         return String::new();
     }
-    let names: Vec<String> = items
+    let mut names = items
         .iter()
         .filter(|item| items_match_for_prefix(item, &type_filter))
-        .map(|item| visible_suggestion_title(item, typed).to_ascii_lowercase())
-        .collect();
-    if names.len() < 2 {
+        .map(|item| visible_suggestion_title(item, typed));
+    let Some(first) = names.next() else {
         return String::new();
+    };
+    let Some(second) = names.next() else {
+        return String::new();
+    };
+    // Only the resulting prefix needs ownership. Re-renders must not copy
+    // every candidate title just to decorate the few visible rows.
+    let mut prefix = first.to_ascii_lowercase();
+    for name in std::iter::once(second).chain(names) {
+        let common_bytes = prefix
+            .chars()
+            .zip(name.chars())
+            .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+            .map(|(character, _)| character.len_utf8())
+            .sum();
+        prefix.truncate(common_bytes);
+        if prefix.is_empty() {
+            break;
+        }
     }
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    longest_common_prefix(&refs)
+    prefix
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,6 +830,8 @@ fn underline_prefix(runs: &[TextRun], index: usize, char_count: usize) -> Option
     Some(out)
 }
 
+type ObservedIconViewport = std::rc::Rc<std::cell::RefCell<Option<((u64, u64), Range<usize>)>>>;
+
 pub struct SuggestionList {
     pub state: Entity<OverlayState>,
     scroll_handle: UniformListScrollHandle,
@@ -818,6 +843,38 @@ pub struct SuggestionList {
     /// Last size handed to GPUI's native window. Repeating the same resize on
     /// every caret/frame update feeds back into AppKit's resize callbacks.
     pub(crate) last_requested_size: Option<(f32, f32)>,
+    last_icon_range: ObservedIconViewport,
+}
+
+/// UniformList also calls its row renderer to measure an offscreen sample.
+/// Decorations receive only the post-scroll viewport, so measurement must not
+/// submit icon work or replace the actual visible batch.
+struct VisibleRows {
+    callback: Option<crate::overlay::VisibleRowsCallback>,
+    revision: (u64, u64),
+    previous: ObservedIconViewport,
+}
+
+impl gpui::UniformListDecoration for VisibleRows {
+    fn compute(
+        &self,
+        range: Range<usize>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _scroll_offset: gpui::Point<gpui::Pixels>,
+        _item_height: gpui::Pixels,
+        _item_count: usize,
+        _window: &mut Window,
+        _cx: &mut gpui::App,
+    ) -> AnyElement {
+        if let Some(callback) = &self.callback {
+            let next = (self.revision, range.clone());
+            if self.previous.borrow().as_ref() != Some(&next) {
+                *self.previous.borrow_mut() = Some(next);
+                callback(range, self.revision);
+            }
+        }
+        gpui::Empty.into_any_element()
+    }
 }
 
 #[derive(Default)]
@@ -833,6 +890,7 @@ impl SuggestionList {
             scroll_handle: UniformListScrollHandle::new(),
             scroll_snapshot: None,
             last_requested_size: None,
+            last_icon_range: Default::default(),
         }
     }
 }
@@ -843,6 +901,7 @@ impl Render for SuggestionList {
         let has_current_arg = overlay.has_current_arg();
         if !overlay.visible || (overlay.items.is_empty() && !overlay.loading && !has_current_arg) {
             self.scroll_snapshot = None;
+            self.last_icon_range.borrow_mut().take();
             return div().id("ec-overlay-hidden").w(px(1.)).h(px(1.));
         }
 
@@ -856,6 +915,9 @@ impl Render for SuggestionList {
         let max_list_height = overlay.effective_max_list_height();
         let state = self.state.clone();
         let click = overlay.on_click_insert.clone();
+        let visible_range = overlay.on_visible_range.clone();
+        let icon_revision = overlay.icon_request_revision();
+        let last_icon_range = self.last_icon_range.clone();
         let disable_dev = overlay.on_disable_dev_mode.clone();
         let fuzzy = overlay.effective_fuzzy_search;
         // With no suggestions the WebView renders parser context in the normal
@@ -1011,6 +1073,11 @@ impl Render for SuggestionList {
                                     })
                                     .collect()
                             }
+                        })
+                        .with_decoration(VisibleRows {
+                            callback: visible_range,
+                            revision: icon_revision,
+                            previous: last_icon_range,
                         })
                         .map(|mut list| {
                             list.style().restrict_scroll_to_axis = Some(true);
@@ -1877,6 +1944,47 @@ mod tests {
     use super::*;
     use gpui::{AppContext, ScrollDelta, ScrollWheelEvent, TestAppContext, size};
 
+    #[gpui::test]
+    fn native_icon_demand_tracks_viewport_without_measurement_rows(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = calls.clone();
+        let overlay = cx.new(|_| {
+            let mut overlay = OverlayState::default();
+            overlay.set_suggestions(
+                (0..100)
+                    .map(|index| SuggestionItem {
+                        name: format!("file-{index}"),
+                        kind: "file".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                String::new(),
+            );
+            overlay.on_visible_range = Some(Arc::new(move |range, _| requests.lock().unwrap().push(range)));
+            overlay
+        });
+        let view = cx.new(|_| SuggestionList::new(overlay.clone()));
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(point(px(0.), px(0.)), size(px(400.), px(220.)), |_, _| view.clone());
+        };
+        draw(cx);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(
+            calls.lock().unwrap()[0].end > 1,
+            "row zero measurement is not an icon demand"
+        );
+        overlay.update(cx, |overlay, _| overlay.selected = 50);
+        calls.lock().unwrap().clear();
+        draw(cx);
+        let ranges = calls.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].contains(&50));
+        assert!(!ranges[0].contains(&0), "offscreen measurement must not load row zero");
+        draw(cx);
+        assert_eq!(calls.lock().unwrap().len(), 1, "repaint must not submit another batch");
+    }
+
     struct ScrollTestRow {
         overlay: Entity<OverlayState>,
         row: Entity<RowScrollState>,
@@ -2184,6 +2292,32 @@ mod tests {
             },
         ];
         assert_eq!(common_prefix_for(0, &items, ""), "che");
+    }
+
+    #[test]
+    fn common_prefix_preserves_unicode_boundaries_and_ascii_only_folding() {
+        for (names, expected) in [
+            (["a💡branch", "A💡commit"], "a💡"),
+            (["FÖO", "fÖot"], "fÖo"),
+            (["Éclair", "école"], ""),
+            (["checkout", "CHECKOUT"], "checkout"),
+            (["", "checkout"], ""),
+        ] {
+            let items = names.map(|name| item(name, "subcommand"));
+            assert_eq!(common_prefix_for(0, &items, ""), expected);
+        }
+        let items = [item("checkout", "subcommand"), item("--help", "option")];
+        assert_eq!(common_prefix_for(0, &items, ""), "");
+    }
+
+    #[test]
+    fn common_prefix_uses_updated_presentation_even_when_identity_is_unchanged() {
+        let mut items = [item("alpha", "subcommand"), item("bravo", "subcommand")];
+        items[0].display_name = Some("FOÖbar".into());
+        items[1].display_name = Some("foÖbaz".into());
+        assert_eq!(common_prefix_for(0, &items, ""), "foÖba");
+        items[1].display_name = Some("Other".into());
+        assert_eq!(common_prefix_for(0, &items, ""), "");
     }
 
     #[test]

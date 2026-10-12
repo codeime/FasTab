@@ -144,6 +144,7 @@ impl SettingsWindow {
     fn set_bool(&mut self, key: &str, value: bool, cx: &mut Context<'_, Self>) {
         if let Err(err) = fastab_settings::settings::set_value(key, value) {
             error!(%err, key, "Failed to write setting");
+            return;
         }
         self.proxy.send_event(Event::ReloadCredentials).ok();
         cx.notify();
@@ -152,6 +153,7 @@ impl SettingsWindow {
     fn set_string(&mut self, key: &str, value: impl Into<serde_json::Value>, cx: &mut Context<'_, Self>) {
         if let Err(err) = fastab_settings::settings::set_value(key, value) {
             error!(%err, key, "Failed to write setting");
+            return;
         }
         self.proxy.send_event(Event::ReloadCredentials).ok();
         cx.notify();

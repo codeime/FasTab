@@ -29,6 +29,7 @@ pub fn install_idle_cache_release(cx: &gpui::App) {
 }
 
 pub use ai::AiPreview;
+pub use icons::identifier_is_renderable;
 
 pub use list::{
     ClickInsert, DEFAULT_FONT_SIZE, DEFAULT_MAX_LIST_HEIGHT, DEFAULT_ROW_HEIGHT, DEFAULT_WIDTH, DESCRIPTION_HEIGHT,
@@ -45,7 +46,7 @@ pub use macos::{
     system_appearance_is_dark,
 };
 pub use overlay::{
-    OverlayHandle, OverlayState, open_overlay_window, open_overlay_window_with_visibility, overlay_window_options,
-    park_overlay_handle, position_overlay,
+    OverlayHandle, OverlayState, VisibleRowsCallback, open_overlay_window, open_overlay_window_with_visibility,
+    overlay_window_options, park_overlay_handle, position_overlay,
 };
 pub use theme::{parse_color, theme_from_json};

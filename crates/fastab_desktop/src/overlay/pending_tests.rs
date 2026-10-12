@@ -10,11 +10,11 @@ fn invisible_pending_generator_finishes_in_normal_mode(cx: &mut gpui::TestAppCon
 }
 
 #[gpui::test]
-fn invisible_pending_generator_finishes_in_tab_only_mode(cx: &mut gpui::TestAppContext) {
+fn explicit_show_runs_pending_generator_in_tab_only_mode(cx: &mut gpui::TestAppContext) {
     pending_generator_finishes(
         cx,
         true,
-        "overlay::pending_tests::invisible_pending_generator_finishes_in_tab_only_mode",
+        "overlay::pending_tests::explicit_show_runs_pending_generator_in_tab_only_mode",
     );
 }
 
@@ -98,6 +98,10 @@ fn pending_generator_finishes(cx: &mut gpui::TestAppContext, only_show_on_tab: b
             figterm_state,
             cx,
         );
+        if only_show_on_tab {
+            assert!(!overlay.wants_caret(cx));
+            overlay.show(cx);
+        }
         overlay.apply_position(
             WindowPosition::Absolute(Position::Logical(LogicalPosition::new(100.0, 100.0))),
             &platform_state,
@@ -146,28 +150,9 @@ fn pending_generator_finishes(cx: &mut gpui::TestAppContext, only_show_on_tab: b
         ["dynamic-result"]
     );
     assert_eq!(std::fs::read_to_string(marker).expect("script invocation"), "run\n");
-    if only_show_on_tab {
-        // A hidden result can exercise retained UI state headlessly. The
-        // normal-mode result above is verified at the actual host event:
-        // applying a visible result needs an NSWindow, which GPUI's test
-        // platform deliberately does not implement.
-        cx.update(|cx| {
-            overlay.apply_completion(generation, Ok(second), second_session, &second_cwd, cx);
-            let state = overlay.state.read(cx);
-            assert_eq!(state.items.len(), 1);
-            assert_eq!(state.items[0].name, "dynamic-result");
-            assert!(!state.visible);
-        });
-        cx.update(|cx| {
-            overlay.end_input(session, cx);
-            let state = overlay.state.read(cx);
-            assert!(
-                state.items.is_empty(),
-                "ended input must not retain rows for Tab interception"
-            );
-            assert!(!state.visible && !state.loading);
-        });
-    }
+    // Visible results need a native NSWindow, unavailable in TestAppContext.
+    // Both modes have now exercised the actual worker and debounce timer.
+    cx.update(|cx| overlay.end_input(session, cx));
     assert_eq!(
         futures::executor::block_on(engine.diagnostics())
             .expect("final diagnostics")

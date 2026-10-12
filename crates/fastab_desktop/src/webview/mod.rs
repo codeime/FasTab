@@ -190,6 +190,9 @@ impl WebviewManager {
                 window_target,
                 overlay,
                 settings: None,
+                completion_settings: crate::settings_refresh::CompletionSettings::capture(
+                    &fastab_settings::settings::Settings::new(),
+                ),
                 tray,
             });
             Ok((host, event_rx))

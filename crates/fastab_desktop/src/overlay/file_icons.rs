@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,8 @@ struct IconBatch {
     generation: Arc<AtomicU64>,
     expected_generation: u64,
     batch_generation: u64,
+    revision: (u64, u64),
+    range: Range<usize>,
 }
 
 #[derive(Default)]
@@ -54,6 +57,7 @@ pub(super) struct FileIconCache {
     pending: Option<IconBatch>,
     load_task: Option<Task<()>>,
     batch_generation: u64,
+    viewport: Option<((u64, u64), Range<usize>)>,
     #[cfg(test)]
     provider: Option<Arc<dyn Fn(&Path) -> Option<Vec<u8>> + Send + Sync>>,
 }
@@ -74,7 +78,46 @@ impl FileIconCache {
         self.batch.clear();
         self.requested.clear();
         self.pending = None;
+        self.viewport = None;
         self.batch_generation = self.batch_generation.wrapping_add(1);
+    }
+
+    pub(super) fn prepare_visible(
+        &mut self,
+        cwd: &str,
+        state: &Entity<OverlayState>,
+        revision: (u64, u64),
+        range: Range<usize>,
+        cx: &mut App,
+    ) -> bool {
+        if !state.read(cx).visible || state.read(cx).icon_request_revision() != revision {
+            return false;
+        }
+        let range = range.start.min(state.read(cx).items.len())..range.end.min(state.read(cx).items.len());
+        if self.viewport.as_ref() == Some(&(revision, range.clone())) {
+            return false;
+        }
+        self.begin_batch();
+        self.viewport = Some((revision, range.clone()));
+        let mut uncached = 0;
+        state.update(cx, |state, cx| {
+            let mut changed = false;
+            for (index, item) in state.items.iter_mut().enumerate() {
+                let image = if range.contains(&index) && needs_native_icon(item) {
+                    self.lookup(cwd, &item.name, &item.kind, &mut uncached)
+                } else {
+                    None
+                };
+                if item.icon_png.as_ref().map(|image| image.id) != image.as_ref().map(|image| image.id) {
+                    item.icon_png = image;
+                    changed = true;
+                }
+            }
+            if changed {
+                cx.notify();
+            }
+        });
+        true
     }
 
     pub(super) fn cancel_idle(&mut self) {
@@ -146,6 +189,12 @@ impl FileIconCache {
         if self.requested.is_empty() {
             return;
         }
+        let Some(overlay) = state.upgrade() else { return };
+        let revision = overlay.read(cx).icon_request_revision();
+        let range = self
+            .viewport
+            .as_ref()
+            .map_or(0..overlay.read(cx).items.len(), |(_, range)| range.clone());
         self.pending = Some(IconBatch {
             paths: std::mem::take(&mut self.requested),
             cwd: cwd.to_owned(),
@@ -154,6 +203,8 @@ impl FileIconCache {
             generation,
             expected_generation,
             batch_generation: self.batch_generation,
+            revision,
+            range,
         });
         self.start_pending(cx);
     }
@@ -211,7 +262,7 @@ impl FileIconCache {
             return;
         }
         let Some(state) = batch.state.upgrade() else { return };
-        if !state.read(cx).visible {
+        if !state.read(cx).visible || state.read(cx).icon_request_revision() != batch.revision {
             return;
         }
         let used = row_images(&state, cx);
@@ -226,8 +277,8 @@ impl FileIconCache {
             .filter_map(|(path, icon)| self.insert_prepared(path.clone(), icon).map(|image| (path, image)))
             .collect::<HashMap<_, _>>();
         state.update(cx, |state, cx| {
-            for item in &mut state.items {
-                if item.kind == "file" || item.kind == "folder" {
+            for (index, item) in state.items.iter_mut().enumerate() {
+                if batch.range.contains(&index) && needs_native_icon(item) {
                     let path = icon_path(&batch.cwd, &item.name);
                     if let Some(image) = images.get(&path) {
                         item.icon_png = Some(image.clone());
@@ -343,19 +394,28 @@ impl FileIconCache {
                 }
                 cache.batch_generation = cache.batch_generation.wrapping_add(1);
                 cache.pending = None;
+                cache.viewport = None;
                 cache.requested.clear();
                 cache.paths.clear();
                 for entry in cache.images.values_mut() {
                     entry.cached = false;
                 }
-                // Tab recreates a window from this same state, so retain just
-                // the small decoded images referenced by the kept rows.
+                // Explicit Show/Tab now requests fresh rows. Preserve only
+                // selection identity, not hidden result strings or images.
+                state.update(cx, |state, _| state.release_hidden_payload());
                 drop(cache.take_retired(&row_images(&state, cx)));
                 cache.batch.clear();
-                state.update(cx, |state, _| state.release_empty_capacity());
             });
         }));
     }
+}
+
+fn needs_native_icon(item: &fastab_gpui::SuggestionItem) -> bool {
+    (item.kind == "file" || item.kind == "folder")
+        && !item
+            .icon_identifier
+            .as_deref()
+            .is_some_and(fastab_gpui::identifier_is_renderable)
 }
 
 fn icon_path(cwd: &str, name: &str) -> PathBuf {
@@ -567,6 +627,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn only_visible_rows_without_renderable_icons_request_native_work(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let state = cx.new(|_| OverlayState::new());
+            state.update(cx, |state, _| {
+                state.items = [
+                    "",
+                    "fig://icon?type=file",
+                    "📁",
+                    "fig://template?badge=R",
+                    "fig://icon?type=not-real",
+                    "",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, icon)| fastab_gpui::SuggestionItem {
+                    name: index.to_string(),
+                    kind: "file".into(),
+                    icon_identifier: Some(icon.into()),
+                    ..Default::default()
+                })
+                .collect();
+                state.visible = true;
+            });
+            let mut cache = FileIconCache::default();
+            let revision = state.read(cx).icon_request_revision();
+            assert!(cache.prepare_visible("/tmp", &state, revision, 1..5, cx));
+            assert_eq!(cache.requested, vec![PathBuf::from("/tmp/4")]);
+            assert!(!cache.prepare_visible("/tmp", &state, revision, 1..5, cx));
+            let png = cache.insert_png(PathBuf::from("/tmp/4"), png(1)).unwrap();
+            state.update(cx, |state, _| state.items[4].icon_png = Some(png));
+            assert!(cache.prepare_visible("/tmp", &state, revision, 5..6, cx));
+            assert_eq!(cache.requested, vec![PathBuf::from("/tmp/5")]);
+            assert!(
+                state.read(cx).items[4].icon_png.is_none(),
+                "offscreen rows release their image"
+            );
+            assert!(!cache.prepare_visible("/tmp", &state, (revision.0 + 1, revision.1), 0..1, cx));
+            state.update(cx, |state, _| state.visible = false);
+            assert!(!cache.prepare_visible("/tmp", &state, revision, 0..1, cx));
+        });
+    }
+
+    #[gpui::test]
     fn late_icons_do_not_refill_hidden_or_replaced_results(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             let state = cx.new(|_| OverlayState::new());
@@ -589,6 +692,8 @@ mod tests {
                 generation: generation.clone(),
                 expected_generation: 1,
                 batch_generation: cache.batch_generation,
+                revision: state.read(cx).icon_request_revision(),
+                range: 0..1,
             };
             let result = || vec![(PathBuf::from("/tmp/file"), prepare_icon(png(1)).unwrap())];
             generation.store(2, Ordering::Relaxed);
@@ -609,7 +714,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn idle_grace_restarts_and_preserves_only_images_in_kept_rows(cx: &mut gpui::TestAppContext) {
+    fn idle_grace_restarts_and_releases_hidden_rows_and_images(cx: &mut gpui::TestAppContext) {
         let slot = Arc::new(Mutex::new(None));
         let (cache, state, unused, kept) = cx.update(|cx| {
             let state = cx.new(|_| OverlayState::new());
@@ -618,8 +723,8 @@ mod tests {
                 let unused = cache.insert_png(PathBuf::from("unused"), png(1)).unwrap();
                 let kept = cache.insert_png(PathBuf::from("kept"), png(2)).unwrap();
                 state.update(cx, |state, _| {
-                    // A large prior result must remain intact while Tab can
-                    // restore it, then release its backing storage on idle.
+                    // A large hidden result survives the grace, then releases
+                    // rows and backing storage before a cold Show/Tab request.
                     state.items.reserve(10_000);
                     state.items.push(fastab_gpui::SuggestionItem {
                         name: "kept".into(),
@@ -654,17 +759,17 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert!(unused.upgrade().is_none());
-        assert!(kept.upgrade().is_some(), "Tab still owns the kept row's decoded image");
+        assert!(kept.upgrade().is_none(), "hidden rows no longer pin decoded images");
         cx.update(|cx| {
             assert!(cache.read(cx).paths.is_empty());
             assert!(cache.read(cx).idle_task.is_none());
             state.update(cx, |state, _| {
-                assert_eq!(state.items[0].name, "kept");
-                assert_eq!(state.search_term, "kept search");
-                assert_eq!(state.match_term, "kept match");
-                assert_eq!(state.current_arg_name, "kept argument");
-                assert_eq!(state.current_arg_description, "kept argument description");
-                assert!(state.items.capacity() >= 10_000);
+                assert!(state.items.is_empty());
+                assert_eq!(state.items.capacity(), 0);
+                assert!(state.search_term.is_empty());
+                assert!(state.match_term.is_empty());
+                assert!(state.current_arg_name.is_empty());
+                assert!(state.current_arg_description.is_empty());
                 state.dismiss();
             });
             cache.update(cx, |cache, cx| cache.finish_batch(&state, &slot, cx));
@@ -685,11 +790,12 @@ mod tests {
         assert!(next.upgrade().is_some());
         cx.update(|cx| {
             let state = state.read(cx);
-            assert!(state.items.is_empty() && state.items.capacity() >= 10_000);
-            assert!(state.search_term.is_empty() && state.search_term.capacity() > 0);
-            assert!(state.match_term.is_empty() && state.match_term.capacity() > 0);
-            assert!(state.current_arg_name.is_empty() && state.current_arg_name.capacity() > 0);
-            assert!(state.current_arg_description.is_empty() && state.current_arg_description.capacity() > 0);
+            assert!(state.items.is_empty());
+            assert_eq!(state.items.capacity(), 0);
+            assert_eq!(state.search_term.capacity(), 0);
+            assert_eq!(state.match_term.capacity(), 0);
+            assert_eq!(state.current_arg_name.capacity(), 0);
+            assert_eq!(state.current_arg_description.capacity(), 0);
         });
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();

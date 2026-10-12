@@ -181,6 +181,8 @@ pub struct PlatformStateImpl {
     caret_epoch: AtomicU64,
     #[serde(skip)]
     enabled_epoch: AtomicU64,
+    #[serde(skip)]
+    caret_demand: AtomicBool,
 }
 
 /// Returned by the existing platform state dump without performing an AX query.
@@ -449,6 +451,7 @@ impl PlatformStateImpl {
             last_ax_caret_failure: Mutex::new(None),
             caret_epoch: AtomicU64::new(0),
             enabled_epoch: AtomicU64::new(0),
+            caret_demand: AtomicBool::new(false),
         }
     }
 
@@ -1109,8 +1112,46 @@ impl PlatformStateImpl {
         self.send_terminal_caret_snapshot(app, identity, epoch, position, false);
     }
 
+    pub(crate) fn terminal_completion_disabled(&self) -> bool {
+        self.focused_window
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|window| Terminal::from_bundle_id(&window.bundle_id))
+            .is_some_and(|terminal| {
+                fastab_settings::settings::get_bool_or(
+                    format!("integrations.{}.disabled", terminal.internal_id()),
+                    false,
+                )
+            })
+    }
+
+    pub(crate) fn set_caret_demand(&self, demand: bool) {
+        self.caret_demand.store(demand, Ordering::Relaxed);
+    }
+
     fn refresh_window_position(&self) -> anyhow::Result<()> {
-        let ax_app = macos_utils::window_server::frontmost_application().filter(prefers_ax_caret_for_app);
+        if !self.caret_demand.load(Ordering::Relaxed)
+            || fastab_settings::settings::get_bool_or("autocomplete.disable", false)
+        {
+            return Ok(());
+        }
+        // Checking the frontmost app does not walk its AX tree. Keep this
+        // ahead of recovery and of both the AX and IME query routes.
+        let frontmost = macos_utils::window_server::frontmost_application();
+        if frontmost
+            .as_ref()
+            .and_then(|app| Terminal::from_bundle_id(&app.bundle_id))
+            .is_none_or(|terminal| {
+                fastab_settings::settings::get_bool_or(
+                    format!("integrations.{}.disabled", terminal.internal_id()),
+                    false,
+                )
+            })
+        {
+            return Ok(());
+        }
+        let ax_app = frontmost.filter(prefers_ax_caret_for_app);
         {
             let mut diagnostics = self.ax_caret.lock().unwrap();
             diagnostics.position_refreshes = diagnostics.position_refreshes.saturating_add(1);
@@ -1273,6 +1314,23 @@ mod tests {
         recovery_is_throttled, should_refresh_x_term_cache, window_focus_events,
         x_term_cache_update_for_focused_element,
     };
+
+    #[test]
+    fn suspended_or_disabled_refresh_does_not_enter_any_caret_route() {
+        let (proxy, _events) = crate::event_loop::channel();
+        let state = super::PlatformStateImpl::new(proxy);
+        state.set_caret_demand(false);
+        state.refresh_window_position().unwrap();
+        let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::from_slice(&[(
+            "autocomplete.disable",
+            serde_json::json!(true),
+        )]));
+        state.set_caret_demand(true);
+        state.refresh_window_position().unwrap();
+        let diagnostics = state.ax_caret.lock().unwrap();
+        assert_eq!(diagnostics.position_refreshes, 0);
+        assert_eq!(diagnostics.queries, 0);
+    }
 
     #[test]
     fn platform_dump_reports_ax_query_failure_without_requerying() {

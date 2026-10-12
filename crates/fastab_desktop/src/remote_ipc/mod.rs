@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use crate::EventLoopProxy;
 use crate::event::{EmitEventName, Event, WindowEvent};
-use crate::platform::PlatformBoundEvent;
 use crate::webview::notification::WebviewNotificationsState;
 
 #[derive(Debug, Clone)]
@@ -118,8 +117,6 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
             }
         }
 
-        let empty_edit_buffer = hook.text.trim().is_empty();
-
         let cwd = figterm_state
             .with(&session_id, |session| {
                 session
@@ -129,20 +126,12 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        self.proxy.send_event(Event::GpuiOverlayBuffer {
+        self.proxy.send_overlay_input(crate::event_loop::OverlayInput {
             buffer: hook.text.clone(),
             cwd,
             cursor: hook.cursor.max(0) as u32,
             session_id,
         })?;
-
-        // Establish the buffer's session before asking AX/IME for its caret.
-        // Otherwise a fast caret reply can reach the host before this buffer,
-        // then be discarded when the new session clears the previous caret.
-        if !empty_edit_buffer {
-            self.proxy
-                .send_event(Event::PlatformBoundEvent(PlatformBoundEvent::EditBufferChanged))?;
-        }
 
         Ok(None)
     }
@@ -371,17 +360,14 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                assert!(matches!(
-                    next_event(&events).await,
-                    Event::GpuiOverlayBuffer { buffer, cwd, cursor, session_id: owner }
-                        if buffer == text && cwd == "/fixture" && cursor == text.len() as u32 && owner == session_id
-                ));
-                if !text.trim().is_empty() {
-                    assert!(matches!(
-                        next_event(&events).await,
-                        Event::PlatformBoundEvent(PlatformBoundEvent::EditBufferChanged)
-                    ));
-                }
+                let Event::GpuiOverlayInput(queued) = next_event(&events).await else {
+                    panic!("expected queued input");
+                };
+                let input = queued.take().unwrap();
+                assert_eq!(input.buffer, text);
+                assert_eq!(input.cwd, "/fixture");
+                assert_eq!(input.cursor, text.len() as u32);
+                assert_eq!(input.session_id, session_id);
             }
 
             drop(client);

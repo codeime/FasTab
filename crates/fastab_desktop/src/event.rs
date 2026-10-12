@@ -25,6 +25,11 @@ pub enum Event {
     SetTrayVisible(bool),
 
     ReloadCredentials,
+    GpuiOverlayVisibleRows {
+        generation: u64,
+        revision: (u64, u64),
+        range: std::ops::Range<usize>,
+    },
     JevSettingsChanged,
     JevCredentialsLoaded {
         epoch: u64,
@@ -52,6 +57,7 @@ pub enum Event {
     },
 
     /// Headless engine input for the GPUI overlay.
+    GpuiOverlayInput(std::sync::Arc<crate::event_loop::QueuedOverlayInput>),
     GpuiOverlayBuffer {
         buffer: String,
         cwd: String,
@@ -73,6 +79,10 @@ pub enum Event {
     /// retired; the request itself keeps running under the engine watchdog.
     GpuiOverlayLoadingExpired {
         generation: u64,
+    },
+    /// An explicit Show/Tab could not resolve before its bounded deadline.
+    GpuiOverlayShowExpired {
+        token: u64,
     },
     /// A completion request finished on the engine thread.
     GpuiOverlayComplete {

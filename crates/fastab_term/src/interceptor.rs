@@ -19,7 +19,7 @@ const IGNORE_ACTION: &str = "ignore";
 /// still running, though, so caching it in a `LazyLock` makes the old setting
 /// stick until the terminal is restarted.  Refresh the settings snapshot
 /// before reading it; this branch only runs for a Tab while the overlay is
-/// hidden and has kept rows, so it is not on the ordinary typing path.
+/// hidden and advertises a current input, so it is not on ordinary typing.
 fn only_show_on_tab_enabled() -> bool {
     let _ = fastab_settings::settings::init_global();
     fastab_settings::settings::get_bool_or("autocomplete.onlyShowOnTab", false)
@@ -30,9 +30,10 @@ fn only_show_on_tab_enabled() -> bool {
 /// This must stay distinct from `showAutocomplete`: the latter is also a user
 /// keybinding/action and showing the list must never accept a row as a side
 /// effect.  The overlay can therefore preserve the legacy special case only
-/// for this action.
-fn tab_only_action(key_event: &KeyEvent, only_show_on_tab: bool) -> Option<&'static str> {
-    (only_show_on_tab && key_event.key == KeyCode::Tab).then_some("showAutocompleteFromTab")
+/// for this action. Check the key before refreshing settings from disk.
+fn tab_only_action(key_event: &KeyEvent, read_only_show_on_tab: impl FnOnce() -> bool) -> Option<&'static str> {
+    (key_event.key == KeyCode::Tab && key_event.modifiers == Modifiers::NONE && read_only_show_on_tab())
+        .then_some("showAutocompleteFromTab")
 }
 
 pub fn key_from_text(text: impl AsRef<str>) -> Option<KeyEvent> {
@@ -239,7 +240,7 @@ impl KeyInterceptor {
 
         match (self.intercept_global, self.intercept) {
             (true, false) => {
-                if let Some(action) = tab_only_action(key_event, only_show_on_tab_enabled()) {
+                if let Some(action) = tab_only_action(key_event, only_show_on_tab_enabled) {
                     return Some(action.into());
                 }
 
@@ -328,8 +329,70 @@ mod tests {
             modifiers: Modifiers::NONE,
         };
 
-        assert_eq!(tab_only_action(&tab, true), Some("showAutocompleteFromTab"));
-        assert_eq!(tab_only_action(&enter, true), None);
-        assert_eq!(tab_only_action(&tab, false), None);
+        assert_eq!(tab_only_action(&tab, || true), Some("showAutocompleteFromTab"));
+        assert_eq!(tab_only_action(&enter, || true), None);
+        assert_eq!(tab_only_action(&tab, || false), None);
+        assert_eq!(
+            tab_only_action(
+                &KeyEvent {
+                    modifiers: Modifiers::SHIFT,
+                    ..tab
+                },
+                || true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_only_action_reads_live_settings_only_for_unmodified_tab() {
+        let reads = std::cell::Cell::new(0);
+        let setting = std::cell::Cell::new(true);
+        let read_setting = || {
+            reads.set(reads.get() + 1);
+            setting.get()
+        };
+
+        for key in [
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::DownArrow,
+        ] {
+            assert_eq!(
+                tab_only_action(
+                    &KeyEvent {
+                        key,
+                        modifiers: Modifiers::NONE,
+                    },
+                    read_setting
+                ),
+                None
+            );
+        }
+        for modifiers in [Modifiers::SHIFT, Modifiers::CTRL, Modifiers::ALT, Modifiers::META] {
+            assert_eq!(
+                tab_only_action(
+                    &KeyEvent {
+                        key: KeyCode::Tab,
+                        modifiers,
+                    },
+                    read_setting
+                ),
+                None
+            );
+        }
+        assert_eq!(reads.get(), 0);
+
+        let tab = KeyEvent {
+            key: KeyCode::Tab,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(tab_only_action(&tab, read_setting), Some("showAutocompleteFromTab"));
+        setting.set(false);
+        assert_eq!(tab_only_action(&tab, read_setting), None);
+        setting.set(true);
+        assert_eq!(tab_only_action(&tab, read_setting), Some("showAutocompleteFromTab"));
+        assert_eq!(reads.get(), 3);
     }
 }

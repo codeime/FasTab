@@ -196,6 +196,13 @@ pub fn is_short_text_icon(identifier: &str) -> bool {
     !identifier.contains("://") && !identifier.is_empty() && identifier.chars().count() < 4
 }
 
+/// Match the renderer's accepted forms without allocating an image or doing I/O.
+pub fn identifier_is_renderable(identifier: &str) -> bool {
+    icon_type_from_identifier(identifier).is_some()
+        || identifier.starts_with("fig://template?")
+        || is_short_text_icon(identifier)
+}
+
 fn template_icon_parts(identifier: &str) -> Option<(u32, String)> {
     let query = identifier.strip_prefix("fig://template?")?;
     let mut color = 0x628dad;

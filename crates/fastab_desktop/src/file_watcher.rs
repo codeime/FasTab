@@ -87,11 +87,16 @@ pub async fn setup_listeners(notifications_state: Arc<WebviewNotificationsState>
                     if let EventKind::Create(_) | EventKind::Modify(_) = event.kind {
                         match fastab_settings::OldSettings::load_from_file() {
                             Ok(settings) => {
+                                if settings == prev_settings {
+                                    continue;
+                                }
                                 debug!("Settings file changed");
 
-                                if let Err(err) = fastab_settings::settings::init_global() {
-                                    error!(%err, "failed to reload settings into memory");
-                                }
+                                // Install the exact validated snapshot used for
+                                // deduplication/notifications. A second file read
+                                // can fail during an external rewrite and reset
+                                // global settings while we record this as applied.
+                                *fastab_settings::OldSettings::data_lock().write() = Some(settings.clone());
                                 proxy
                                     .send_event(Event::ReloadCredentials)
                                     .map_err(|err| error!(?err, "failed to refresh overlay after settings change"))
