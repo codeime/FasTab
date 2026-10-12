@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.0.7
+
+- change: defer hidden completion, caret queries, history materialization and hook catalog parsing until needed; release hidden suggestion payloads after the idle grace.
+- change: request native file icons only for visible rows, cancel superseded directory scans, retain bounded candidates and reduce ranking allocations.
+- fix: request fresh rows and caret geometry for cold Tab/Show, reject stale loading candidates and consume intercepted Tab exactly once when partial results become actionable or an insertion succeeds.
+- fix: preserve temporary fuzzy matching during presentation-only settings refreshes; avoid settings-file reads on ordinary hidden keystrokes and coalesce identical queued input updates.
+- fix: preserve terminal protocol ordering and invalid UTF-8 paste boundaries, drain parser controls locally, release large input buffers and settle intercepted keys on EOF or permanent errors.
+- fix: bound IPC queues and supervised engine work, preserve idle-release deadlines, clean up script process groups before reaping and maintain RPC timeouts only while replies are pending.
+- change: bound cross-process log rotation and native background workers; report build identity, resource ownership and reliable memory-measurement failures.
+
 ## v0.0.6
 
 - fix: drain temporary AppKit objects after synchronous background queries and startup, preventing them from accumulating in thread autorelease pools.
