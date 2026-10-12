@@ -1531,6 +1531,58 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn repeated_csi_u_controls_only_push_and_pop_owned_state() {
+            // Exercise the controls directly: Term suppresses repeated PreExec
+            // hooks, which would otherwise mask an extra CSI-u pop here.
+            let sender = RemoteSender::test_disconnected();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let mut master = SocketMaster(socket);
+            let mut deferred = BytesMut::new();
+            let mut inserts = VecDeque::new();
+            let mut interceptor = KeyInterceptor::new();
+            let mut terminal = ModeTerminal::default();
+            let (mut stdout, mut capture) = tokio::io::duplex(128);
+            let mut csi_u = CsiUState::default();
+            let mut control = MainLoopControl {
+                remote_sender: &sender,
+                master: &mut master,
+                deferred_pty_input: &mut deferred,
+                deferred_inserts: &mut inserts,
+                key_interceptor: &mut interceptor,
+                terminal: &mut terminal,
+                stdout: &mut stdout,
+                csi_u: &mut csi_u,
+                bracketed_paste: false,
+            };
+
+            // No acquired push means there is nothing to pop, including when
+            // conflicting requests settle before an output boundary.
+            control.apply(MainLoopEvent::UnsetCsiU).await.unwrap();
+            control.flush_csi_u().await.unwrap();
+            control.apply(MainLoopEvent::SetCsiU).await.unwrap();
+            control.apply(MainLoopEvent::UnsetCsiU).await.unwrap();
+            control.flush_csi_u().await.unwrap();
+            assert!(!control.csi_u.owned);
+
+            for _ in 0..2 {
+                for _ in 0..2 {
+                    control.apply(MainLoopEvent::SetCsiU).await.unwrap();
+                    control.flush_csi_u().await.unwrap();
+                    assert!(control.csi_u.owned);
+                }
+                for _ in 0..2 {
+                    control.apply(MainLoopEvent::UnsetCsiU).await.unwrap();
+                    control.flush_csi_u().await.unwrap();
+                    assert!(!control.csi_u.owned);
+                }
+            }
+            drop(stdout);
+            let mut output = Vec::new();
+            capture.read_to_end(&mut output).await.unwrap();
+            assert_eq!(output, b"\x1b[>1u\x1b[<u".repeat(2));
+        }
+
+        #[tokio::test]
         async fn csi_u_controls_follow_screen_transitions_across_pty_read_boundaries() {
             let cases: &[(&[u8], &[u8], &[bool], bool)] = &[
                 (b"ordinary\r\noutput", b"ordinary\r\noutput", &[], false),
@@ -1587,16 +1639,18 @@ mod tests {
                     &[false, true],
                     false,
                 ),
+                // NewCmd emits each prompt; PreExec emits once until the
+                // next NewCmd. All duplicate hook bytes still pass through.
                 (
                     b"\x1b]697;NewCmd\x1b\\\x1b]697;NewCmd\x07\x1b]697;PreExec\x07\x1b]697;PreExec\x1b\\tail",
                     b"\x1b]697;NewCmd\x1b\\\x1b[>1u\x1b]697;NewCmd\x07\x1b]697;PreExec\x07\x1b[<u\x1b]697;PreExec\x1b\\tail",
-                    &[false, false, true, true],
+                    &[false, false, true],
                     false,
                 ),
                 (
                     b"\x1b]697;PreExec\x07\x1b]697;PreExec\x1b\\tail",
                     b"\x1b]697;PreExec\x07\x1b]697;PreExec\x1b\\tail",
-                    &[true, true],
+                    &[true],
                     false,
                 ),
                 // Give up our push before the application's alternate screen
