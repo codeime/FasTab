@@ -791,8 +791,7 @@ pub fn apply_with_acceptance(
         } else {
             best_match(suggestion, &query)
         }
-        .map(|score| (score.bucket(), Reverse(score.score)))
-        .unwrap_or((u8::MAX, Reverse(0)));
+        .map_or((u8::MAX, Reverse(0)), |score| (score.bucket(), Reverse(score.score)));
         let priority = effective_priority_score(suggestion, history_counts, acceptance, root_command, !alphabetical);
         // This score is finite and nonnegative: bounded integer priority
         // plus an optional u64 timestamp fraction. Its IEEE bits therefore
