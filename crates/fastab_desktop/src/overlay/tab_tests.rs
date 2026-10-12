@@ -702,6 +702,7 @@ fn show_outbox_fixture(
         intercept_global: InterceptMode::Unlocked,
     });
     let controller = cx.update(|cx| {
+        cx.set_global(HeadlessOverlayWindows);
         let mut controller = OverlayController::start(cx, engine, proxy, figterm.clone(), platform).unwrap();
         controller.enabled = true;
         // onlyShowOnTab and an absent caret keep the actual input entry point

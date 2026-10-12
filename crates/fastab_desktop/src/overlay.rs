@@ -2149,11 +2149,23 @@ fn layout_retry_is_current(generation: u64, current_generation: u64, token: u64,
     generation == current_generation && token == current_token
 }
 
+/// Controller/outbox tests exercise native-unavailable handling. GPUI's test
+/// windows have no raw AppKit handle, so do not invoke the title-based fallback.
+#[cfg(test)]
+struct HeadlessOverlayWindows;
+
+#[cfg(test)]
+impl gpui::Global for HeadlessOverlayWindows {}
+
 fn ensure_overlay_window(
     slot: &Mutex<Option<OverlayHandle>>,
     state: &Entity<OverlayState>,
     cx: &mut App,
 ) -> Option<OverlayHandle> {
+    #[cfg(test)]
+    if cx.has_global::<HeadlessOverlayWindows>() {
+        return None;
+    }
     if let Some(handle) = *slot.lock().unwrap_or_else(|err| err.into_inner()) {
         return Some(handle);
     }
