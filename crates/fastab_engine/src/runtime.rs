@@ -1037,7 +1037,9 @@ mod tests {
         let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), Frecency::default()).unwrap();
         assert!(!engine.diagnostics().hook_catalog.load_attempted);
         assert!(engine.diagnostics().hook_catalog.captured_bytes > 0);
-        for buffer in ["d", "demo "] {
+        // First-token suggestions default off; exercise that early return as
+        // well as both unfiltered and filtered static spec completions.
+        for (buffer, expected_row) in [("d", None), ("demo ", Some("static")), ("demo st", Some("static"))] {
             let result = engine
                 .complete(CompleteRequest {
                     buffer: buffer.into(),
@@ -1046,7 +1048,15 @@ mod tests {
                     ..CompleteRequest::default()
                 })
                 .unwrap();
-            assert!(!result.suggestions.is_empty());
+            if let Some(expected_row) = expected_row {
+                assert!(
+                    result.suggestions.iter().any(|row| row.name == expected_row),
+                    "{buffer:?}: {:?}",
+                    result.suggestions
+                );
+            } else {
+                assert!(result.suggestions.is_empty(), "{buffer:?}: {:?}", result.suggestions);
+            }
             assert_eq!(engine.diagnostics().hook_catalog, Default::default());
         }
         let _bound = crate::hook_backend::bind_native(Arc::clone(engine.native.as_ref().unwrap()));
