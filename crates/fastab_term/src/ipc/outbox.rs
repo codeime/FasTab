@@ -456,6 +456,10 @@ impl GenerationSender {
         self.sender.phase() == ConnectionPhase::Ready(self.generation)
     }
 
+    pub(crate) async fn invalidated(&self) {
+        self.sender.invalidated(self.generation).await;
+    }
+
     pub(crate) fn context_progress(&self) -> Option<ContextProgress> {
         let state = self.sender.shared.state.lock().unwrap();
         (state.phase == ConnectionPhase::Ready(self.generation)).then_some(state.context)

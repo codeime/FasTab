@@ -277,7 +277,7 @@ async fn read_input_stream(
     immediate_mode: &AtomicBool,
 ) {
     let _resources = InputOuterResources;
-    let mut parser = InputParser::new();
+    let mut parser = InputParser::new_raw_passthrough();
     let mut buf = BytesMut::with_capacity(crate::BUFFER_SIZE);
     crate::resource_diagnostics::input_outer(buf.len(), buf.capacity());
     // A fixed request size also prevents Tokio stdin's internal blocking Buf
@@ -387,7 +387,11 @@ mod tests {
             while let Ok(events) = rx.recv_async().await {
                 for event in events {
                     match event {
-                        Ok((bytes, _)) => {
+                        Ok((bytes, event)) => {
+                            assert!(
+                                !matches!(event, InputEvent::Paste(_)),
+                                "Unix raw paste must not decode unused text"
+                            );
                             assert_eq!(errors, 0, "buffered input must precede the terminal error");
                             raw.extend_from_slice(bytes.as_deref().unwrap_or_default());
                         },

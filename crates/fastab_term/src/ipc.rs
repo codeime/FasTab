@@ -1,11 +1,13 @@
 //! Utiities for IPC with Tauri App
 
+pub(crate) mod incoming;
 mod outbox;
 
 pub(crate) use outbox::{ContextAdmission, ContextProgress, Generation, GenerationSender, RemoteSender, RequestOrigin};
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -16,11 +18,11 @@ use fastab_proto::figterm::{FigtermRequestMessage, FigtermResponseMessage};
 use fastab_proto::remote::hostbound::Handshake;
 use fastab_proto::remote::{Clientbound, Hostbound, clientbound, hostbound};
 use fastab_util::{PTY_BINARY_NAME, directories, gen_hex_string};
-use flume::{Receiver, Sender, unbounded};
+use flume::{Receiver, Sender, bounded};
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracing::{debug, error, info, trace};
 
@@ -31,6 +33,50 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct RemoteIncoming {
     pub(crate) generation: Generation,
     pub(crate) message: Clientbound,
+    pub(crate) permit: incoming::IncomingPermit,
+}
+
+pub(crate) struct LocalIncoming {
+    pub(crate) message: FigtermRequestMessage,
+    pub(crate) reply: LocalReply,
+}
+
+pub(crate) struct LocalReply {
+    completion: oneshot::Sender<Option<LocalResponse>>,
+    permit: incoming::IncomingPermit,
+    serial: OwnedSemaphorePermit,
+}
+
+struct LocalResponse {
+    message: FigtermResponseMessage,
+    _permit: incoming::IncomingPermit,
+    _serial: OwnedSemaphorePermit,
+}
+
+impl LocalReply {
+    pub(crate) fn complete(mut self, response: Option<FigtermResponseMessage>) {
+        if let Some(response) = &response {
+            if !self.permit.try_extend(incoming::response_size(response)) {
+                // Dropping the reserved sender makes the writer retire this
+                // connection. Never silently turn a rejected reply into None.
+                debug!("Local IPC response exceeds available admission budget");
+                return;
+            }
+        }
+        let response = response.map(|message| LocalResponse {
+            message,
+            _permit: self.permit,
+            _serial: self.serial,
+        });
+        // The reader reserved this one-shot slot before admitting the request.
+        // Never wait for the socket writer from the PTY's main loop.
+        let _ = self.completion.send(response);
+    }
+
+    #[cfg(test)]
+    fn is_closed(&self) -> bool {
+        self.completion.is_closed()
+    }
 }
 
 struct ForwardedConnection {
@@ -125,12 +171,10 @@ async fn get_forwarded_stream() -> Result<ForwardedConnection> {
 }
 
 /// Spawns a local unix socket for communicating with figterm on a local machine
-pub async fn spawn_figterm_ipc(
-    session_id: impl std::fmt::Display,
-) -> Result<Receiver<(FigtermRequestMessage, Sender<FigtermResponseMessage>)>> {
+pub(crate) async fn spawn_figterm_ipc(session_id: impl std::fmt::Display) -> Result<Receiver<LocalIncoming>> {
     trace!("Spawning incoming receiver");
 
-    let (incoming_tx, incoming_rx) = unbounded();
+    let (incoming_tx, incoming_rx) = bounded(incoming::MAX_MESSAGES);
 
     let socket_path = directories::figterm_socket_path(session_id)?;
     if let Some(parent) = socket_path.parent() {
@@ -151,10 +195,24 @@ pub async fn spawn_figterm_ipc(
 
     tokio::spawn(async move {
         loop {
-            if let Ok((stream, _)) = socket_listener.accept().await {
-                let incoming_tx = incoming_tx.clone();
-
-                tokio::spawn(handle_local_connection(stream, incoming_tx));
+            let Ok(connection) = incoming::CONNECTIONS.clone().acquire_owned().await else {
+                break;
+            };
+            match socket_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(handle_local_connection(
+                        stream,
+                        incoming_tx.clone(),
+                        incoming::budget(),
+                        connection,
+                        CONNECTION_TIMEOUT,
+                    ));
+                },
+                Err(err) => {
+                    debug!(%err, "Local IPC accept failed");
+                    drop(connection);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                },
             }
         }
     });
@@ -164,30 +222,56 @@ pub async fn spawn_figterm_ipc(
 
 async fn handle_local_connection(
     stream: tokio::net::UnixStream,
-    incoming_tx: Sender<(FigtermRequestMessage, Sender<FigtermResponseMessage>)>,
+    incoming_tx: Sender<LocalIncoming>,
+    budget: Arc<incoming::IncomingBudget>,
+    _connection: OwnedSemaphorePermit,
+    admission_timeout: Duration,
 ) {
+    let _connection = incoming::ConnectionLease::new(_connection);
     let (read_half, mut write_half) = tokio::io::split(stream);
-    let (response_tx, response_rx) = unbounded::<FigtermResponseMessage>();
+    let (response_tx, response_rx) = bounded::<oneshot::Receiver<Option<LocalResponse>>>(1);
+    let serial = Arc::new(Semaphore::new(1));
     let reader = async move {
         let mut reader = BufferedReader::new(read_half);
         loop {
-            match reader.recv_message::<FigtermRequestMessage>().await {
-                Ok(Some(message)) => {
-                    if incoming_tx.send_async((message, response_tx.clone())).await.is_err() {
+            match timeout(Duration::from_secs(30), reader.recv_message::<FigtermRequestMessage>()).await {
+                Ok(Ok(Some(message))) => {
+                    let admission = timeout(admission_timeout, async {
+                        let permit = budget.admit(incoming::local_size(&message)).await?;
+                        let serial = serial.clone().acquire_owned().await?;
+                        let (completion, response) = oneshot::channel();
+                        response_tx.send_async(response).await?;
+                        let reply = LocalReply {
+                            completion,
+                            permit,
+                            serial,
+                        };
+                        incoming_tx.send_async(LocalIncoming { message, reply }).await?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                    if !matches!(admission, Ok(Ok(()))) {
+                        debug!("Local IPC admission rejected or timed out; retiring connection");
                         break;
                     }
                 },
-                Ok(None) => break,
-                Err(error) => {
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => {
                     debug!(%error, "Local IPC read failed");
                     break;
                 },
+                Err(_) => break,
             }
         }
     };
     let writer = async move {
         while let Ok(response) = response_rx.recv_async().await {
-            let Ok(protobuf) = response.encode_fastab_protobuf() else {
+            let response = match response.await {
+                Ok(Some(response)) => response,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
+            let Ok(protobuf) = response.message.encode_fastab_protobuf() else {
                 break;
             };
             if !matches!(
@@ -214,9 +298,8 @@ pub(crate) async fn spawn_remote_ipc(
     let (stop_ipc_tx, mut stop_ipc_rx) = oneshot::channel::<()>();
     let outgoing = RemoteSender::new();
     let supervisor = outgoing.clone();
-    // This change bounds the outbox; it does not claim to bound incoming
-    // protocol parsing or the local figterm listener.
-    let (incoming_tx, incoming_rx) = unbounded::<RemoteIncoming>();
+    let (incoming_tx, incoming_rx) = bounded::<RemoteIncoming>(incoming::MAX_MESSAGES);
+    let incoming_budget = incoming::budget();
 
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(5));
@@ -300,8 +383,18 @@ pub(crate) async fn spawn_remote_ipc(
 
                     let receive = async {
                         while let Some(message) = reader.recv_message::<Clientbound>().await? {
+                            let permit = timeout(
+                                CONNECTION_TIMEOUT,
+                                incoming_budget.admit(incoming::remote_size(&message)),
+                            )
+                            .await??;
                             incoming_tx
-                                .send(RemoteIncoming { generation, message })
+                                .send_async(RemoteIncoming {
+                                    generation,
+                                    message,
+                                    permit,
+                                })
+                                .await
                                 .map_err(|err| anyhow::anyhow!("remote incoming receiver closed: {err}"))?;
                         }
                         Err::<(), anyhow::Error>(anyhow::anyhow!("remote reader reached EOF"))
@@ -389,11 +482,21 @@ mod local_connection_tests {
     use super::*;
     use fastab_proto::figterm::{DiagnosticsRequest, figterm_request_message};
 
+    async fn connection_slot() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap()
+    }
+
     #[tokio::test]
     async fn local_peer_half_close_retires_reader_and_writer_together() {
         let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
-        let (incoming, requests) = unbounded();
-        let task = tokio::spawn(handle_local_connection(server, incoming));
+        let (incoming, requests) = bounded(4);
+        let task = tokio::spawn(handle_local_connection(
+            server,
+            incoming,
+            incoming::IncomingBudget::new(4, 4096),
+            connection_slot().await,
+            CONNECTION_TIMEOUT,
+        ));
         client
             .send_message(FigtermRequestMessage {
                 request: Some(figterm_request_message::Request::Diagnostics(DiagnosticsRequest {})),
@@ -402,12 +505,113 @@ mod local_connection_tests {
             .unwrap();
         // Hold a response sender past peer EOF. Its lifetime must not keep the
         // connection's writer waiting indefinitely.
-        let (_, response) = timeout(Duration::from_secs(2), requests.recv_async())
+        let LocalIncoming { reply: response, .. } = timeout(Duration::from_secs(2), requests.recv_async())
             .await
             .unwrap()
             .unwrap();
         client.shutdown().await.unwrap();
         timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
-        assert!(response.is_disconnected());
+        assert!(response.is_closed());
+    }
+
+    #[tokio::test]
+    async fn dead_peer_waiting_for_admission_releases_its_connection() {
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (incoming, _requests) = bounded(4);
+        let budget = incoming::IncomingBudget::new(1, 4096);
+        let held = budget.admit(4096).await.unwrap();
+        let task = tokio::spawn(handle_local_connection(
+            server,
+            incoming,
+            budget.clone(),
+            connection_slot().await,
+            Duration::from_millis(30),
+        ));
+        client
+            .send_message(FigtermRequestMessage {
+                request: Some(figterm_request_message::Request::Diagnostics(DiagnosticsRequest {})),
+            })
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+        drop(held);
+        assert!(budget.admit(4096).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_request_replies_are_reserved_and_serialized_without_main_loop_waits() {
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (incoming, requests) = bounded(4);
+        let task = tokio::spawn(handle_local_connection(
+            server,
+            incoming,
+            incoming::IncomingBudget::new(4, 4096),
+            connection_slot().await,
+            CONNECTION_TIMEOUT,
+        ));
+        for _ in 0..2 {
+            client
+                .send_message(FigtermRequestMessage {
+                    request: Some(figterm_request_message::Request::Diagnostics(DiagnosticsRequest {})),
+                })
+                .await
+                .unwrap();
+        }
+        let first = timeout(Duration::from_secs(2), requests.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(timeout(Duration::from_millis(20), requests.recv_async()).await.is_err());
+        first.reply.complete(Some(FigtermResponseMessage { response: None }));
+        let mut reader = BufferedReader::new(client);
+        assert!(
+            timeout(Duration::from_secs(2), reader.recv_message::<FigtermResponseMessage>())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        let second = timeout(Duration::from_secs(2), requests.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        second.reply.complete(None);
+        drop(reader);
+        timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_owned_reply_retires_instead_of_blocking_or_silently_skipping() {
+        use fastab_proto::figterm::{InlineShellCompletionResponse, figterm_response_message};
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (incoming, requests) = bounded(4);
+        let task = tokio::spawn(handle_local_connection(
+            server,
+            incoming,
+            incoming::IncomingBudget::new(4, 1024),
+            connection_slot().await,
+            CONNECTION_TIMEOUT,
+        ));
+        client
+            .send_message(FigtermRequestMessage {
+                request: Some(figterm_request_message::Request::Diagnostics(DiagnosticsRequest {})),
+            })
+            .await
+            .unwrap();
+        let request = timeout(Duration::from_secs(2), requests.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        request.reply.complete(Some(FigtermResponseMessage {
+            response: Some(figterm_response_message::Response::InlineShellCompletion(
+                InlineShellCompletionResponse {
+                    insert_text: Some("x".repeat(1024)),
+                },
+            )),
+        }));
+        timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+        let mut reader = BufferedReader::new(client);
+        assert!(reader.recv_message::<FigtermResponseMessage>().await.unwrap().is_none());
     }
 }

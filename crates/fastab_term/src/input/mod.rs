@@ -812,6 +812,7 @@ pub struct InputParser {
     buf: ReadBuffer,
     state: InputState,
     raw_byte_stack: BytesMut,
+    paste_as_raw: bool,
 }
 
 #[cfg(windows)]
@@ -1068,8 +1069,18 @@ impl InputParser {
             buf: ReadBuffer::new(),
             state: InputState::Normal,
             raw_byte_stack: BytesMut::new(),
+            paste_as_raw: false,
         };
         parser.record_resources();
+        parser
+    }
+
+    /// Unix forwards bracketed pastes byte-for-byte, so no consumer needs an
+    /// owned, decoded copy of their contents. Keep the text API for other callers.
+    #[cfg(unix)]
+    pub(crate) fn new_raw_passthrough() -> Self {
+        let mut parser = Self::new();
+        parser.paste_as_raw = true;
         parser
     }
 
@@ -1524,10 +1535,14 @@ impl InputParser {
                 InputState::Pasting(offset) => {
                     let end_paste = PASTE_END.as_bytes();
                     if let Some(idx) = self.buf.find_subsequence(offset, end_paste) {
-                        let pasted = String::from_utf8_lossy(&self.buf.as_slice()[0..idx]).to_string();
+                        let event = if self.paste_as_raw {
+                            InputEvent::RawString
+                        } else {
+                            InputEvent::Paste(String::from_utf8_lossy(&self.buf.as_slice()[0..idx]).to_string())
+                        };
                         self.advance_buf(idx + end_paste.len());
                         let raw = self.take_raw();
-                        callback(Some(raw.freeze()), InputEvent::Paste(pasted));
+                        callback(Some(raw.freeze()), event);
                         self.state = InputState::Normal;
                     } else {
                         // Advance our offset so that in the case where we receive a paste that
@@ -2008,6 +2023,42 @@ mod test {
         parser.parse(b"a", |raw, event| next.push((raw, event)), false);
         assert_eq!(next[0].0.as_deref(), Some(b"a".as_slice()));
         assert_eq!(raw.as_ref(), input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_paste_mode_preserves_markers_invalid_utf8_and_following_keys_without_text() {
+        let mut input = PASTE_START.as_bytes().to_vec();
+        input.extend(std::iter::repeat_n(b'x', 128 * 1024));
+        input.extend_from_slice(b"\xe4\xb8\xad\xff\x1b[31m");
+        input.extend_from_slice(PASTE_END.as_bytes());
+        let paste_len = input.len();
+        input.extend_from_slice(b"xy");
+        for chunk_size in [1, 37, input.len()] {
+            let mut parser = InputParser::new_raw_passthrough();
+            let mut events = Vec::new();
+            for chunk in input.chunks(chunk_size) {
+                parser.parse(chunk, |raw, event| events.push((raw, event)), false);
+            }
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0].1, InputEvent::RawString);
+            let raw = events[0].0.as_ref().unwrap();
+            assert_eq!(raw.as_ref(), &input[..paste_len]);
+            assert!(raw.is_unique());
+            for (index, byte) in b"xy".iter().enumerate() {
+                assert_eq!(events[index + 1].0.as_deref(), Some(std::slice::from_ref(byte)));
+                assert_eq!(
+                    events[index + 1].1,
+                    InputEvent::Key(KeyEvent {
+                        key: KeyCode::Char(char::from(*byte)),
+                        modifiers: Modifiers::NONE,
+                    })
+                );
+            }
+            assert!(parser.buf.is_empty());
+            assert!(parser.raw_byte_stack.is_empty());
+            assert!(parser.buf.capacity() <= 64 * 1024);
+        }
     }
 
     #[test]

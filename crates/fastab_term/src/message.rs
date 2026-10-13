@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alacritty_terminal::Term;
@@ -14,13 +15,14 @@ use fastab_util::PTY_BINARY_NAME;
 use fastab_util::env_var::PROCESS_LAUNCHED_BY_Q;
 use flume::Sender;
 use tokio::process::Command;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, trace, warn};
 
 use crate::event_handler::EventHandler;
 use crate::history::HistorySender;
 use crate::interceptor::KeyInterceptor;
-use crate::ipc::{GenerationSender, RequestOrigin};
-use crate::pty::AsyncMasterPty;
+use crate::ipc::{GenerationSender, LocalReply, RequestOrigin, incoming};
+use crate::pty::{AsyncMasterPty, AsyncMasterPtyExt};
 use crate::{
     INSERT_ON_NEW_CMD, INSERTION_LOCK, InsertionLock, MainLoopEvent, PendingInsertion, SHELL_ALIAS,
     SHELL_ENVIRONMENT_VARIABLES, shell_state_to_context,
@@ -60,19 +62,17 @@ fn working_directory(path: Option<&str>, shell_state: &ShellState) -> PathBuf {
         })
 }
 
-fn create_command(executable: impl AsRef<Path>, working_directory: impl AsRef<Path>) -> Command {
-    let env = (*SHELL_ENVIRONMENT_VARIABLES.lock().unwrap())
-        .clone()
-        .into_iter()
-        .filter_map(|EnvironmentVariable { key, value }| value.map(|value| (key, value)))
-        .collect::<Vec<_>>();
-
+fn create_command(
+    executable: impl AsRef<Path>,
+    working_directory: impl AsRef<Path>,
+    env: &[EnvironmentVariable],
+) -> Command {
     let mut cmd = if executable.as_ref().is_absolute() {
         Command::new(executable.as_ref())
     } else {
         let path = env
             .iter()
-            .find_map(|(key, value)| if key == "PATH" { Some(value.as_str()) } else { None });
+            .find_map(|var| if var.key == "PATH" { var.value.as_deref() } else { None });
 
         which::which_in(executable.as_ref(), path, working_directory.as_ref())
             .map_or_else(|_| Command::new(executable.as_ref()), Command::new)
@@ -96,9 +96,12 @@ fn create_command(executable: impl AsRef<Path>, working_directory: impl AsRef<Pa
         unsafe { cmd.pre_exec(pre_exec_fn) };
     }
 
-    if !env.is_empty() {
+    if env.iter().any(|var| var.value.is_some()) {
         cmd.env_clear();
-        cmd.envs(env);
+        cmd.envs(
+            env.iter()
+                .filter_map(|var| var.value.as_ref().map(|value| (&var.key, value))),
+        );
     }
 
     cmd.env_remove("LS_COLORS");
@@ -118,10 +121,18 @@ fn create_command(executable: impl AsRef<Path>, working_directory: impl AsRef<Pa
     cmd
 }
 
+async fn acquire_process_slot(slots: Arc<Semaphore>, sender: &GenerationSender) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        _ = sender.invalidated() => None,
+        slot = slots.acquire_owned() => slot.ok(),
+    }
+}
+
 /// Process the inner figterm request enum, shared between local and remote
 pub(crate) async fn process_figterm_request(
     figterm_request: FigtermRequest,
-    main_loop_tx: Sender<MainLoopEvent>,
+    _main_loop_tx: Sender<MainLoopEvent>,
     term: &Term<EventHandler>,
     pty_master: &mut Box<dyn AsyncMasterPty + Send + Sync>,
     key_interceptor: &mut KeyInterceptor,
@@ -174,7 +185,7 @@ pub(crate) async fn process_figterm_request(
                 }
             }
             insertion_string.push_str(&request.to_term_string());
-            pty_master.write(insertion_string.as_bytes()).await?;
+            pty_master.write_all(insertion_string.as_bytes()).await?;
             Ok(None)
         },
         FigtermRequest::Intercept(request) => {
@@ -252,7 +263,7 @@ pub(crate) async fn process_figterm_request(
         FigtermRequest::UpdateShellContext(request) => {
             let mut updated = false;
             if request.update_environment_variables {
-                *SHELL_ENVIRONMENT_VARIABLES.lock().unwrap() = request.environment_variables;
+                *SHELL_ENVIRONMENT_VARIABLES.lock().unwrap() = Arc::new(request.environment_variables);
                 updated = true;
             }
             if request.update_alias {
@@ -264,15 +275,9 @@ pub(crate) async fn process_figterm_request(
             }
             Ok(None)
         },
-        FigtermRequest::NotifySshSessionStarted(notification) => {
-            main_loop_tx
-                .send(MainLoopEvent::PromptSSH {
-                    uuid: notification.uuid,
-                    remote_host: notification.remote_host,
-                })
-                .ok();
-            Ok(None)
-        },
+        // Local dispatch applies this through MainLoopControl. Never send
+        // synchronously into the bounded queue consumed by this same loop.
+        FigtermRequest::NotifySshSessionStarted(_) => Ok(None),
         FigtermRequest::Telemtety(_) => anyhow::bail!("Telemetry is not supported over remote"),
         FigtermRequest::InlineShellCompletion(_)
         | FigtermRequest::InlineShellCompletionAccept(_)
@@ -285,22 +290,20 @@ pub(crate) async fn process_figterm_request(
 pub(crate) async fn process_figterm_message(
     figterm_request_message: FigtermRequestMessage,
     main_loop_tx: Sender<MainLoopEvent>,
-    response_tx: Sender<FigtermResponseMessage>,
+    reply: LocalReply,
     term: &Term<EventHandler>,
     _history_sender: &HistorySender,
     pty_master: &mut Box<dyn AsyncMasterPty + Send + Sync>,
     key_interceptor: &mut KeyInterceptor,
     _session_id: &str,
 ) -> Result<()> {
-    match figterm_request_message.request {
+    let response = match figterm_request_message.request {
         Some(
             FigtermRequest::InlineShellCompletion(_)
             | FigtermRequest::InlineShellCompletionAccept(_)
             | FigtermRequest::InlineShellCompletionSetEnabled(_),
-        ) => {},
-        Some(FigtermRequest::Telemtety(TelemetryRequest { .. })) => {
-            // Telemetry removed
-        },
+        ) => None,
+        Some(FigtermRequest::Telemtety(TelemetryRequest { .. })) => None,
         Some(request) => {
             match process_figterm_request(
                 request,
@@ -312,20 +315,22 @@ pub(crate) async fn process_figterm_message(
             )
             .await
             {
-                Ok(Some(response)) => {
-                    let response_message = FigtermResponseMessage {
-                        response: Some(response),
-                    };
-                    if let Err(err) = response_tx.send_async(response_message).await {
-                        error!(%err, "Failed sending request response");
-                    }
+                Ok(Some(response)) => Some(FigtermResponseMessage {
+                    response: Some(response),
+                }),
+                Ok(None) => None,
+                Err(err) => {
+                    error!(%err, "Failed to process figterm message");
+                    None
                 },
-                Ok(None) => {},
-                Err(err) => error!(%err, "Failed to process figterm message"),
             }
         },
-        None => warn!("{PTY_BINARY_NAME} message with no request"),
-    }
+        None => {
+            warn!("{PTY_BINARY_NAME} message with no request");
+            None
+        },
+    };
+    reply.complete(response);
     Ok(())
 }
 
@@ -355,6 +360,7 @@ pub(crate) async fn process_remote_message(
     clientbound_message: Clientbound,
     main_loop_tx: Sender<MainLoopEvent>,
     response_tx: GenerationSender,
+    mut incoming_permit: incoming::IncomingPermit,
     term: &Term<EventHandler>,
     pty_master: &mut Box<dyn AsyncMasterPty + Send + Sync>,
     key_interceptor: &mut KeyInterceptor,
@@ -443,30 +449,41 @@ pub(crate) async fn process_remote_message(
                     );
                 },
                 Some(Request::RunProcess(request)) => {
-                    // TODO: we can infer shell as above for execute if no executable is provided.
-                    let mut cmd = create_command(
-                        &request.executable,
-                        working_directory(request.working_directory.as_deref(), term.shell_state()),
-                    );
-
-                    cmd.args(request.arguments);
-                    for var in request.env {
-                        match var.value {
-                            Some(value) => cmd.env(var.key, value),
-                            None => cmd.env_remove(var.key),
-                        };
+                    let directory = working_directory(request.working_directory.as_deref(), term.shell_state());
+                    // Freeze at main-loop dispatch, as before, and charge every
+                    // retained epoch. Never wait on a budget this loop must drain.
+                    let environment = SHELL_ENVIRONMENT_VARIABLES.lock().unwrap().clone();
+                    if !incoming_permit.try_extend(incoming::environment_size(environment.as_ref())) {
+                        let _ = response_tx.try_send(make_response(Response::Error(
+                            "RunProcess busy: shell environment snapshot exceeds available incoming budget".into(),
+                        )));
+                        return Ok(());
                     }
 
                     tokio::spawn(async move {
+                        let _incoming_permit = incoming_permit;
                         debug!("running command");
 
                         let timeout_duration = request.timeout.map_or(Duration::from_secs(60), Into::into);
                         let command_timeout = tokio::time::timeout(timeout_duration, async {
+                            let _execution =
+                                acquire_process_slot(incoming::PROCESS_SLOTS.clone(), &response_tx).await?;
                             // Run at the task's actual first poll, immediately
                             // before output starts. Once admitted to start,
                             // retain the existing command timeout on disconnect.
                             if !response_tx.is_current_ready() {
                                 return None;
+                            }
+                            let mut cmd = create_command(&request.executable, directory, environment.as_ref());
+                            // Command owns its copied environment now; the
+                            // frozen Arc need not pin an old shell epoch too.
+                            drop(environment);
+                            cmd.args(request.arguments);
+                            for var in request.env {
+                                match var.value {
+                                    Some(value) => cmd.env(var.key, value),
+                                    None => cmd.env_remove(var.key),
+                                };
                             }
                             Some(fastab_term::process_output::run(&mut cmd).await)
                         });
@@ -522,17 +539,109 @@ pub(crate) async fn process_remote_message(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incoming_insert_writes_every_byte_across_real_socket_short_writes() {
+        use alacritty_terminal::term::SizeInfo;
+        use fastab_proto::figterm::InsertTextRequest;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        struct ShortWriter(UnixStream);
+
+        #[async_trait::async_trait]
+        impl AsyncMasterPty for ShortWriter {
+            async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(buf).await
+            }
+
+            async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.write(&buf[..buf.len().min(257)]).await
+            }
+
+            fn resize(&self, _: portable_pty::PtySize) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let capture = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let (history, _history_rx) = flume::bounded(1);
+        let term = Term::new(
+            SizeInfo::new(24, 80),
+            EventHandler::new(
+                crate::ipc::RemoteSender::test_disconnected(),
+                history,
+                crate::event_handler::LocalEvents::default(),
+                false,
+            ),
+            1,
+            "short-insert-fixture".into(),
+        );
+        let mut master: Box<dyn AsyncMasterPty + Send + Sync> = Box::new(ShortWriter(server));
+        let (control, _controls) = flume::bounded(16);
+        let expected = "x".repeat(128 * 1024);
+        let request = FigtermRequest::InsertText(InsertTextRequest {
+            insertion: Some(expected.clone()),
+            ..Default::default()
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            process_figterm_request(
+                request,
+                control,
+                &term,
+                &mut master,
+                &mut KeyInterceptor::new(),
+                RequestOrigin::Local,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(master);
+        assert_eq!(capture.await.unwrap(), expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn unstarted_run_process_retires_with_its_generation_while_waiting_for_a_slot() {
+        let sender = crate::ipc::RemoteSender::test_ready();
+        let generation = sender.phase().ready_generation().unwrap();
+        let response = sender.for_generation(generation);
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.unwrap();
+        let waiting = tokio::spawn(async move { acquire_process_slot(slots, &response).await });
+        tokio::task::yield_now().await;
+        sender.test_retire();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+    }
+
     #[tokio::test]
     async fn test_create_command() {
-        let output = create_command("cargo", "/").output().await.unwrap();
+        let output = create_command("cargo", "/", &[]).output().await.unwrap();
         assert!(output.status.success());
 
-        let output = create_command("echo", "/").arg("hello world").output().await.unwrap();
+        let output = create_command("echo", "/", &[])
+            .arg("hello world")
+            .output()
+            .await
+            .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"hello world\n");
         assert_eq!(output.stderr, b"");
 
-        let output = create_command("bash", "/")
+        let output = create_command("bash", "/", &[])
             .args(["-c", "echo hello world 1 1>&2; echo hello world 2; exit 25"])
             .output()
             .await

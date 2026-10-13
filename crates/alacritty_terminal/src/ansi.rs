@@ -19,6 +19,9 @@ const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
 /// Maximum number of bytes read in one synchronized update (2MiB).
 const SYNC_BUFFER_SIZE: usize = 0x20_0000;
 
+/// Keep small synchronized updates reusable without retaining large output batches.
+const SYNC_IDLE_CAPACITY: usize = 64 * 1024;
+
 /// Number of bytes in the synchronized update DCS sequence before the passthrough parameters.
 const SYNC_ESCAPE_START_LEN: usize = 5;
 
@@ -129,7 +132,7 @@ struct SyncState {
 impl Default for SyncState {
     fn default() -> Self {
         Self {
-            buffer: Vec::with_capacity(SYNC_BUFFER_SIZE),
+            buffer: Vec::new(),
             pending_dcs: None,
             timeout: None,
         }
@@ -213,6 +216,10 @@ impl Processor {
 
         // Resetting state after processing makes sure we don't interpret buffered sync escapes.
         self.state.sync_state.buffer.clear();
+        if self.state.sync_state.buffer.capacity() > SYNC_IDLE_CAPACITY {
+            self.state.sync_state.buffer = Vec::new();
+        }
+        self.state.sync_state.pending_dcs = None;
         self.state.sync_state.timeout = None;
     }
 
@@ -228,6 +235,12 @@ impl Processor {
         self.state.sync_state.buffer.len()
     }
 
+    /// Allocated buffer capacity, not a physical-memory measurement.
+    #[inline]
+    pub fn sync_buffer_capacity(&self) -> usize {
+        self.state.sync_state.buffer.capacity()
+    }
+
     /// Process a new byte during a synchronized update.
     #[cold]
     fn advance_sync<H>(&mut self, handler: &mut H, byte: u8)
@@ -235,6 +248,13 @@ impl Processor {
         H: Handler,
     {
         self.state.sync_state.buffer.push(byte);
+
+        // The byte budget is independent of DCS termination. A missing ESC
+        // must not turn a pending SyncEnd into an unbounded output buffer.
+        if self.state.sync_state.buffer.len() >= SYNC_BUFFER_SIZE {
+            self.stop_sync(handler);
+            return;
+        }
 
         // Handle sync DCS escape sequences.
         match self.state.sync_state.pending_dcs {
@@ -253,7 +273,7 @@ impl Processor {
         // Check for extension/termination of the synchronized update.
         if end == SYNC_START_ESCAPE_START {
             self.state.sync_state.pending_dcs = Some(Dcs::SyncStart);
-        } else if end == SYNC_END_ESCAPE_START || len >= SYNC_BUFFER_SIZE - 1 {
+        } else if end == SYNC_END_ESCAPE_START {
             self.state.sync_state.pending_dcs = Some(Dcs::SyncEnd);
         }
     }
@@ -1048,7 +1068,7 @@ where
 
     #[inline]
     fn unhook(&mut self) {
-        match self.state.dcs {
+        match self.state.dcs.take() {
             Some(Dcs::SyncStart) => {
                 self.state.sync_state.timeout = Some(Instant::now() + SYNC_UPDATE_TIMEOUT);
             },
@@ -1701,6 +1721,74 @@ pub mod C0 {
 mod tests {
     use super::*;
     use crate::term::color::Rgb;
+
+    #[derive(Default)]
+    struct PrintedText(String);
+
+    impl Handler for PrintedText {
+        fn input(&mut self, c: char) {
+            self.0.push(c);
+        }
+    }
+
+    #[test]
+    fn synchronized_output_is_lazy_bounded_and_releases_large_backing() {
+        let mut parser = Processor::new();
+        let mut handler = PrintedText::default();
+        assert_eq!(parser.state.sync_state.buffer.capacity(), 0);
+        for byte in b"\x1bP=1s\x1b\\" {
+            parser.advance(&mut handler, *byte);
+        }
+        for _ in 0..SYNC_BUFFER_SIZE + 17 {
+            parser.advance(&mut handler, b'x');
+            assert!(parser.sync_bytes_count() < SYNC_BUFFER_SIZE);
+        }
+        assert_eq!(handler.0, "x".repeat(SYNC_BUFFER_SIZE + 17));
+        assert!(parser.sync_timeout().is_none());
+        assert!(parser.state.sync_state.pending_dcs.is_none());
+        assert_eq!(parser.state.sync_state.buffer.capacity(), 0);
+        assert!(parser.is_output_boundary());
+
+        // A previous forced settlement cannot leave pending SyncEnd state in
+        // the next update; a non-sync DCS must not reactivate the old start.
+        for byte in b"\x1bP=1s\x1b\\next\x1bP=2s\x1b\\\x1bP0q\x1b\\tail" {
+            parser.advance(&mut handler, *byte);
+        }
+        assert!(handler.0.ends_with("nexttail"));
+        assert!(parser.sync_timeout().is_none());
+        assert!(parser.state.sync_state.pending_dcs.is_none());
+        assert!(parser.state.sync_state.buffer.capacity() <= SYNC_IDLE_CAPACITY);
+    }
+
+    #[test]
+    fn forced_sync_replay_preserves_partial_utf8_and_dcs_state() {
+        let mut parser = Processor::new();
+        let mut handler = PrintedText::default();
+        for byte in b"\x1bP=1s\x1b\\text\xe4\xb8" {
+            parser.advance(&mut handler, *byte);
+        }
+        parser.stop_sync(&mut handler);
+        assert_eq!(handler.0, "text");
+        assert!(!parser.is_output_boundary());
+        parser.advance(&mut handler, 0xad);
+        assert_eq!(handler.0, "text中");
+        assert!(parser.is_output_boundary());
+
+        // Force a replay while the secondary sync detector is waiting for
+        // the DCS terminator; only the real VTE partial DCS state survives.
+        for byte in b"\x1bP=1s\x1b\\\x1bP=2s" {
+            parser.advance(&mut handler, *byte);
+        }
+        assert!(parser.state.sync_state.pending_dcs.is_some());
+        parser.stop_sync(&mut handler);
+        assert!(parser.state.sync_state.pending_dcs.is_none());
+        for byte in b"\x1b\\after" {
+            parser.advance(&mut handler, *byte);
+        }
+        assert!(handler.0.ends_with("中after"));
+        assert!(parser.sync_timeout().is_none());
+        assert!(parser.is_output_boundary());
+    }
 
     struct MockHandler {
         index: CharsetIndex,

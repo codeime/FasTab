@@ -18,7 +18,7 @@ use std::env;
 #[cfg(unix)]
 use std::ffi::{CString, OsStr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use alacritty_terminal::Term;
@@ -51,8 +51,8 @@ use crate::event_handler::{EventHandler, LocalEvents};
 use crate::input::{InputEvent, KeyCode, KeyCodeEncodeModes, KeyboardEncoding, Modifiers};
 use crate::interceptor::KeyInterceptor;
 use crate::ipc::{
-    ContextAdmission, ContextProgress, Generation, RemoteIncoming, RemoteSender, RequestOrigin, spawn_figterm_ipc,
-    spawn_remote_ipc,
+    ContextAdmission, ContextProgress, Generation, LocalIncoming, RemoteIncoming, RemoteSender, RequestOrigin,
+    spawn_figterm_ipc, spawn_remote_ipc,
 };
 use crate::message::{process_figterm_message, process_remote_message};
 #[cfg(unix)]
@@ -68,6 +68,19 @@ struct DeferredInsert {
     bracketed: bool,
     execute: bool,
     origin: RequestOrigin,
+}
+
+enum MainLoopReady {
+    SyncTimeout,
+    RemoteStateChanged,
+    KeyDeliveryChanged,
+    Control(std::result::Result<MainLoopEvent, flume::RecvError>),
+    Input(std::result::Result<term::InputEventResult, flume::RecvError>),
+    Pty(std::io::Result<usize>),
+    Remote(std::result::Result<RemoteIncoming, flume::RecvError>),
+    Local(std::result::Result<LocalIncoming, flume::RecvError>),
+    InsertionRetry,
+    ChildExited,
 }
 
 /// Replay settled failed intercepted keys, then flush deferred ordinary PTY
@@ -337,6 +350,46 @@ async fn process_pty_bytes(
         control.flush_csi_u().await?;
     }
     control.stdout.flush().await?;
+    record_sync_output(processor);
+    Ok(())
+}
+
+fn record_sync_output(processor: &Processor) {
+    resource_diagnostics::sync_output(
+        processor.sync_bytes_count(),
+        processor.sync_buffer_capacity(),
+        processor.sync_timeout().is_some(),
+    );
+}
+
+async fn wait_for_pty_sync_timeout(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn finish_pty_sync(
+    processor: &mut Processor,
+    term: &mut Term<EventHandler>,
+    events: &LocalEvents,
+    control: &mut MainLoopControl<'_>,
+) -> Result<()> {
+    // Every retained byte has already been forwarded by process_pty_bytes.
+    // Replay changes the tracking Term only; controls follow that raw output.
+    processor.stop_sync(term);
+    record_sync_output(processor);
+    // The Windows prompt grace has already lasted through this timeout. Do
+    // not require another PTY read to publish prompt events replayed above.
+    term.flush_delayed_events();
+    control.bracketed_paste = term
+        .mode()
+        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+    control.drain_local(events).await?;
+    if processor.is_output_boundary() {
+        control.flush_csi_u().await?;
+    }
+    control.stdout.flush().await?;
     Ok(())
 }
 
@@ -361,7 +414,8 @@ pub(crate) struct InsertionLock {
 static INSERT_ON_NEW_CMD: Mutex<Option<PendingInsertion>> = Mutex::new(None);
 static INSERTION_LOCK: Mutex<Option<InsertionLock>> = Mutex::new(None);
 
-static SHELL_ENVIRONMENT_VARIABLES: Mutex<Vec<EnvironmentVariable>> = Mutex::new(Vec::new());
+static SHELL_ENVIRONMENT_VARIABLES: LazyLock<Mutex<Arc<Vec<EnvironmentVariable>>>> =
+    LazyLock::new(|| Mutex::new(Arc::new(Vec::new())));
 static SHELL_ALIAS: Mutex<Option<String>> = Mutex::new(None);
 /// Bumped by `UpdateShellContext` (`ftab _ pre-cmd` at prompt). Edit-buffer
 /// frames send env/alias only when this changes, so the desktop session
@@ -436,7 +490,7 @@ fn shell_state_to_context(shell_state: &ShellState) -> local::ShellContext {
         session_id: shell_state.local_context.session_id.clone(),
         terminal: cached_parent_terminal(),
         hostname: cached_host_label(shell_state.local_context.username.as_deref()),
-        environment_variables: SHELL_ENVIRONMENT_VARIABLES.lock().unwrap().clone(),
+        environment_variables: SHELL_ENVIRONMENT_VARIABLES.lock().unwrap().as_ref().clone(),
         qterm_version: Some(env!("CARGO_PKG_VERSION").into()),
         preexec: Some(shell_state.preexec),
         osc_lock: Some(shell_state.osc_lock),
@@ -457,7 +511,7 @@ fn edit_buffer_context(shell_state: &ShellState, include_environment: bool) -> l
             .as_ref()
             .map(|path| path.display().to_string()),
         environment_variables: if include_environment {
-            SHELL_ENVIRONMENT_VARIABLES.lock().unwrap().clone()
+            SHELL_ENVIRONMENT_VARIABLES.lock().unwrap().as_ref().clone()
         } else {
             Vec::new()
         },
@@ -586,6 +640,7 @@ async fn _should_install_remote_ssh_integration(
                         msg,
                         main_loop_tx.clone(),
                         response_sender,
+                        incoming.permit,
                         term,
                         pty_master,
                         key_interceptor,
@@ -923,10 +978,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
         let incoming_receiver = spawn_figterm_ipc(&session_id).await?;
 
         // Spawn thread to handle remote ipc
-        let (remote_sender, remote_receiver, stop_ipc_tx) = spawn_remote_ipc(
-            session_id.clone(),
-            parent_id,
-        ).await?;
+        let (remote_sender, remote_receiver, stop_ipc_tx) = spawn_remote_ipc(session_id.clone(), parent_id).await?;
         let mut remote_state_changes = remote_sender.subscribe();
         let mut deferred_pty_input = BytesMut::new();
         let mut deferred_inserts = VecDeque::new();
@@ -970,7 +1022,10 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 
         if let Ok(shell) = get_parent_shell() {
             let path = std::path::Path::new(&shell);
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(shell.as_str());
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(shell.as_str());
             let title_osc = format!("\x1b]0;{name}\x07");
             if let Err(err) = stdout.write(title_osc.as_bytes()).await {
                 error!("Failed to write title osc: {err}");
@@ -994,11 +1049,55 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
             }
 
             insertion_retry.update(INSERTION_LOCK.lock().unwrap().as_ref().map(|lock| lock.at));
-            let select_result: Result<()> = select! {
+            let sync_deadline = processor.sync_timeout().copied();
+            let ready = select! {
                 biased;
-                _ = remote_state_changes.changed() => {
+                _ = wait_for_pty_sync_timeout(sync_deadline) => MainLoopReady::SyncTimeout,
+                // Choose ready I/O fairly, but never race/cancel a handler's
+                // partially completed PTY or stdout write against the timer.
+                ready = async {
+                    select! {
+                        _ = remote_state_changes.changed() => MainLoopReady::RemoteStateChanged,
+                        _ = remote_sender.key_delivery_changed() => MainLoopReady::KeyDeliveryChanged,
+                        result = main_loop_rx.recv_async() => MainLoopReady::Control(result),
+                        result = input_rx.recv_async() => MainLoopReady::Input(result),
+                        result = master.read(&mut write_buffer) => MainLoopReady::Pty(result),
+                        result = remote_receiver.recv_async() => MainLoopReady::Remote(result),
+                        result = incoming_receiver.recv_async() => MainLoopReady::Local(result),
+                        _ = insertion_retry.wait(), if insertion_retry.active() => MainLoopReady::InsertionRetry,
+                        _ = &mut child_rx => MainLoopReady::ChildExited,
+                    }
+                } => ready,
+            };
+            let select_result: Result<()> = match ready {
+                MainLoopReady::SyncTimeout => {
+                    let mut control = MainLoopControl {
+                        remote_sender: &remote_sender,
+                        master: master.as_mut(),
+                        deferred_pty_input: &mut deferred_pty_input,
+                        deferred_inserts: &mut deferred_inserts,
+                        key_interceptor: &mut key_interceptor,
+                        terminal: &mut terminal,
+                        stdout: &mut stdout,
+                        csi_u: &mut csi_u,
+                        bracketed_paste: term
+                            .mode()
+                            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                    };
+                    finish_pty_sync(&mut processor, &mut term, &local_events, &mut control).await?;
+                    if can_send_edit_buffer(&term) {
+                        let cursor_coordinates = get_cursor_coordinates(&terminal);
+                        if let Err(err) = send_edit_buffer(&term, &remote_sender, cursor_coordinates).await {
+                            warn!("Failed to send edit buffer after synchronized output: {err}");
+                        }
+                    }
+                    Ok(())
+                },
+                MainLoopReady::RemoteStateChanged => {
                     reconcile_remote_state(&remote_sender, &mut key_interceptor);
-                    let bracketed_paste = term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+                    let bracketed_paste = term
+                        .mode()
+                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
                     flush_settled_pty_input(
                         &remote_sender,
                         master.as_mut(),
@@ -1008,10 +1107,12 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                         bracketed_paste,
                     )
                     .await
-                }
-                _ = remote_sender.key_delivery_changed() => {
+                },
+                MainLoopReady::KeyDeliveryChanged => {
                     reconcile_remote_state(&remote_sender, &mut key_interceptor);
-                    let bracketed_paste = term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+                    let bracketed_paste = term
+                        .mode()
+                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
                     flush_settled_pty_input(
                         &remote_sender,
                         master.as_mut(),
@@ -1021,8 +1122,8 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                         bracketed_paste,
                     )
                     .await
-                }
-                res = main_loop_rx.recv_async() => {
+                },
+                MainLoopReady::Control(res) => {
                     match res {
                         Ok(event) => {
                             let mut control = MainLoopControl {
@@ -1034,18 +1135,20 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 terminal: &mut terminal,
                                 stdout: &mut stdout,
                                 csi_u: &mut csi_u,
-                                bracketed_paste: term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                bracketed_paste: term
+                                    .mode()
+                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
                             };
                             control.apply(event).await?;
                             if processor.is_output_boundary() {
                                 control.flush_csi_u().await?;
                             }
-                        }
+                        },
                         Err(err) => warn!("Failed to recv: {err}"),
                     };
                     Ok(())
-                }
-                res = input_rx.recv_async() => {
+                },
+                MainLoopReady::Input(res) => {
                     let mut input_res = Ok(());
                     match res {
                         Ok(events) => {
@@ -1055,7 +1158,8 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                     Ok((raw, InputEvent::Key(event))) => {
                                         // Capture the generation whose state made this key
                                         // interceptable. Never retarget the key after reconnect.
-                                        let key_generation = reconcile_remote_state(&remote_sender, &mut key_interceptor);
+                                        let key_generation =
+                                            reconcile_remote_state(&remote_sender, &mut key_interceptor);
                                         // Do not do most stuff during not preexec since that means a command is running
                                         let preexec = term.shell_state().preexec;
 
@@ -1063,12 +1167,17 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 
                                         // if we are in CSI u mode we try to encode first, otherwise we try to send the raw bytes first
                                         let raw = if csi_u.owned {
-                                            event.key.encode(event.modifiers, key_code_encode_mode, true)
+                                            event
+                                                .key
+                                                .encode(event.modifiers, key_code_encode_mode, true)
                                                 .ok()
-                                                .map(|s| s.into_bytes().into()).or(raw)
+                                                .map(|s| s.into_bytes().into())
+                                                .or(raw)
                                         } else {
                                             raw.or_else(|| {
-                                                event.key.encode(event.modifiers, key_code_encode_mode, true)
+                                                event
+                                                    .key
+                                                    .encode(event.modifiers, key_code_encode_mode, true)
                                                     .ok()
                                                     .map(|s| s.into_bytes().into())
                                             })
@@ -1091,9 +1200,8 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                                     &mut deferred_pty_input,
                                                     &mut deferred_inserts,
                                                     &mut key_interceptor,
-                                                    term.mode().contains(
-                                                        alacritty_terminal::term::TermMode::BRACKETED_PASTE,
-                                                    ),
+                                                    term.mode()
+                                                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
                                                 )
                                                 .await?;
                                                 debug!(?action, "Intercepted action");
@@ -1101,8 +1209,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                                     .clone()
                                                     .and_then(|b| String::from_utf8(b.to_vec()).ok())
                                                     .unwrap_or_default();
-                                                let context =
-                                                    shell_state_to_context(term.shell_state());
+                                                let context = shell_state_to_context(term.shell_state());
                                                 let hook = fastab_proto::remote_hooks::new_intercepted_key_hook(
                                                     context, action, s,
                                                 );
@@ -1119,10 +1226,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                                         .is_ok()
                                                 });
                                                 if !admitted {
-                                                    reconcile_remote_state(
-                                                        &remote_sender,
-                                                        &mut key_interceptor,
-                                                    );
+                                                    reconcile_remote_state(&remote_sender, &mut key_interceptor);
                                                 }
 
                                                 if event.key == KeyCode::Escape {
@@ -1139,13 +1243,14 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                         if !handled_action {
                                             if let Some(bytes) = raw {
                                                 if (event.key == KeyCode::Char('c') || event.key == KeyCode::Char('d'))
-                                                    && event.modifiers == Modifiers::CTRL {
+                                                    && event.modifiers == Modifiers::CTRL
+                                                {
                                                     key_interceptor.reset();
                                                 }
                                                 write_buffer.extend(&bytes);
                                             }
                                         }
-                                    }
+                                    },
                                     Ok((_, InputEvent::Resized)) => {
                                         terminal.flush()?;
 
@@ -1161,17 +1266,21 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                         let window_size = SizeInfo::new(size.rows, size.cols);
                                         debug!("Window size changed: {window_size:?}");
                                         term.resize(window_size);
-                                    }
+                                    },
                                     Ok((None, InputEvent::Paste(string))) => {
                                         // Pass through bracketed pastes.
-                                        if term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE) {
+                                        if term
+                                            .mode()
+                                            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+                                        {
                                             write_buffer.extend(b"\x1b[200~");
                                             write_buffer.extend(string.replace('\x1b', "").as_bytes());
                                             write_buffer.extend(b"\x1b[201~");
                                         } else {
-                                            write_buffer.extend(string.replace("\r\n", "\r").replace('\n', "\r").as_bytes());
+                                            write_buffer
+                                                .extend(string.replace("\r\n", "\r").replace('\n', "\r").as_bytes());
                                         }
-                                    }
+                                    },
                                     Ok((raw, _)) => {
                                         if let Some(raw) = raw {
                                             info!("Fallback write");
@@ -1179,12 +1288,12 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                         } else {
                                             info!("Unhandled input event with no raw pass-through data");
                                         }
-                                    }
+                                    },
                                     Err(err) => {
                                         error!("Failed receiving input from stdin: {err}");
                                         input_res = Err(err);
                                         break;
-                                    }
+                                    },
                                 };
                             }
                             if !write_buffer.is_empty() {
@@ -1196,9 +1305,8 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 &mut deferred_pty_input,
                                 &mut deferred_inserts,
                                 &mut key_interceptor,
-                                term.mode().contains(
-                                    alacritty_terminal::term::TermMode::BRACKETED_PASTE,
-                                ),
+                                term.mode()
+                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
                             )
                             .await?;
                             if input_res.is_err() {
@@ -1208,18 +1316,29 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                     &mut deferred_pty_input,
                                     &mut deferred_inserts,
                                     &mut key_interceptor,
-                                    term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
-                                ).await?;
+                                    term.mode()
+                                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                )
+                                .await?;
                             }
-                        }
+                        },
                         Err(_) => {
-                            finish_pty_input(&remote_sender, master.as_mut(), &mut deferred_pty_input, &mut deferred_inserts, &mut key_interceptor, term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)).await?;
+                            finish_pty_input(
+                                &remote_sender,
+                                master.as_mut(),
+                                &mut deferred_pty_input,
+                                &mut deferred_inserts,
+                                &mut key_interceptor,
+                                term.mode()
+                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                            )
+                            .await?;
                             break 'select_loop Ok(());
-                        }
+                        },
                     };
                     input_res
-                }
-                res = master.read(&mut write_buffer) => {
+                },
+                MainLoopReady::Pty(res) => {
                     #[cfg(feature = "profiling_early_exit")]
                     break 'select_loop Ok(());
                     match res {
@@ -1239,9 +1358,18 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 terminal: &mut terminal,
                                 stdout: &mut stdout,
                                 csi_u: &mut csi_u,
-                                bracketed_paste: term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                bracketed_paste: term
+                                    .mode()
+                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
                             };
-                            process_pty_bytes(&write_buffer[..size], &mut processor, &mut term, &local_events, &mut control).await?;
+                            process_pty_bytes(
+                                &write_buffer[..size],
+                                &mut processor,
+                                &mut term,
+                                &local_events,
+                                &mut control,
+                            )
+                            .await?;
 
                             if can_send_edit_buffer(&term) {
                                 let cursor_coordinates = get_cursor_coordinates(&terminal);
@@ -1251,14 +1379,14 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                             }
 
                             Ok(())
-                        }
+                        },
                         Err(err) => {
                             error!("Failed to read from master: {err}");
                             break 'select_loop Ok(());
-                        }
+                        },
                     }
-                }
-                msg = remote_receiver.recv_async() => {
+                },
+                MainLoopReady::Remote(msg) => {
                     match msg {
                         Ok(incoming) => {
                             reconcile_remote_state(&remote_sender, &mut key_interceptor);
@@ -1272,40 +1400,79 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 message,
                                 main_loop_tx.clone(),
                                 response_sender,
+                                incoming.permit,
                                 &term,
                                 &mut master,
-                                &mut key_interceptor
-                            ).await?;
-                        }
+                                &mut key_interceptor,
+                            )
+                            .await?;
+                        },
                         Err(err) => {
                             error!("Failed to receive message from socket: {err}");
-                        }
+                        },
                     }
                     Ok(())
-                }
-                msg = incoming_receiver.recv_async() => {
+                },
+                MainLoopReady::Local(msg) => {
                     match msg {
-                        Ok((message, sender)) => {
+                        Ok(LocalIncoming { mut message, reply }) => {
                             debug!("Received message from figterm listener: {message:?}");
+                            if matches!(
+                                &message.request,
+                                Some(
+                                    fastab_proto::figterm::figterm_request_message::Request::NotifySshSessionStarted(_)
+                                )
+                            ) {
+                                let Some(
+                                    fastab_proto::figterm::figterm_request_message::Request::NotifySshSessionStarted(
+                                        notification,
+                                    ),
+                                ) = message.request.take()
+                                else {
+                                    unreachable!()
+                                };
+                                let mut control = MainLoopControl {
+                                    remote_sender: &remote_sender,
+                                    master: master.as_mut(),
+                                    deferred_pty_input: &mut deferred_pty_input,
+                                    deferred_inserts: &mut deferred_inserts,
+                                    key_interceptor: &mut key_interceptor,
+                                    terminal: &mut terminal,
+                                    stdout: &mut stdout,
+                                    csi_u: &mut csi_u,
+                                    bracketed_paste: term
+                                        .mode()
+                                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                };
+                                control
+                                    .apply(MainLoopEvent::PromptSSH {
+                                        uuid: notification.uuid,
+                                        remote_host: notification.remote_host,
+                                    })
+                                    .await?;
+                                reply.complete(None);
+                                continue 'select_loop;
+                            }
                             process_figterm_message(
                                 message,
                                 main_loop_tx.clone(),
-                                sender.clone(),
+                                reply,
                                 &term,
                                 &history_sender,
                                 &mut master,
                                 &mut key_interceptor,
                                 &session_id,
-                            ).await?;
-                        }
+                            )
+                            .await?;
+                        },
                         Err(err) => {
                             error!("Failed to receive message from socket: {err}");
-                        }
+                        },
                     }
                     Ok(())
-                }
+                },
                 // Check if to send the edit buffer because of timeout
-                _ = insertion_retry.wait(), if insertion_retry.active() => {
+                MainLoopReady::InsertionRetry => {
                     insertion_retry.tick();
                     reconcile_remote_state(&remote_sender, &mut key_interceptor);
                     let send_eb = INSERTION_LOCK.lock().unwrap().is_some();
@@ -1316,11 +1483,11 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                         }
                     }
                     Ok(())
-                }
-                _ = &mut child_rx => {
+                },
+                MainLoopReady::ChildExited => {
                     trace!("Shell process exited");
                     break 'select_loop Ok(());
-                }
+                },
             };
 
             if let Err(err) = select_result {
@@ -1460,9 +1627,21 @@ mod tests {
             immediate_modes: Vec<bool>,
             csi_u_set: bool,
             delayed_events: usize,
+            sync_bytes: usize,
+            sync_pending: bool,
+            tracked_buffer: Option<String>,
         }
 
         async fn capture_pty_reads(reads: &[&[u8]], csi_u: bool, delay_prompt: bool) -> ParserOutput {
+            capture_pty_reads_with_sync_timeout(reads, csi_u, delay_prompt, None).await
+        }
+
+        async fn capture_pty_reads_with_sync_timeout(
+            reads: &[&[u8]],
+            csi_u: bool,
+            delay_prompt: bool,
+            after_timeout: Option<&[u8]>,
+        ) -> ParserOutput {
             let sender = RemoteSender::test_disconnected();
             let events = LocalEvents::default();
             let mut term = parser_term(&sender, &events, csi_u);
@@ -1492,12 +1671,23 @@ mod tests {
                 csi_u: &mut csi_u,
                 bracketed_paste: false,
             };
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 for bytes in reads {
                     process_pty_bytes(bytes, &mut processor, &mut term, &events, &mut control).await?;
                     // Every read, including ones ending inside an OSC/ST,
                     // settles its events rather than retaining queue entries.
                     assert!(!events.has_pending());
+                }
+                if let Some(after_timeout) = after_timeout {
+                    let deadline = processor.sync_timeout().copied();
+                    assert!(deadline.is_some());
+                    // No subsequent PTY read arrives. Drive the exact wait and
+                    // settlement used by the main-loop timer branch.
+                    wait_for_pty_sync_timeout(deadline).await;
+                    finish_pty_sync(&mut processor, &mut term, &events, &mut control).await?;
+                    assert!(processor.sync_timeout().is_none());
+                    assert!(!events.has_pending());
+                    process_pty_bytes(after_timeout, &mut processor, &mut term, &events, &mut control).await?;
                 }
                 Ok::<_, anyhow::Error>(())
             })
@@ -1512,6 +1702,82 @@ mod tests {
                 immediate_modes: terminal.0,
                 csi_u_set: csi_u.owned,
                 delayed_events: term.get_delayed_events_count(),
+                sync_bytes: processor.sync_bytes_count(),
+                sync_pending: processor.sync_timeout().is_some(),
+                tracked_buffer: term.get_current_buffer().map(|buffer| buffer.buffer),
+            }
+        }
+
+        #[tokio::test]
+        async fn synchronized_output_byte_budget_replays_without_an_end_sequence() {
+            let mut input = b"\x1bP=1s\x1b\\".to_vec();
+            input.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024 + 17));
+            input.extend_from_slice(b"\x1b]697;NewCmd\x07tail");
+            let reads: Vec<_> = input.chunks(BUFFER_SIZE).collect();
+            let output = capture_pty_reads(&reads, true, false).await;
+            let mut expected = input[..input.len() - 4].to_vec();
+            expected.extend_from_slice(b"\x1b[>1utail");
+            assert_eq!(output.bytes, expected);
+            assert_eq!(output.immediate_modes, [false]);
+            assert_eq!(output.sync_bytes, 0);
+            assert!(!output.sync_pending);
+            assert_eq!(output.tracked_buffer.as_deref(), Some("tail"));
+        }
+
+        #[tokio::test]
+        async fn synchronized_output_silent_timeout_orders_controls_after_raw_output() {
+            let input = b"\x1bP=1s\x1b\\\x1b]697;NewCmd\x07tail";
+            for delay_prompt in [false, true] {
+                let output = capture_pty_reads_with_sync_timeout(&[input], true, delay_prompt, Some(b"!")).await;
+                let mut expected = input.to_vec();
+                expected.extend_from_slice(b"\x1b[>1u!");
+                assert_eq!(output.bytes, expected);
+                assert_eq!(output.immediate_modes, [false]);
+                assert!(output.csi_u_set);
+                assert_eq!(output.delayed_events, 0);
+                assert_eq!(output.sync_bytes, 0);
+                assert!(!output.sync_pending);
+                if !delay_prompt {
+                    assert_eq!(output.tracked_buffer.as_deref(), Some("tail!"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn synchronized_output_legal_end_flushes_controls_at_the_complete_terminator() {
+            let input = b"\x1bP=1s\x1b\\\x1b]697;NewCmd\x07tail\x1bP=2s\x1b\\!";
+            let reads: Vec<_> = input.chunks(1).collect();
+            let output = capture_pty_reads(&reads, true, false).await;
+            let mut expected = input[..input.len() - 1].to_vec();
+            expected.extend_from_slice(b"\x1b[>1u!");
+            assert_eq!(output.bytes, expected);
+            assert_eq!(output.immediate_modes, [false]);
+            assert!(output.csi_u_set);
+            assert_eq!(output.sync_bytes, 0);
+            assert!(!output.sync_pending);
+            assert_eq!(output.tracked_buffer.as_deref(), Some("tail!"));
+        }
+
+        #[tokio::test]
+        async fn synchronized_timeout_waits_for_partial_utf8_and_osc_output_boundaries() {
+            for (partial, continuation, expected_tail) in [
+                (b"\xe4\xb8".as_slice(), b"\xad".as_slice(), b"\xad\x1b[>1u".as_slice()),
+                (
+                    b"\x1b]0;title".as_slice(),
+                    b"\x07".as_slice(),
+                    b"\x07\x1b[>1u".as_slice(),
+                ),
+            ] {
+                let mut input = b"\x1bP=1s\x1b\\\x1b]697;NewCmd\x07".to_vec();
+                input.extend_from_slice(partial);
+                let output = capture_pty_reads_with_sync_timeout(&[&input], true, false, Some(continuation)).await;
+                let mut expected = input;
+                expected.extend_from_slice(expected_tail);
+                assert_eq!(output.bytes, expected);
+                assert_eq!(output.immediate_modes, [false]);
+                assert!(output.csi_u_set);
+                assert_eq!(output.sync_bytes, 0);
+                assert!(!output.sync_pending);
             }
         }
 
