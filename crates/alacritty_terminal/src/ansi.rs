@@ -117,7 +117,7 @@ struct ProcessorState {
     sync_state: SyncState,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct SyncState {
     /// Expiration time of the synchronized update.
     timeout: Option<Instant>,
@@ -127,16 +127,6 @@ struct SyncState {
 
     /// Bytes read during the synchronized update.
     buffer: Vec<u8>,
-}
-
-impl Default for SyncState {
-    fn default() -> Self {
-        Self {
-            buffer: Vec::new(),
-            pending_dcs: None,
-            timeout: None,
-        }
-    }
 }
 
 /// Pending DCS sequence.
