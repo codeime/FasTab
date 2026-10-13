@@ -118,7 +118,7 @@ impl<T: CachePayload> CachePayload for CacheEntry<T> {
     }
 }
 
-fn suggestion_heap(suggestion: &Suggestion) -> usize {
+pub(crate) fn suggestion_heap(suggestion: &Suggestion) -> usize {
     suggestion.name.capacity()
         + suggestion.description.capacity()
         + suggestion.kind.capacity()

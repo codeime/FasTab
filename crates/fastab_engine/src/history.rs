@@ -128,13 +128,38 @@ type SlotIndex = HashMap<ArgSlot, Vec<String>>;
 /// a handful of commands; an index that falls out of this window is rebuilt
 /// from the same lines the next time that command is completed.
 const MAX_CACHED_INDEXES: usize = 32;
+// Same retained payload budget as one hook cache; oversized indexes remain
+// available to the current request but are rebuilt instead of cached.
+const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CachedIndex {
+    value: Arc<SlotIndex>,
+    bytes: usize,
+}
+
+fn slot_index_bytes(index: &SlotIndex) -> usize {
+    index.capacity() * std::mem::size_of::<(ArgSlot, Vec<String>)>()
+        + index
+            .iter()
+            .map(|(slot, values)| {
+                slot.root.capacity()
+                    + slot.path.capacity() * std::mem::size_of::<String>()
+                    + slot.path.iter().map(String::capacity).sum::<usize>()
+                    + slot.option.as_ref().map_or(0, String::capacity)
+                    + values.capacity() * std::mem::size_of::<String>()
+                    + values.iter().map(String::capacity).sum::<usize>()
+            })
+            .sum::<usize>()
+}
 
 #[derive(Debug, Default)]
 struct IndexCache {
-    entries: HashMap<String, Arc<SlotIndex>>,
+    entries: HashMap<String, CachedIndex>,
     recent: VecDeque<String>,
     aliases: Option<String>,
     shell: Option<String>,
+    allocated_bytes: usize,
 }
 
 impl IndexCache {
@@ -144,33 +169,62 @@ impl IndexCache {
 
     fn select_context(&mut self, aliases: Option<&str>, shell: Option<&str>) {
         if !self.matches_context(aliases, shell) {
-            self.entries.clear();
-            self.recent.clear();
+            *self = Self::default();
+            if aliases.map_or(0, str::len).saturating_add(shell.map_or(0, str::len)) > MAX_INDEX_BYTES {
+                return;
+            }
             self.aliases = aliases.map(str::to_owned);
             self.shell = shell.map(str::to_owned);
+            if self.context_bytes() > MAX_INDEX_BYTES {
+                // Do not retain an oversized parsing context. publish_index
+                // still returns this request's complete result without caching.
+                *self = Self::default();
+            }
+        }
+    }
+
+    fn context_bytes(&self) -> usize {
+        self.aliases.as_ref().map_or(0, String::capacity) + self.shell.as_ref().map_or(0, String::capacity)
+    }
+
+    fn has_derived_payload(&self) -> bool {
+        !self.entries.is_empty() || self.aliases.is_some() || self.shell.is_some()
+    }
+
+    fn remove(&mut self, name: &str) {
+        if let Some(entry) = self.entries.remove(name) {
+            self.allocated_bytes -= entry.bytes;
         }
     }
 
     fn get(&mut self, name: &str) -> Option<Arc<SlotIndex>> {
-        let index = Arc::clone(self.entries.get(name)?);
+        let index = Arc::clone(&self.entries.get(name)?.value);
         self.touch(name);
         Some(index)
     }
 
     fn insert(&mut self, name: String, index: Arc<SlotIndex>) {
-        if self.entries.contains_key(&name) {
-            self.entries.insert(name.clone(), index);
-            self.touch(&name);
+        self.remove(&name);
+        self.recent.retain(|existing| existing != &name);
+        let bytes = 2 * (std::mem::size_of::<String>() + name.capacity())
+            + std::mem::size_of::<CachedIndex>()
+            + std::mem::size_of::<SlotIndex>()
+            + 2 * std::mem::size_of::<usize>()
+            + slot_index_bytes(&index);
+        if bytes > MAX_INDEX_BYTES.saturating_sub(self.context_bytes()) {
             return;
         }
-        while self.entries.len() >= MAX_CACHED_INDEXES {
+        while self.entries.len() >= MAX_CACHED_INDEXES
+            || self.allocated_bytes + bytes > MAX_INDEX_BYTES - self.context_bytes()
+        {
             let Some(old) = self.recent.pop_front() else {
                 break;
             };
-            self.entries.remove(&old);
+            self.remove(&old);
         }
         self.recent.push_back(name.clone());
-        self.entries.insert(name, index);
+        self.allocated_bytes += bytes;
+        self.entries.insert(name, CachedIndex { value: index, bytes });
     }
 
     fn touch(&mut self, name: &str) {
@@ -217,36 +271,34 @@ impl HistoryStore {
         &self.lines
     }
 
+    pub(crate) fn has_derived_indexes(&self) -> bool {
+        self.index
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .has_derived_payload()
+    }
+
+    pub(crate) fn release_derived_indexes(&self) {
+        *self.index.lock().unwrap_or_else(|error| error.into_inner()) = IndexCache::default();
+    }
+
     pub(crate) fn diagnostics(&self) -> crate::diagnostics::HistoryDiagnostics {
         let cache = self.index.lock().unwrap_or_else(|error| error.into_inner());
+        let mut seen = HashSet::new();
         let line_bytes = self.lines.capacity() * std::mem::size_of::<Arc<str>>()
-            + self.lines.iter().map(|line| line.len()).sum::<usize>();
-        let index_bytes = cache
-            .entries
-            .iter()
-            .map(|(root, index)| {
-                root.len()
-                    + index
-                        .iter()
-                        .map(|(slot, values)| {
-                            std::mem::size_of::<ArgSlot>()
-                                + slot.root.len()
-                                + slot.path.capacity() * std::mem::size_of::<String>()
-                                + slot.path.iter().map(String::len).sum::<usize>()
-                                + slot.option.as_ref().map_or(0, String::len)
-                                + values.capacity() * std::mem::size_of::<String>()
-                                + values.iter().map(String::len).sum::<usize>()
-                        })
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
+            + self
+                .lines
+                .iter()
+                .filter(|line| seen.insert(Arc::as_ptr(line)))
+                .map(|line| line.len() + 2 * std::mem::size_of::<usize>())
+                .sum::<usize>();
+        let index_bytes = cache.allocated_bytes + cache.context_bytes();
         crate::diagnostics::HistoryDiagnostics {
             line_count: self.lines.len(),
             index_count: cache.entries.len(),
-            allocated_bytes: line_bytes
-                + index_bytes
-                + cache.aliases.as_ref().map_or(0, String::len)
-                + cache.shell.as_ref().map_or(0, String::len),
+            allocated_bytes: line_bytes + index_bytes,
+            index_bytes,
+            ..Default::default()
         }
     }
 
@@ -718,6 +770,48 @@ mod tests {
             store.arg_values(&mut registry, None, None, &[slot]),
             vec!["value0".to_owned()]
         );
+    }
+
+    #[test]
+    fn history_index_byte_budget_evicts_old_entries_and_serves_oversized_values() {
+        let mut registry = registry_with(&[
+            ("a", r#"{"names":["a"],"args":[{"name":"value"}]}"#),
+            ("b", r#"{"names":["b"],"args":[{"name":"value"}]}"#),
+            ("large", r#"{"names":["large"],"args":[{"name":"value"}]}"#),
+        ]);
+        let first = "a".repeat(MAX_INDEX_BYTES / 2);
+        let second = "b".repeat(MAX_INDEX_BYTES / 2);
+        let large = "x".repeat(MAX_INDEX_BYTES + 128);
+        let store = HistoryStore::from_lines(vec![
+            format!("a {first}"),
+            format!("b {second}"),
+            format!("large {large}"),
+        ]);
+        let a = store.index_for(&mut registry, "a", None, None);
+        let b = store.index_for(&mut registry, "b", None, None);
+        assert!(!a.is_empty() && !b.is_empty());
+        {
+            let cache = store.index.lock().unwrap();
+            assert!(!cache.entries.contains_key("a"));
+            assert!(cache.entries.contains_key("b"));
+            assert!(cache.allocated_bytes <= MAX_INDEX_BYTES);
+        }
+        let index = store.index_for(&mut registry, "large", None, None);
+        assert_eq!(index.values().next().unwrap(), &[large]);
+        assert!(!store.index.lock().unwrap().entries.contains_key("large"));
+        assert!(store.diagnostics().index_bytes <= MAX_INDEX_BYTES);
+        let aliases = format!("alias irrelevant='{}'", "x".repeat(MAX_INDEX_BYTES));
+        let uncached = store.index_for(&mut registry, "a", Some(&aliases), Some("zsh"));
+        assert_eq!(uncached.values().next().unwrap(), &[first]);
+        assert_eq!(store.diagnostics().index_count, 0);
+        assert_eq!(
+            store.diagnostics().index_bytes,
+            0,
+            "oversized contexts are not retained"
+        );
+        store.release_derived_indexes();
+        assert_eq!(store.diagnostics().index_bytes, 0);
+        assert_eq!(store.lines().len(), 3, "retirement preserves raw history");
     }
 
     #[test]

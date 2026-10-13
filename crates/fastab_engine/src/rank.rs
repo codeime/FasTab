@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -234,30 +234,66 @@ pub struct Frecency {
     /// Occurrence order, including repeats. Identical command text shares one
     /// `Arc<str>`; the `history` template reads this same list.
     lines: Arc<Vec<Arc<str>>>,
-    /// Next-token counts. Single-space prefixes are a word trie. A prefix
-    /// whose spacing is not `split_whitespace` joined by one space stays in
-    /// `irregular`, which is the key the old full-prefix map would have used.
+    /// Next-token counts keyed by exact prefixes, including irregular spacing.
     next_words: NextWords,
 }
 
 #[derive(Debug, Clone, Default)]
 struct NextWords {
-    root: WordNode,
-    irregular: HashMap<String, HashMap<String, usize>>,
+    // Node indices make both destruction and diagnostics iterative, even for
+    // a history line with tens of thousands of tokens.
+    nodes: Vec<WordNode>,
+    words: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct WordNode {
-    children: HashMap<String, WordNode>,
-    counts: HashMap<String, usize>,
+    // Edges split only at ASCII spaces, retaining empty segments, tabs and
+    // Unicode whitespace verbatim instead of copying each full prefix.
+    children: HashMap<String, usize>,
+    counts: HashMap<usize, usize>,
+}
+
+#[derive(Clone, Copy)]
+struct NextWordCounts<'a> {
+    words: &'a HashMap<String, usize>,
+    counts: Option<&'a HashMap<usize, usize>>,
+}
+
+impl NextWordCounts<'_> {
+    fn get(&self, word: &str) -> Option<&usize> {
+        self.counts?.get(self.words.get(word)?)
+    }
+
+    #[cfg(test)]
+    fn to_owned_map(self) -> HashMap<String, usize> {
+        self.words
+            .iter()
+            .filter_map(|(word, id)| self.counts?.get(id).map(|count| (word.clone(), *count)))
+            .collect()
+    }
 }
 
 impl Frecency {
     pub fn from_commands(commands: impl IntoIterator<Item = (String, u64)>) -> Self {
+        Self::build(commands, || Ok(())).expect("uncancelled history construction")
+    }
+
+    pub(crate) fn try_from_commands(
+        commands: impl IntoIterator<Item = (String, u64)>,
+    ) -> Result<Self, crate::cancellation::CompletionCancelled> {
+        Self::build(commands, crate::cancellation::check)
+    }
+
+    fn build(
+        commands: impl IntoIterator<Item = (String, u64)>,
+        mut check: impl FnMut() -> Result<(), crate::cancellation::CompletionCancelled>,
+    ) -> Result<Self, crate::cancellation::CompletionCancelled> {
         let mut lines = Vec::new();
         let mut intern: HashSet<Arc<str>> = HashSet::new();
         let mut next_words = NextWords::default();
         for (command, _) in commands {
+            check()?;
             let command = command.trim();
             if command.is_empty() {
                 continue;
@@ -269,17 +305,22 @@ impl Frecency {
                 intern.insert(Arc::clone(&line));
                 line
             };
-            record_next_words(command, &mut next_words);
+            next_words.record(command, &mut check)?;
             lines.push(line);
         }
-        Self {
+        check()?;
+        Ok(Self {
             lines: Arc::new(lines),
             next_words,
-        }
+        })
     }
 
     pub(crate) fn command_lines(&self) -> Arc<Vec<Arc<str>>> {
         Arc::clone(&self.lines)
+    }
+
+    pub(crate) fn next_words_diagnostics(&self) -> (usize, usize, usize) {
+        self.next_words.diagnostics()
     }
 
     pub fn history_suggestions(&self, query: &str, fuzzy: bool, include_empty_query: bool) -> Vec<Suggestion> {
@@ -346,95 +387,118 @@ impl Frecency {
             .collect()
     }
 
-    fn next_word_counts(&self, prefix: &str) -> &HashMap<String, usize> {
+    fn next_word_counts(&self, prefix: &str) -> NextWordCounts<'_> {
         self.next_words.counts(prefix)
     }
 }
 
-fn empty_word_counts() -> &'static HashMap<String, usize> {
-    static EMPTY: OnceLock<HashMap<String, usize>> = OnceLock::new();
-    EMPTY.get_or_init(HashMap::new)
-}
-
 impl NextWords {
-    fn counts(&self, prefix: &str) -> &HashMap<String, usize> {
-        if !is_canonical_prefix(prefix) {
-            return self.irregular.get(prefix).unwrap_or_else(|| empty_word_counts());
-        }
-        let mut node = &self.root;
+    fn counts(&self, prefix: &str) -> NextWordCounts<'_> {
+        let missing = NextWordCounts {
+            words: &self.words,
+            counts: None,
+        };
+        let Some(mut node) = self.nodes.first() else {
+            return missing;
+        };
         if !prefix.is_empty() {
-            for word in prefix.split_whitespace() {
-                match node.children.get(word) {
-                    Some(child) => node = child,
-                    None => return empty_word_counts(),
+            for segment in prefix.split(' ') {
+                match node.children.get(segment) {
+                    Some(child) => node = &self.nodes[*child],
+                    None => return missing,
                 }
             }
         }
-        &node.counts
+        NextWordCounts {
+            words: &self.words,
+            counts: Some(&node.counts),
+        }
     }
 
-    fn bump(&mut self, prefix: &str, word: &str) {
-        if is_canonical_prefix(prefix) {
-            let mut node = &mut self.root;
-            if !prefix.is_empty() {
-                for part in prefix.split_whitespace() {
-                    node = node.children.entry(part.to_string()).or_default();
+    fn word_id(&mut self, word: &str) -> usize {
+        if let Some(id) = self.words.get(word) {
+            return *id;
+        }
+        let id = self.words.len();
+        self.words.insert(word.to_string(), id);
+        id
+    }
+
+    fn child(&mut self, parent: usize, segment: &str) -> usize {
+        if let Some(child) = self.nodes[parent].children.get(segment) {
+            return *child;
+        }
+        let child = self.nodes.len();
+        self.nodes.push(WordNode::default());
+        self.nodes[parent].children.insert(segment.to_string(), child);
+        child
+    }
+
+    /// Scan characters once to find Unicode whitespace words and ASCII-space
+    /// prefix boundaries, then advance both cursors monotonically. This keeps
+    /// the original `suffix.split_whitespace().next()` meaning without
+    /// rescanning long whitespace runs or revisiting a prefix from the root.
+    fn record(
+        &mut self,
+        command: &str,
+        check: &mut impl FnMut() -> Result<(), crate::cancellation::CompletionCancelled>,
+    ) -> Result<(), crate::cancellation::CompletionCancelled> {
+        let mut words = Vec::new();
+        let mut spaces = Vec::new();
+        let mut start = None;
+        for (position, (offset, character)) in command.char_indices().enumerate() {
+            if position % 1024 == 0 {
+                check()?;
+            }
+            if character == ' ' {
+                spaces.push(offset);
+            }
+            if character.is_whitespace() {
+                if let Some(start) = start.take() {
+                    words.push((start, self.word_id(&command[start..offset])));
                 }
+            } else {
+                start.get_or_insert(offset);
             }
-            *node.counts.entry(word.to_string()).or_default() += 1;
-            return;
         }
-        *self
-            .irregular
-            .entry(prefix.to_string())
-            .or_default()
-            .entry(word.to_string())
-            .or_default() += 1;
+        if let Some(start) = start {
+            words.push((start, self.word_id(&command[start..])));
+        }
+        if self.nodes.is_empty() {
+            self.nodes.push(WordNode::default());
+        }
+        if let Some(&(_, id)) = words.first() {
+            *self.nodes[0].counts.entry(id).or_default() += 1;
+        }
+        let mut node = 0;
+        let mut segment_start = 0;
+        let mut word = 0;
+        for space in spaces {
+            check()?;
+            node = self.child(node, &command[segment_start..space]);
+            segment_start = space + 1;
+            while word < words.len() && words[word].0 <= space {
+                word += 1;
+            }
+            if let Some(&(_, id)) = words.get(word) {
+                *self.nodes[node].counts.entry(id).or_default() += 1;
+            }
+        }
+        Ok(())
     }
-}
 
-/// A prefix lookup joins whitespace tokens with one space. `git  checkout`
-/// (two spaces) is a different key from `git checkout`.
-fn is_canonical_prefix(prefix: &str) -> bool {
-    let mut rest = prefix;
-    let mut first = true;
-    while !rest.is_empty() {
-        if !first {
-            if !rest.starts_with(' ') {
-                return false;
-            }
-            rest = &rest[1..];
-            if rest.is_empty() || rest.starts_with(|character: char| character.is_whitespace()) {
-                return false;
-            }
+    fn diagnostics(&self) -> (usize, usize, usize) {
+        let mut entries = 0;
+        let mut bytes = self.nodes.capacity() * std::mem::size_of::<WordNode>()
+            + self.words.capacity() * std::mem::size_of::<(String, usize)>()
+            + self.words.keys().map(String::capacity).sum::<usize>();
+        for node in &self.nodes {
+            entries += node.counts.len();
+            bytes += node.children.capacity() * std::mem::size_of::<(String, usize)>()
+                + node.counts.capacity() * std::mem::size_of::<(usize, usize)>();
+            bytes += node.children.keys().map(String::capacity).sum::<usize>();
         }
-        let word_len = rest
-            .find(|character: char| character.is_whitespace())
-            .unwrap_or(rest.len());
-        if word_len == 0 {
-            return false;
-        }
-        rest = &rest[word_len..];
-        first = false;
-    }
-    true
-}
-
-/// Same keys the per-request walk used: `""` plus every `command[..space]`
-/// that does not end in whitespace. The next word is still the first
-/// whitespace token of the remainder.
-fn record_next_words(command: &str, counts: &mut NextWords) {
-    if let Some(word) = command.split_whitespace().next() {
-        counts.bump("", word);
-    }
-    let mut search_from = 0;
-    while let Some(rel) = command[search_from..].find(' ') {
-        let space_at = search_from + rel;
-        let prefix = &command[..space_at];
-        if let Some(word) = command[space_at + 1..].split_whitespace().next() {
-            counts.bump(prefix, word);
-        }
-        search_from = space_at + 1;
+        (self.nodes.len(), entries, bytes)
     }
 }
 
@@ -716,7 +780,7 @@ fn acceptance_name_bytes(name: &str) -> usize {
     96 + acceptance_string_bytes(name)
 }
 
-fn first_word_count(counts: &HashMap<String, usize>, value: &str) -> usize {
+fn first_word_count(counts: NextWordCounts<'_>, value: &str) -> usize {
     counts
         .get(value.split_whitespace().next().unwrap_or_default())
         .copied()
@@ -734,7 +798,7 @@ fn suggestion_name_spellings(suggestion: &Suggestion) -> impl Iterator<Item = &s
         .chain(suggestion.primary_name.as_deref())
 }
 
-fn suggestion_first_word_count(suggestion: &Suggestion, history_counts: &HashMap<String, usize>) -> usize {
+fn suggestion_first_word_count(suggestion: &Suggestion, history_counts: NextWordCounts<'_>) -> usize {
     suggestion_name_spellings(suggestion)
         .map(|name| first_word_count(history_counts, name))
         .max()
@@ -827,7 +891,7 @@ pub fn apply_with_acceptance(
 fn compare_priority(
     left: &Suggestion,
     right: &Suggestion,
-    history_counts: &HashMap<String, usize>,
+    history_counts: NextWordCounts<'_>,
     acceptance: &AcceptanceIndex,
     root_command: &str,
     use_acceptance: bool,
@@ -850,7 +914,7 @@ fn compare_auto_execute(left: &Suggestion, right: &Suggestion) -> Ordering {
     right_auto.cmp(&left_auto)
 }
 
-fn effective_priority_tenths(suggestion: &Suggestion, history_counts: &HashMap<String, usize>) -> i64 {
+fn effective_priority_tenths(suggestion: &Suggestion, history_counts: NextWordCounts<'_>) -> i64 {
     // Runtime constructors already apply `priority || 50` and clamp to
     // 0..100. Do not normalize zero again here: an explicit negative value
     // has already become a meaningful zero by this point.
@@ -865,7 +929,7 @@ fn effective_priority_tenths(suggestion: &Suggestion, history_counts: &HashMap<S
 
 fn effective_priority_score(
     suggestion: &Suggestion,
-    history_counts: &HashMap<String, usize>,
+    history_counts: NextWordCounts<'_>,
     acceptance: &AcceptanceIndex,
     root_command: &str,
     use_acceptance: bool,
@@ -2107,12 +2171,13 @@ mod tests {
         let mut counts = HashMap::new();
         let full_prefix = (!prefix.is_empty()).then(|| format!("{prefix} "));
         for (command, _) in commands {
+            let command = command.trim();
             let suffix = match full_prefix.as_deref() {
                 Some(prefix) => match command.strip_prefix(prefix) {
                     Some(suffix) => suffix,
                     None => continue,
                 },
-                None => command.as_str(),
+                None => command,
             };
             let first_word = suffix.split_whitespace().next().unwrap_or_default();
             if !first_word.is_empty() {
@@ -2146,15 +2211,89 @@ mod tests {
             ("echo hi".into(), 3),
             ("git  checkout".into(), 4),
             ("git  checkout main".into(), 5),
+            ("git\tcheckout main".into(), 6),
+            ("git \t\u{2003}checkout\u{a0} main".into(), 7),
+            ("git checkout\n main".into(), 8),
+            ("git  checkout main".into(), 9),
+            ("git checkout main   ".into(), 10),
+            (" \tgit checkout main\u{2003} ".into(), 11),
         ];
         let frecency = Frecency::from_commands(commands.clone());
-        for prefix in ["", "git", "git checkout", "git  checkout", "echo", "missing", "git "] {
+        let mut prefixes = vec![
+            "",
+            "missing",
+            "gi",
+            "git check",
+            "git checkout main",
+            "git  checkout main ",
+        ];
+        for (command, _) in &commands {
+            prefixes.extend(command.match_indices(' ').map(|(offset, _)| &command[..offset]));
+        }
+        for prefix in prefixes {
             assert_eq!(
-                frecency.next_word_counts(prefix),
-                &walk_next_word_counts(&commands, prefix),
+                frecency.next_word_counts(prefix).to_owned_map(),
+                walk_next_word_counts(&commands, prefix),
                 "prefix {prefix:?}"
             );
         }
+    }
+
+    #[test]
+    fn history_index_build_and_drop_stay_flat_for_a_deep_irregular_prefix() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let command = format!("echo  {}", "x ".repeat(10_000));
+                let frecency = Frecency::from_commands([(command.clone(), 0), (command.clone(), 1)]);
+                let trimmed = command.trim();
+                let prefix = trimmed.rsplit_once(' ').unwrap().0;
+                assert_eq!(frecency.next_word_counts(prefix).get("x"), Some(&2));
+                let (nodes, _, bytes) = frecency.next_words_diagnostics();
+                assert!(nodes <= 10_003);
+                assert!(
+                    bytes < command.len() * 256,
+                    "{bytes} bytes for {} bytes of history",
+                    command.len()
+                );
+                assert_eq!(frecency.history_suggestions("", false, true).len(), 1);
+                drop(frecency);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn many_spaces_before_one_large_word_share_the_next_word() {
+        let word = "x".repeat(32 * 1024);
+        let command = format!("echo {}{word}", " ".repeat(4096));
+        let frecency = Frecency::from_commands([(command.clone(), 0)]);
+        assert_eq!(frecency.next_word_counts("echo").get(&word), Some(&1));
+        assert_eq!(
+            frecency
+                .next_word_counts(&format!("echo {}", " ".repeat(4095)))
+                .get(&word),
+            Some(&1)
+        );
+        assert_eq!(frecency.next_words.words.len(), 2);
+        assert!(frecency.next_words_diagnostics().2 < command.len() * 64);
+    }
+
+    #[test]
+    fn cancellation_during_a_long_history_build_discards_the_partial_arena() {
+        let token = crate::cancellation::CancellationToken::new();
+        let _scope = crate::cancellation::enter(token.clone());
+        let mut checkpoints = 0;
+        let result = Frecency::build([(format!("echo  {}", "x ".repeat(10_000)), 0)], || {
+            checkpoints += 1;
+            if checkpoints == 30 {
+                token.cancel();
+            }
+            crate::cancellation::check()
+        });
+        assert!(result.is_err());
+        assert_eq!(checkpoints, 30, "the build stops at the cancellation boundary");
     }
 
     #[test]

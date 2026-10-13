@@ -33,8 +33,9 @@ mod worker;
 
 pub use cancellation::CompletionCancelled;
 pub use diagnostics::{
-    CacheMapDiagnostics, EngineClientDiagnostics, EngineDiagnostics, HistoryDiagnostics, HookCatalogDiagnostics,
-    HookDiagnostics, HostResourceDiagnostics, RegistryDiagnostics, RequestDiagnostics, WorkerResourceDiagnostics,
+    CacheMapDiagnostics, EngineClientDiagnostics, EngineDiagnostics, GeneratorSessionDiagnostics, HistoryDiagnostics,
+    HookCatalogDiagnostics, HookDiagnostics, HostResourceDiagnostics, RegistryDiagnostics, RequestDiagnostics,
+    WorkerResourceDiagnostics,
 };
 pub use ir::{ArgSpec, Builtin, OptionSpec, Registry, Spec, Template};
 pub use lookup::{completion_buffer, current_command_slice, tokenize};

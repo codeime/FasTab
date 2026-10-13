@@ -2737,7 +2737,7 @@ pub(crate) struct TypedHookContext {
     pub current_working_directory: String,
     pub current_process: String,
     pub ssh_prefix: String,
-    pub environment_variables: Vec<(String, String)>,
+    pub environment_variables: crate::hook_types::HookEnvironment,
     pub search_term: String,
     pub is_dangerous: bool,
 }
@@ -2755,11 +2755,7 @@ impl TypedHookContext {
             current_working_directory: context.current_working_directory.clone(),
             current_process: context.current_process.clone(),
             ssh_prefix: context.ssh_prefix.clone(),
-            environment_variables: context
-                .environment_variables
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
+            environment_variables: context.environment_variables.clone(),
             search_term: context.search_term.clone(),
             is_dangerous: context.is_dangerous,
         }
@@ -5369,7 +5365,13 @@ mod tests {
             current_working_directory: "/repo".into(),
             current_process: "zsh".into(),
             ssh_prefix: String::new(),
-            environment_variables: vec![("HOME".into(), "/Users/x".into())],
+            environment_variables: std::sync::Arc::new(vec![
+                ("Z".into(), "tail".into()),
+                ("HOME".into(), "obsolete home".into()),
+                ("HOME".into(), "/Users/x".into()),
+                ("A".into(), "first".into()),
+            ])
+            .into(),
             search_term: String::new(),
             is_dangerous: false,
         };
@@ -5415,8 +5417,73 @@ mod tests {
             None,
         )
         .expect("custom");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].name, "/Users/x");
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["first", "/Users/x", "tail"]
+        );
+        let mut single = custom;
+        single["expr"] = json!({
+            "op": "array",
+            "items": [{
+                "op": "object",
+                "fields": [{
+                    "key": "name",
+                    "value": {"op": "ctx-env", "name": {"op": "string", "value": "HOME"}}
+                }]
+            }]
+        });
+        let rows = evaluate_typed_custom(
+            &parse_typed_hook_ir(&single).expect("single env lookup"),
+            &[],
+            &context,
+            &exec,
+            None,
+        )
+        .expect("single env lookup");
+        assert_eq!(
+            rows[0].name, "/Users/x",
+            "lookup and full object use the same last value"
+        );
+        let result = single["expr"].clone();
+        single["expr"] = json!({
+            "op": "seq",
+            "items": [{
+                "op": "exec",
+                "command": {"op": "string", "value": "fixture"},
+                "args": {"op": "array", "items": []},
+                "cwd": {"op": "ctx-cwd"},
+                "env": {"op": "ctx-environment"},
+                "timeout": {"op": "null"}
+            }, result]
+        });
+        let calls = std::cell::Cell::new(0);
+        let exec = |request: TypedExecRequest| {
+            calls.set(calls.get() + 1);
+            assert_eq!(request.command, "fixture");
+            assert_eq!(request.cwd.as_deref(), Some("/repo"));
+            assert_eq!(
+                request.env,
+                [
+                    ("A".into(), "first".into()),
+                    ("HOME".into(), "/Users/x".into()),
+                    ("Z".into(), "tail".into())
+                ]
+            );
+            Ok(TypedExecResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                status: 0,
+            })
+        };
+        evaluate_typed_custom(
+            &parse_typed_hook_ir(&single).expect("exec environment"),
+            &[],
+            &context,
+            &exec,
+            None,
+        )
+        .expect("exec environment");
+        assert_eq!(calls.get(), 1);
     }
 
     fn typed_eval_error_shape(value: &JsonValue) -> bool {

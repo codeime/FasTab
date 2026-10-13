@@ -619,11 +619,7 @@ fn typed_context(context: &HookContext) -> TypedHookContext {
         current_working_directory: context.current_working_directory.clone(),
         current_process: context.current_process.clone(),
         ssh_prefix: context.ssh_prefix.clone(),
-        environment_variables: context
-            .environment_variables
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
+        environment_variables: context.environment_variables.clone(),
         search_term: context.search_term.clone(),
         is_dangerous: context.is_dangerous,
     }

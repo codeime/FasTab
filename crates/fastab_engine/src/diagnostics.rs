@@ -55,7 +55,24 @@ pub struct RegistryDiagnostics {
 pub struct HistoryDiagnostics {
     pub line_count: usize,
     pub index_count: usize,
-    /// History lines and indexed values, excluding map nodes and allocator overhead.
+    /// History lines, derived indexes and NextWords payload estimate, not footprint.
+    pub allocated_bytes: usize,
+    #[serde(default)]
+    pub index_bytes: usize,
+    #[serde(default)]
+    pub next_word_nodes: usize,
+    #[serde(default)]
+    pub next_word_entries: usize,
+    #[serde(default)]
+    pub next_word_bytes: usize,
+}
+
+/// Rows retained for generator trigger/debounce refiltering in the active input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GeneratorSessionDiagnostics {
+    pub generators: usize,
+    pub rows: usize,
+    /// Owned string/vector capacity estimate, excluding allocator overhead.
     pub allocated_bytes: usize,
 }
 
@@ -66,6 +83,8 @@ pub struct EngineDiagnostics {
     #[serde(default)]
     pub hook_catalog: HookCatalogDiagnostics,
     pub history: HistoryDiagnostics,
+    #[serde(default)]
+    pub generator_session: GeneratorSessionDiagnostics,
 }
 
 /// Worker lifetime counters. `cancelled` includes jobs skipped before execution;
@@ -96,6 +115,24 @@ pub struct WorkerResourceDiagnostics {
 /// Read-only host counters, collected without constructing a window or asset.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HostResourceDiagnostics {
+    #[serde(default)]
+    pub host_async_events: usize,
+    #[serde(default)]
+    pub host_async_payload_bytes: usize,
+    #[serde(default)]
+    pub host_async_waiters: usize,
+    #[serde(default)]
+    pub host_async_waiting_bytes: usize,
+    #[serde(default)]
+    pub host_sync_events: usize,
+    #[serde(default)]
+    pub host_sync_payload_bytes: usize,
+    #[serde(default)]
+    pub host_ax_events: usize,
+    #[serde(default)]
+    pub ipc_remote_connections: usize,
+    #[serde(default)]
+    pub ipc_local_connections: usize,
     pub gpui_windows: usize,
     pub overlay_visible: bool,
     pub file_icon_paths: usize,
@@ -103,6 +140,10 @@ pub struct HostResourceDiagnostics {
     pub file_icon_worker_active: bool,
     pub file_icon_pending_paths: usize,
     pub ipc_sessions: usize,
+    #[serde(default)]
+    pub ipc_session_edit_bytes: usize,
+    #[serde(default)]
+    pub ipc_session_edit_capacity: usize,
     pub ipc_pending_messages: usize,
     pub ipc_pending_bytes: usize,
     pub ipc_pending_responses: usize,
@@ -124,8 +165,10 @@ mod tests {
     fn engine_snapshots_without_catalog_counts_still_deserialize() {
         let mut legacy = serde_json::to_value(super::EngineDiagnostics::default()).unwrap();
         legacy.as_object_mut().unwrap().remove("hook_catalog");
+        legacy.as_object_mut().unwrap().remove("generator_session");
         let restored: super::EngineDiagnostics = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.hook_catalog, Default::default());
+        assert_eq!(restored.generator_session, Default::default());
     }
 
     #[test]
@@ -134,5 +177,17 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("captured_bytes");
         let restored: super::HookCatalogDiagnostics = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.captured_bytes, 0);
+    }
+
+    #[test]
+    fn history_snapshots_without_derived_resource_counts_still_deserialize() {
+        let restored: super::HistoryDiagnostics = serde_json::from_value(serde_json::json!({
+            "line_count": 3, "index_count": 1, "allocated_bytes": 256
+        }))
+        .unwrap();
+        assert_eq!(restored.index_bytes, 0);
+        assert_eq!(restored.next_word_bytes, 0);
+        assert_eq!(restored.next_word_nodes, 0);
+        assert_eq!(restored.next_word_entries, 0);
     }
 }

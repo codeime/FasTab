@@ -860,9 +860,8 @@ fn evaluate_inner(
             let value = require_effects(effects)?
                 .context
                 .environment_variables
-                .iter()
-                .find(|(key, _)| key == &name)
-                .map(|(_, value)| value.as_str());
+                .get(&name)
+                .map(String::as_str);
             Ok(match value {
                 Some(value) => TypedValue::String(Utf16String::from_str(value)),
                 None => TypedValue::Null,
@@ -1580,7 +1579,7 @@ mod cancellation_tests {
             current_working_directory: String::new(),
             current_process: String::new(),
             ssh_prefix: String::new(),
-            environment_variables: Vec::new(),
+            environment_variables: Default::default(),
             search_term: String::new(),
             is_dangerous: false,
         }

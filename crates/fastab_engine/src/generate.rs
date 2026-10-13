@@ -87,6 +87,30 @@ pub(crate) struct GeneratorSession {
     entries: Vec<CachedGenerator>,
 }
 
+impl GeneratorSession {
+    pub(crate) fn diagnostics(&self) -> crate::diagnostics::GeneratorSessionDiagnostics {
+        crate::diagnostics::GeneratorSessionDiagnostics {
+            generators: self.entries.len(),
+            rows: self.entries.iter().map(|entry| entry.results.len()).sum(),
+            allocated_bytes: self.arg_id.capacity()
+                + self.search_term.capacity()
+                + self.entries.capacity() * std::mem::size_of::<CachedGenerator>()
+                + self
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        entry.results.capacity() * std::mem::size_of::<Suggestion>()
+                            + entry
+                                .results
+                                .iter()
+                                .map(crate::hook_cache::suggestion_heap)
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>(),
+        }
+    }
+}
+
 thread_local! {
     static GENERATOR_SESSION: RefCell<GeneratorSession> = RefCell::new(GeneratorSession::default());
     static PENDING_GENERATORS: Cell<(bool, i64)> = const { Cell::new((false, 0)) };
@@ -387,7 +411,7 @@ pub(crate) fn generate_for_arg_with_history(
             } else if !trigger && !follow_up {
                 refilter_generated(&session.entries[index].results, &gen_query, fuzzy)
             } else {
-                let rows = generate_from_generator(
+                let mut rows = generate_from_generator(
                     arg,
                     generator,
                     tokens,
@@ -401,10 +425,11 @@ pub(crate) fn generate_for_arg_with_history(
                 if crate::cancellation::is_cancelled() {
                     return;
                 }
-                session.entries[index].results = rows.clone();
+                dedup_session_rows(&mut rows);
+                session.entries[index].results = rows;
                 session.entries[index].needs_run = false;
                 session.entries[index].ran = true;
-                rows
+                session.entries[index].results.clone()
             };
             stamp_query_term(&mut rows, &gen_query, search_term, has_query_rule);
             out.extend(rows);
@@ -869,6 +894,36 @@ fn dedup_suggestions(suggestions: &mut Vec<Suggestion>) {
     });
 }
 
+/// Final output keeps the first (name, kind, insert_value) row. Equal keys
+/// have the same refilter match, but hidden rows can disappear for a later
+/// query, exposing a visible duplicate with different metadata. Keep those
+/// two visibility classes separate in the session; within each class the
+/// first row wins for every future query, including its original query_term.
+fn dedup_session_rows(rows: &mut Vec<Suggestion>) {
+    if rows.len() <= 1 {
+        return;
+    }
+    let keep = {
+        let mut seen = HashSet::new();
+        rows.iter()
+            .map(|row| {
+                seen.insert((
+                    row.name.as_str(),
+                    row.kind.as_str(),
+                    row.insert_value.as_deref(),
+                    row.hidden,
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let original_len = rows.len();
+    let mut keep = keep.into_iter();
+    rows.retain(|_| keep.next().expect("one keep flag per generator row"));
+    if rows.len() != original_len && rows.capacity() > rows.len().saturating_mul(2).max(64) {
+        rows.shrink_to_fit();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_js_generators(
     arg: &ArgSpec,
@@ -1023,12 +1078,7 @@ fn filter_split(stdout: &str, query: &str, fuzzy: bool, split_on: &str) -> Vec<S
 }
 
 fn all_lines(stdout: &str) -> Vec<Suggestion> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| Suggestion::new(line, "", "arg").with_insert_value(line))
-        .collect()
+    unique_script_rows(stdout.lines().map(str::trim).filter(|line| !line.is_empty()))
 }
 
 fn all_split(stdout: &str, split_on: &str) -> Vec<Suggestion> {
@@ -1039,8 +1089,16 @@ fn all_split(stdout: &str, split_on: &str) -> Vec<Suggestion> {
     if trimmed.is_empty() {
         return Vec::new();
     }
-    trimmed
-        .split(split_on)
+    unique_script_rows(trimmed.split(split_on))
+}
+
+// Script pieces have identical metadata. Discard repeated borrowed pieces
+// before allocating rows; final output already keeps only their first row.
+// Empty pieces are significant for splitOn and remain as one empty row.
+fn unique_script_rows<'a>(parts: impl Iterator<Item = &'a str>) -> Vec<Suggestion> {
+    let mut seen = HashSet::new();
+    parts
+        .filter(|part| seen.insert(*part))
         .map(|part| Suggestion::new(part, "", "arg").with_insert_value(part))
         .collect()
 }
@@ -1556,6 +1614,41 @@ mod tests {
     }
 
     #[test]
+    fn session_dedup_preserves_first_metadata_and_future_hidden_refiltering() {
+        let mut hidden = Suggestion::new("alpha", "hidden first", "arg").with_insert_value("alpha");
+        hidden.hidden = true;
+        hidden.query_term = Some("first query".into());
+        let mut visible = hidden.clone();
+        visible.hidden = false;
+        visible.description = "visible fallback".into();
+        visible.query_term = None;
+        let mut later = visible.clone();
+        later.description = "later duplicate".into();
+        later.query_term = Some("later query".into());
+        let mut original = vec![hidden.clone(), visible.clone(), later];
+        original.extend(std::iter::repeat_n(visible.clone(), 1024));
+        let mut compact = original.clone();
+        dedup_session_rows(&mut compact);
+        assert_eq!(compact, vec![hidden, visible]);
+        assert!(
+            compact.capacity() <= 64,
+            "removed rows must release their spare capacity"
+        );
+
+        for query in ["", "a", "alpha", "ALPHA", "z"] {
+            for fuzzy in [false, true] {
+                let finish = |rows: &[Suggestion]| {
+                    let mut rows = refilter_generated(rows, query, fuzzy);
+                    stamp_query_term(&mut rows, query, &format!("src/{query}"), true);
+                    dedup_suggestions(&mut rows);
+                    rows
+                };
+                assert_eq!(finish(&compact), finish(&original), "query={query:?}, fuzzy={fuzzy}");
+            }
+        }
+    }
+
+    #[test]
     fn script_timeout_matches_webview_default_and_max_priority() {
         assert_eq!(DEFAULT_SCRIPT_TIMEOUT_MS, 5_000);
         assert_eq!(effective_script_timeout_ms(5_000, None, None), 5_000);
@@ -2051,7 +2144,11 @@ mod tests {
         };
         let with_query_term = ArgSpec {
             name: "query-term-debounce".into(),
-            script: vec!["sh".into(), "-c".into(), "printf 'alpha\\nbeta\\n'".into()],
+            script: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'alpha\\nalpha\\nbeta\\nbeta\\n'".into(),
+            ],
             split_on: Some("\n".into()),
             debounce_ms: Some(200),
             meta: SuggestionMeta {
@@ -2463,14 +2560,16 @@ mod tests {
             constant_suggestions(&["from-hook"]),
         )]);
         let arg = ArgSpec {
-            script: vec!["printf".into(), "alpha,beta".into()],
+            script: vec!["printf".into(), "alpha,alpha,beta,,beta,".into()],
             split_on: Some(",".into()),
             js_post_process: Some("demo#postProcess#0".into()),
             ..ArgSpec::default()
         };
         let rows = with_native(native, "/", || generate_for_arg(&arg, &["demo".into()], "", "/", false));
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "beta"]);
+        assert_eq!(names, vec!["alpha", "beta", ""]);
+        let session = take_session();
+        assert_eq!(session.entries[0].results.len(), 3);
 
         let native = hook_backend::test_native_hooks(vec![hook_backend::test_typed_entry(
             "demo#postProcess#0",

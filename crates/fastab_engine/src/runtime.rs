@@ -374,6 +374,7 @@ pub struct Engine {
     hook_cache_idle_since: Option<std::time::Instant>,
     /// Shares the hook result owner, but has a deadline even with empty caches.
     native_idle_since: Option<std::time::Instant>,
+    history_index_idle_since: Option<std::time::Instant>,
 }
 
 impl Engine {
@@ -435,6 +436,7 @@ impl Engine {
             // Construction can race cancellation before complete's first
             // check. Until a normal result commits, this owner is idle.
             native_idle_since: Some(std::time::Instant::now()),
+            history_index_idle_since: None,
         }
     }
 
@@ -487,6 +489,7 @@ impl Engine {
         self.hook_cache_active = false;
         self.note_idle_hook_cache(false, now);
         self.note_idle_native(now);
+        self.note_idle_history_indexes(false, now);
         self.registry.begin_idle_completion();
         self.registry.note_idle_after_complete(now);
     }
@@ -497,6 +500,12 @@ impl Engine {
     }
 
     pub(crate) fn diagnostics_with_grace(&self, grace: std::time::Duration) -> crate::diagnostics::EngineDiagnostics {
+        let mut history = self.history.diagnostics();
+        let (nodes, entries, bytes) = self.frecency.next_words_diagnostics();
+        history.next_word_nodes = nodes;
+        history.next_word_entries = entries;
+        history.next_word_bytes = bytes;
+        history.allocated_bytes += bytes;
         crate::diagnostics::EngineDiagnostics {
             registry: self.registry.diagnostics(std::time::Instant::now(), grace),
             hooks: self.hook_cache.diagnostics(),
@@ -504,7 +513,8 @@ impl Engine {
                 .native
                 .as_ref()
                 .map_or_else(Default::default, |native| native.diagnostics()),
-            history: self.history.diagnostics(),
+            history,
+            generator_session: self.generator_session.diagnostics(),
         }
     }
 
@@ -526,6 +536,14 @@ impl Engine {
     /// Release expired specs, hook results and the catalog once the worker regains Engine.
     pub(crate) fn release_idle_specs(&mut self, now: std::time::Instant, grace: std::time::Duration) {
         self.registry.release_idle(now, grace);
+        if !self.hook_cache_active
+            && self
+                .history_index_idle_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= grace)
+        {
+            self.history.release_derived_indexes();
+            self.history_index_idle_since = None;
+        }
         if !self.hook_cache_active
             && self
                 .hook_cache_idle_since
@@ -554,11 +572,16 @@ impl Engine {
             .then_some(self.native_idle_since)
             .flatten()
             .and_then(|since| since.checked_add(grace));
+        let history_deadline = (!self.hook_cache_active && self.history.has_derived_indexes())
+            .then_some(self.history_index_idle_since)
+            .flatten()
+            .and_then(|since| since.checked_add(grace));
         self.registry
             .next_idle_deadline(grace)
             .into_iter()
             .chain(hook_deadline)
             .chain(native_deadline)
+            .chain(history_deadline)
             .min()
     }
 
@@ -572,6 +595,15 @@ impl Engine {
     fn note_idle_native(&mut self, now: std::time::Instant) {
         if !self.hook_cache_active && self.native.is_some() && self.native_idle_since.is_none() {
             self.native_idle_since = Some(now);
+        }
+    }
+
+    fn note_idle_history_indexes(&mut self, was_empty: bool, now: std::time::Instant) {
+        if !self.hook_cache_active
+            && self.history.has_derived_indexes()
+            && (was_empty || self.history_index_idle_since.is_none())
+        {
+            self.history_index_idle_since = Some(now);
         }
     }
 
@@ -603,6 +635,7 @@ impl Engine {
         self.hook_cache_idle_since = None;
         self.generator_session = crate::generate::GeneratorSession::default();
         self.history = Arc::default();
+        self.history_index_idle_since = None;
         match Self::load_registry(&self.specs_dir) {
             Ok(registry) => {
                 // A successful reload is a new generation. Rebind both hosts
@@ -634,6 +667,7 @@ impl Engine {
                 // otherwise replay a custom result from the prior generation.
                 self.generator_session = crate::generate::GeneratorSession::default();
                 self.history = Arc::default();
+                self.history_index_idle_since = None;
             },
             Err(error) => {
                 // The publisher may currently have the canonical path
@@ -696,7 +730,9 @@ impl Engine {
         if crate::cancellation::is_cancelled() {
             return;
         }
-        let frecency = Frecency::from_commands(commands);
+        let Ok(frecency) = Frecency::try_from_commands(commands) else {
+            return;
+        };
         let _ = crate::cancellation::commit_if_active(|| {
             self.frecency = frecency;
             self.frecency_loaded = true;
@@ -721,6 +757,7 @@ impl Engine {
         crate::cancellation::check()?;
         let idle = self.registry.checkpoint_idle();
         let hook_cache_was_empty = self.hook_cache.is_empty();
+        let history_indexes_were_empty = !self.history.has_derived_indexes();
         let history_only = request.history_only;
         crate::generate::take_pending_generators();
         crate::generate::install_session(std::mem::take(&mut self.generator_session));
@@ -732,10 +769,12 @@ impl Engine {
                 self.hook_cache_active = true;
                 self.hook_cache_idle_since = None;
                 self.native_idle_since = None;
+                self.history_index_idle_since = None;
                 self.registry.note_idle_after_complete(std::time::Instant::now());
             } else {
                 self.note_idle_hook_cache(hook_cache_was_empty, std::time::Instant::now());
                 self.note_idle_native(std::time::Instant::now());
+                self.note_idle_history_indexes(history_indexes_were_empty, std::time::Instant::now());
                 // History-only still loads specs to resolve fuzzy matching.
                 // It cannot take ownership of earlier active files, but new
                 // files must not be left without an idle deadline.
@@ -748,6 +787,7 @@ impl Engine {
                 crate::generate::take_pending_generators();
                 self.note_idle_hook_cache(hook_cache_was_empty, std::time::Instant::now());
                 self.note_idle_native(std::time::Instant::now());
+                self.note_idle_history_indexes(history_indexes_were_empty, std::time::Instant::now());
                 self.registry.restore_idle_checkpoint(&idle, std::time::Instant::now());
                 Err(cancelled.into())
             },
@@ -767,6 +807,7 @@ impl Engine {
         let lines = self.frecency.command_lines();
         if !Arc::ptr_eq(self.history.lines(), &lines) {
             self.history = Arc::new(crate::history::HistoryStore::new(lines));
+            self.history_index_idle_since = None;
         }
         crate::generate::set_history(Arc::clone(&self.history));
         if request.history_only {
@@ -818,7 +859,7 @@ impl Engine {
             let _native = hook_backend::bind_native(self.ensure_native());
             let shell = ShellContext {
                 current_process: request.current_process.clone().unwrap_or_default(),
-                environment_variables: std::mem::take(&mut request.environment_variables),
+                environment_variables: std::mem::take(&mut request.environment_variables).into(),
             };
             let registry = &mut self.registry;
             let _cache = self.hook_cache.bind();
@@ -2447,6 +2488,147 @@ mod tests {
                 .iter()
                 .any(|suggestion| suggestion.name == "git")
         );
+    }
+
+    #[test]
+    fn repeated_script_pieces_stay_compact_through_real_engine_refilter_and_end_input() {
+        let _lock = engine_lock();
+        let _settings =
+            fastab_settings::settings::install_override(fastab_settings::settings::Settings::from_slice(&[
+                ("autocomplete.history.disableLoading", serde_json::json!(true)),
+                ("autocomplete.sortMethod", serde_json::json!("default")),
+                ("autocomplete.hideAutoExecuteSuggestion", serde_json::json!(true)),
+            ]));
+        let dir = tempfile::tempdir().unwrap();
+        let specs = dir.path().join("specs");
+        let output = dir.path().join("output");
+        let mut stdout = "alpha\n".repeat(20_000);
+        stdout.push_str("\nbeta\n");
+        for index in 0..200 {
+            stdout.push_str(&format!("unique-{index:03}\n"));
+        }
+        fs::write(&output, stdout).unwrap();
+        write_spec(
+            &specs,
+            "repeat",
+            &serde_json::json!({
+                "names": ["repeat"],
+                "args": [{"name": "value", "script": ["cat", output.display().to_string()], "splitOn": "\n"}]
+            })
+            .to_string(),
+        );
+        let mut engine = Engine::new_with_frecency(specs, Frecency::default()).unwrap();
+        let request = |buffer: &str| CompleteRequest {
+            buffer: buffer.into(),
+            cwd: dir.path().display().to_string(),
+            include_history: false,
+            ..CompleteRequest::default()
+        };
+        let first = engine.complete(request("repeat ")).unwrap();
+        assert_eq!(first.suggestions.len(), 203);
+        assert_eq!(first.suggestions[0].name, "alpha");
+        assert_eq!(first.suggestions[1].name, "");
+        assert_eq!(first.suggestions[2].name, "beta");
+        assert_eq!(first.suggestions.last().unwrap().name, "unique-199");
+        let resources = engine.diagnostics().generator_session;
+        assert_eq!(resources.generators, 1);
+        assert_eq!(resources.rows, 203, "unique candidates are not truncated");
+        assert!(resources.allocated_bytes < 256 * 1024, "{resources:?}");
+        fs::remove_file(&output).unwrap();
+        let second = engine.complete(request("repeat al")).unwrap();
+        assert_eq!(second.suggestions.len(), 1);
+        assert_eq!(second.suggestions[0].name, "alpha");
+        let after_refilter = engine.diagnostics().generator_session;
+        assert_eq!(after_refilter.rows, resources.rows, "refilter retains the same rows");
+        assert!(
+            after_refilter.allocated_bytes <= resources.allocated_bytes + 64,
+            "{after_refilter:?}"
+        );
+        engine.end_input();
+        assert_eq!(engine.diagnostics().generator_session, Default::default());
+    }
+
+    #[test]
+    fn ended_input_retires_only_derived_history_indexes_and_rebuilds_identical_rows() {
+        let _lock = engine_lock();
+        let _settings =
+            fastab_settings::settings::install_override(fastab_settings::settings::Settings::from_slice(&[
+                ("autocomplete.history.disableLoading", serde_json::json!(false)),
+                ("beta.history.customCommand", serde_json::json!("")),
+                ("beta.history.allShells", serde_json::json!(false)),
+                ("autocomplete.sortMethod", serde_json::json!("default")),
+            ]));
+        let dir = tempfile::tempdir().unwrap();
+        write_spec(
+            dir.path(),
+            "tool",
+            r#"{"names":["tool"],"args":[{"name":"value","templates":["history"]}]}"#,
+        );
+        let frecency = Frecency::from_commands([
+            ("tool alpha".into(), 1),
+            ("tool beta".into(), 2),
+            ("tool alpha".into(), 3),
+        ]);
+        let mut engine = Engine::new_with_frecency(dir.path().to_path_buf(), frecency).unwrap();
+        let request = CompleteRequest {
+            buffer: "tool ".into(),
+            cwd: dir.path().display().to_string(),
+            include_history: false,
+            ..CompleteRequest::default()
+        };
+        let first = engine.complete(request.clone()).unwrap();
+        assert_eq!(
+            first
+                .suggestions
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        let active = engine.diagnostics().history;
+        assert_eq!(active.index_count, 1);
+        assert!(active.index_bytes > 0 && active.next_word_bytes > 0);
+        let lines = engine.frecency.command_lines();
+        let grace = Duration::from_secs(10);
+        engine.end_input();
+        let deadline = engine.next_idle_deadline(grace).unwrap();
+        engine.native = None;
+        engine.registry.release_idle(std::time::Instant::now(), Duration::ZERO);
+        assert_eq!(
+            engine.next_idle_deadline(grace),
+            Some(deadline),
+            "indexes alone schedule retirement"
+        );
+        engine
+            .complete(CompleteRequest {
+                history_only: true,
+                ..request.clone()
+            })
+            .unwrap();
+        engine.end_input();
+        assert_eq!(
+            engine.next_idle_deadline(grace),
+            Some(deadline),
+            "history and repeated end do not extend grace"
+        );
+        let token = crate::cancellation::CancellationToken::new();
+        token.cancel();
+        {
+            let _scope = crate::cancellation::enter(token);
+            assert!(engine.complete(request.clone()).is_err());
+        }
+        assert_eq!(engine.next_idle_deadline(grace), Some(deadline));
+        engine.release_idle_specs(deadline - Duration::from_millis(1), grace);
+        assert_eq!(engine.diagnostics().history.index_count, 1);
+        engine.release_idle_specs(deadline, grace);
+        let retired = engine.diagnostics().history;
+        assert_eq!(retired.index_count, 0);
+        assert_eq!(retired.index_bytes, 0);
+        assert_eq!(retired.next_word_bytes, active.next_word_bytes);
+        assert!(Arc::ptr_eq(&lines, &engine.frecency.command_lines()));
+        let rebuilt = engine.complete(request).unwrap();
+        assert_eq!(rebuilt, first);
+        assert_eq!(engine.diagnostics().history.index_count, 1);
     }
 
     #[test]
