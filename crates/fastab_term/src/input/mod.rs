@@ -2038,8 +2038,11 @@ mod test {
             let mut parser = InputParser::new_raw_passthrough();
             let mut events = Vec::new();
             for chunk in input.chunks(chunk_size) {
-                parser.parse(chunk, |raw, event| events.push((raw, event)), false);
+                // These chunks belong to one continuously available stream;
+                // an isolated ESC is ambiguous until its following bytes arrive.
+                parser.parse(chunk, |raw, event| events.push((raw, event)), true);
             }
+            parser.parse(b"", |raw, event| events.push((raw, event)), false);
             assert_eq!(events.len(), 3);
             assert_eq!(events[0].1, InputEvent::RawString);
             let raw = events[0].0.as_ref().unwrap();

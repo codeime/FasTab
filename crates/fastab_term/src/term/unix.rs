@@ -255,10 +255,11 @@ async fn flush_input_batch(
     parser: &mut InputParser,
     buf: &mut BytesMut,
     input_tx: &Sender<InputEventResult>,
+    maybe_more: bool,
     finishing: bool,
 ) -> bool {
     let mut events = Vec::new();
-    parser.parse(buf, |raw, event| events.push(Ok((raw, event))), false);
+    parser.parse(buf, |raw, event| events.push(Ok((raw, event))), maybe_more);
     buf.clear();
     if buf.capacity() > MAX_INPUT_BATCH_BYTES {
         *buf = BytesMut::with_capacity(crate::BUFFER_SIZE);
@@ -291,7 +292,7 @@ async fn read_input_stream(
             res = stdin.read(&mut chunk[..read_limit]) => {
                 match res {
                     Ok(0) => {
-                        flush_input_batch(&mut parser, &mut buf, &input_tx, true).await;
+                        flush_input_batch(&mut parser, &mut buf, &input_tx, false, true).await;
                         return;
                     }
                     Ok(n) => {
@@ -299,14 +300,19 @@ async fn read_input_stream(
                         crate::resource_diagnostics::input_outer(buf.len(), buf.capacity());
                         let deadline = *batch_deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(1));
                         if immediate_mode.load(Ordering::SeqCst) || buf.len() >= MAX_INPUT_BATCH_BYTES || Instant::now() >= deadline {
-                            if !flush_input_batch(&mut parser, &mut buf, &input_tx, false).await { return; }
-                            batch_deadline = None;
+                            let maybe_more = Instant::now() < deadline;
+                            if !flush_input_batch(&mut parser, &mut buf, &input_tx, maybe_more, false).await { return; }
+                            // Size/immediate flushes are read boundaries, not an
+                            // idle boundary. Preserve split escape prefixes and
+                            // settle them at the original first-byte deadline,
+                            // even when the outer batch is now empty.
+                            if !maybe_more { batch_deadline = None; }
                         }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(err) => {
                         // Deliver already-read bytes before the permanent error.
-                        if flush_input_batch(&mut parser, &mut buf, &input_tx, true).await {
+                        if flush_input_batch(&mut parser, &mut buf, &input_tx, false, true).await {
                             let _ = input_tx.send_async(vec![Err(anyhow::anyhow!(err))]).await;
                         }
                         return;
@@ -314,7 +320,7 @@ async fn read_input_stream(
                 }
             }
             _ = tokio::time::sleep_until(batch_deadline.unwrap_or_else(Instant::now)), if batch_deadline.is_some() => {
-                if !flush_input_batch(&mut parser, &mut buf, &input_tx, false).await { return; }
+                if !flush_input_batch(&mut parser, &mut buf, &input_tx, false, false).await { return; }
                 batch_deadline = None;
             }
             _ = async {
@@ -420,6 +426,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_boundary_flush_preserves_split_paste_markers_and_idle_flush_settles_escape() {
+        let mut input = crate::input::PASTE_START.as_bytes().to_vec();
+        input.extend(std::iter::repeat_n(b'x', 128 * 1024));
+        input.extend_from_slice(b"\xe4\xb8\xad\xff\x1b[31m");
+        input.extend_from_slice(crate::input::PASTE_END.as_bytes());
+        let paste_len = input.len();
+        input.extend_from_slice(b"xy");
+        for split in 1..crate::input::PASTE_START.len() {
+            let mut parser = InputParser::new_raw_passthrough();
+            let mut buf = BytesMut::from(&input[..split]);
+            let (tx, rx) = bounded(4);
+            // A size/immediate read boundary must not commit this prefix.
+            assert!(flush_input_batch(&mut parser, &mut buf, &tx, true, false).await);
+            assert!(rx.try_recv().is_err());
+            buf.extend_from_slice(&input[split..paste_len - 3]);
+            assert!(flush_input_batch(&mut parser, &mut buf, &tx, true, false).await);
+            assert!(rx.try_recv().is_err());
+            buf.extend_from_slice(&input[paste_len - 3..]);
+            assert!(flush_input_batch(&mut parser, &mut buf, &tx, true, false).await);
+            let events: Vec<_> = rx.recv().unwrap().into_iter().map(|event| event.unwrap()).collect();
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0].1, InputEvent::RawString);
+            let raw = events[0].0.as_ref().unwrap();
+            assert_eq!(raw.as_ref(), &input[..paste_len]);
+            assert!(raw.is_unique());
+            for (index, byte) in b"xy".iter().enumerate() {
+                assert_eq!(events[index + 1].0.as_deref(), Some(std::slice::from_ref(byte)));
+                assert_eq!(
+                    events[index + 1].1,
+                    InputEvent::Key(crate::input::KeyEvent {
+                        key: crate::input::KeyCode::Char(char::from(*byte)),
+                        modifiers: crate::input::Modifiers::NONE,
+                    })
+                );
+            }
+            assert!(buf.is_empty());
+            assert!(buf.capacity() <= MAX_INPUT_BATCH_BYTES);
+        }
+
+        let mut parser = InputParser::new_raw_passthrough();
+        let mut buf = BytesMut::from(b"\x1b".as_slice());
+        let (tx, rx) = bounded(1);
+        assert!(flush_input_batch(&mut parser, &mut buf, &tx, true, false).await);
+        assert!(rx.try_recv().is_err());
+        // The original first-byte timer must flush even with an empty batch.
+        assert!(buf.is_empty());
+        assert!(flush_input_batch(&mut parser, &mut buf, &tx, false, false).await);
+        let event = rx.recv().unwrap().pop().unwrap().unwrap();
+        assert_eq!(event.0.as_deref(), Some(b"\x1b".as_slice()));
+        assert!(matches!(
+            event.1,
+            InputEvent::Key(crate::input::KeyEvent {
+                key: crate::input::KeyCode::Escape,
+                modifiers: crate::input::Modifiers::NONE,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn immediate_input_settles_isolated_escape_without_eof_or_another_read() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let (tx, rx) = bounded(1);
+        let task = tokio::spawn(async move {
+            read_input_stream(reader, tx, None, &AtomicBool::new(true)).await;
+        });
+        writer.write_all(b"\x1b").await.unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(2), rx.recv_async())
+            .await
+            .expect("the empty-batch timer must settle ESC while the writer stays open")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let event = events.into_iter().next().unwrap().unwrap();
+        assert_eq!(event.0.as_deref(), Some(b"\x1b".as_slice()));
+        assert!(matches!(
+            event.1,
+            InputEvent::Key(crate::input::KeyEvent {
+                key: crate::input::KeyCode::Escape,
+                modifiers: crate::input::Modifiers::NONE,
+            })
+        ));
+        writer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rx.recv_async().await.is_err());
+    }
+
+    #[tokio::test]
     async fn continuous_input_produces_bounded_batches_before_writer_exits() {
         let (mut writer, reader) = UnixStream::pair().unwrap();
         let producer = tokio::spawn(async move {
@@ -461,7 +556,7 @@ mod tests {
         let expected = buf.to_vec();
         let (tx, rx) = bounded(1);
         let mut parser = InputParser::new();
-        assert!(flush_input_batch(&mut parser, &mut buf, &tx, false).await);
+        assert!(flush_input_batch(&mut parser, &mut buf, &tx, false, false).await);
         let raw = rx.recv().unwrap().pop().unwrap().unwrap().0.unwrap();
         assert_eq!(raw.as_ref(), expected);
         assert!(buf.is_empty());
