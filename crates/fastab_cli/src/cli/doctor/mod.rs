@@ -590,7 +590,7 @@ impl DoctorCheck for FigIntegrationsCheck {
 
         if sibling_pty_owns_this_session() {
             return Err(doctor_warning!(
-                "This terminal is wrapped by Easy Complete, not {PTY_BINARY_NAME}. Dual-install keeps one desktop wrapping a session — quit Easy Complete and open a new tab to test Fastab."
+                "This terminal is wrapped by Easy Complete, not {PTY_BINARY_NAME}. Dual-install keeps one desktop wrapping a session — quit Easy Complete and open a new tab to test FasTab."
             ));
         }
 
@@ -1185,7 +1185,7 @@ impl DoctorCheck<DiagnosticsResponse> for AccessibilityCheck {
             Err(DoctorError::Error {
                 reason: "Accessibility is disabled".into(),
                 info: vec![format!(
-                    "{PRODUCT_NAME} is {APP_BUNDLE_ID}. Grant Accessibility from Settings — this is Fastab's own TCC identity."
+                    "{PRODUCT_NAME} is {APP_BUNDLE_ID}. Grant Accessibility from Settings — this is FasTab's own TCC identity."
                 )
                 .into()],
                 fix: command_fix(

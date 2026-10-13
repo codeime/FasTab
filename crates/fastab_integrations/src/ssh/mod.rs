@@ -4,9 +4,9 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use fastab_util::PRODUCT_NAME;
 use fastab_util::consts::CLI_BINARY_NAME;
 use fastab_util::directories::{self, fig_data_dir_utf8, home_dir};
+use fastab_util::{INTEGRATION_MARKER_NAME, PRODUCT_NAME};
 use regex::Regex;
 
 use crate::error::{Error, Result};
@@ -58,7 +58,7 @@ impl SshIntegration {
 
     #[allow(clippy::unused_self)]
     fn description_text(&self) -> String {
-        format!("# {PRODUCT_NAME} SSH Integration. Keep at the bottom of this file.")
+        format!("# {INTEGRATION_MARKER_NAME} SSH Integration. Keep at the bottom of this file.")
     }
 
     fn match_text(&self) -> Result<String> {
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(all_count, 2);
 
         // count the number of product name comments to ensure match is replaced
-        let product_re = Regex::new(&format!(r"# {}", regex::escape(PRODUCT_NAME))).unwrap();
+        let product_re = Regex::new(&format!(r"# {}", regex::escape(INTEGRATION_MARKER_NAME))).unwrap();
         let product_count = product_re.find_iter(&replaced_config_text).count();
         assert_eq!(product_count, 1);
     }

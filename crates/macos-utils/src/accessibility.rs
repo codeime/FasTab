@@ -67,16 +67,16 @@ pub fn accessibility_settings_parent_name(major: isize, zh: bool) -> &'static st
 pub fn accessibility_permission_hint(major: isize, zh: bool) -> &'static str {
     match (major >= ACCESSIBILITY_PANE_RENAME_MAJOR, zh) {
         (true, false) => {
-            "Required to read the focused terminal window and position completions. Click to open System Settings → Privacy & Security → Device Control and Data Access. A stale list row is removed first, then drag Fastab into the list beside the card. Fastab has its own TCC identity and can sit beside Easy Complete."
+            "Required to read the focused terminal window and position completions. Click to open System Settings → Privacy & Security → Device Control and Data Access. A stale list row is removed first, then drag FasTab into the list beside the card. FasTab has its own TCC identity and can sit beside Easy Complete."
         },
         (false, false) => {
-            "Required to read the focused terminal window and position completions. Click to open System Settings → Privacy & Security → Accessibility. A stale list row is removed first, then drag Fastab into the list beside the card. Fastab has its own TCC identity and can sit beside Easy Complete."
+            "Required to read the focused terminal window and position completions. Click to open System Settings → Privacy & Security → Accessibility. A stale list row is removed first, then drag FasTab into the list beside the card. FasTab has its own TCC identity and can sit beside Easy Complete."
         },
         (true, true) => {
-            "用于读取当前聚焦的终端窗口并定位补全弹窗。点击后打开系统设置 → 隐私与安全 → 设备控制和数据访问；列表里失效的旧条目会先被移除，再把 Fastab 拖进旁边的列表。Fastab 有自己的 TCC 身份，可以和 Easy Complete 并排安装。"
+            "用于读取当前聚焦的终端窗口并定位补全弹窗。点击后打开系统设置 → 隐私与安全 → 设备控制和数据访问；列表里失效的旧条目会先被移除，再把 FasTab 拖进旁边的列表。FasTab 有自己的 TCC 身份，可以和 Easy Complete 并排安装。"
         },
         (false, true) => {
-            "用于读取当前聚焦的终端窗口并定位补全弹窗。点击后打开系统设置 → 隐私与安全性 → 辅助功能；列表里失效的旧条目会先被移除，再把 Fastab 拖进旁边的列表。Fastab 有自己的 TCC 身份，可以和 Easy Complete 并排安装。"
+            "用于读取当前聚焦的终端窗口并定位补全弹窗。点击后打开系统设置 → 隐私与安全性 → 辅助功能；列表里失效的旧条目会先被移除，再把 FasTab 拖进旁边的列表。FasTab 有自己的 TCC 身份，可以和 Easy Complete 并排安装。"
         },
     }
 }

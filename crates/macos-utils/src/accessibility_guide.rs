@@ -52,7 +52,7 @@ const NS_IMAGE_SCALE_PROPORTIONALLY: u64 = 3;
 static ARROW_DIRECTION: AtomicI8 = AtomicI8::new(0);
 static CHIP: Mutex<Option<usize>> = Mutex::new(None);
 
-/// Same mask as the overlay: click/drag must not activate Fastab.
+/// Same mask as the overlay: click/drag must not activate FasTab.
 const NS_WINDOW_STYLE_NONACTIVATING_PANEL: u64 = 1 << 7;
 const NS_WINDOW_ANIMATION_BEHAVIOR_NONE: i64 = 2;
 const NS_MODAL_PANEL_WINDOW_LEVEL: i64 = 8;
@@ -1119,7 +1119,7 @@ fn app_display_name() -> String {
             }
         }
     }
-    "Fastab".into()
+    "FasTab".into()
 }
 
 /// `addSubview:` retains. Drop the extra `alloc`/`new` retain so releasing

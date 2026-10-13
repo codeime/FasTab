@@ -5,11 +5,12 @@ set -euo pipefail
 # Fastab-only. Easy Complete is a sibling product and is left installed.
 
 APP_NAME="fastab"
-APP_DISPLAY="Fastab"
+APP_DISPLAY="FasTab"
+APP_BUNDLE_NAME="Fastab.app"
 BUNDLE_ID="app.fastab"
 IME_BUNDLE_ID="app.fastab.inputmethod"
 
-APP_BUNDLE="/Applications/${APP_DISPLAY}.app"
+APP_BUNDLE="/Applications/${APP_BUNDLE_NAME}"
 LOCAL_BIN="${HOME}/.local/bin"
 LAUNCH_AGENTS="${HOME}/Library/LaunchAgents"
 PLIST_PATH="${LAUNCH_AGENTS}/${BUNDLE_ID}.plist"
@@ -29,15 +30,15 @@ error() { echo -e "${RED}==>${NC} $*" >&2; }
 if [[ "${1:-}" != "--yes" ]]; then
   echo ""
   warn "This will completely remove ${APP_DISPLAY} and all its data."
-  echo "  • /Applications/${APP_DISPLAY}.app"
+  echo "  • /Applications/${APP_BUNDLE_NAME}"
   echo "  • ${IME_SYMLINK}"
   echo "  • ${PLIST_PATH}"
-  echo "  • ${LOCAL_BIN}/ftab, Fastab's fterm/fastabterm links, and <shell> (fterm/fastabterm) copies"
+  echo "  • ${LOCAL_BIN}/ftab, FasTab's fterm/fastabterm links, and <shell> (fterm/fastabterm) copies"
   echo "  • ${APP_SUPPORT}/"
   echo "  • ${CACHE_DIR}/"
   echo "  • ${TMP_ROOT}/ftablog"
-  echo "  • Fastab shell integration lines in ~/.zshrc / ~/.bashrc / ~/.config/fish/config.fish"
-  echo "  • Fastab SSH Include in ~/.ssh/config"
+  echo "  • FasTab shell integration lines in ~/.zshrc / ~/.bashrc / ~/.config/fish/config.fish"
+  echo "  • FasTab SSH Include in ~/.ssh/config"
   echo ""
   echo "  Easy Complete is not touched."
   echo ""
@@ -102,7 +103,7 @@ fi
 info "Input Method palette entries were removed in-process (no HIToolbox domain rewrite)."
 
 # ── 5. Remove app bundle ───────────────────────────────────────────────────────
-info "Removing /Applications/${APP_DISPLAY}.app..."
+info "Removing /Applications/${APP_BUNDLE_NAME}..."
 rm -rf "$APP_BUNDLE"
 
 # ── 6. Remove CLI symlinks ─────────────────────────────────────────────────────
@@ -212,7 +213,7 @@ security delete-generic-password -s "$BUNDLE_ID" 2>/dev/null || true
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
-info "Fastab has been fully uninstalled."
+info "FasTab has been fully uninstalled."
 echo ""
 echo "  To remove the ~/.local/bin directory itself (if empty):"
 echo "    rmdir ~/.local/bin 2>/dev/null"

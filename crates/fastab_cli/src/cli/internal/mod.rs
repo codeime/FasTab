@@ -113,9 +113,9 @@ pub enum InternalSubcommand {
     LocalState(local_state::LocalStateArgs),
     /// Callback used for the internal pseudoterminal
     Callback(CallbackArgs),
-    /// Install the Fastab cli
+    /// Install the FasTab cli
     Install(InstallArgs),
-    /// Uninstall the Fastab cli
+    /// Uninstall the FasTab cli
     Uninstall {
         /// Uninstall only the shell integrations
         #[arg(long)]

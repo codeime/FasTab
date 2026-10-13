@@ -27,7 +27,11 @@ pub fn is_product_url_scheme(scheme: &str) -> bool {
     scheme == URL_SCHEMA
 }
 
-pub const PRODUCT_NAME: &str = "Fastab";
+pub const PRODUCT_NAME: &str = "FasTab";
+
+/// Stable marker written into shell and SSH configuration files. Keep it independent
+/// of the display name so existing integrations remain recognizable on uninstall.
+pub const INTEGRATION_MARKER_NAME: &str = "Fastab";
 
 pub const RUNTIME_DIR_NAME: &str = "fastabrun";
 

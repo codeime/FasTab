@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use cfg_if::cfg_if;
 use clap::ValueEnum;
 use fastab_os_shim::Env;
-use fastab_util::{CLI_BINARY_NAME, PRODUCT_NAME, PTY_BINARY_NAME, Shell, directories};
+use fastab_util::{CLI_BINARY_NAME, INTEGRATION_MARKER_NAME, PTY_BINARY_NAME, Shell, directories};
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 
@@ -492,11 +492,11 @@ impl DotfileShellIntegration {
     #[allow(clippy::unused_self)]
     fn description(&self, when: When) -> String {
         match when {
-            When::Pre => format!("# {PRODUCT_NAME} pre block. Keep at the top of this file."),
+            When::Pre => format!("# {INTEGRATION_MARKER_NAME} pre block. Keep at the top of this file."),
             When::Post => format!(
                 // "Near" not "at": Otty (and similar) may own the absolute end of bashrc.
                 // See strip_trailing_foreign_integrations / Otty shell-integration docs.
-                "# {PRODUCT_NAME} post block. Keep near the bottom of this file."
+                "# {INTEGRATION_MARKER_NAME} post block. Keep near the bottom of this file."
             ),
         }
     }

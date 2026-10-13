@@ -121,20 +121,20 @@ fn set_sm_app_service_enabled(enabled: bool) -> Result<()> {
 
 fn sm_error_message(error: *mut Object, action: &str) -> String {
     if error.is_null() {
-        return format!("Failed to {action} the Fastab login item");
+        return format!("Failed to {action} the FasTab login item");
     }
 
     unsafe {
         let description: *mut Object = msg_send![error, localizedDescription];
         if description.is_null() {
-            return format!("Failed to {action} the Fastab login item");
+            return format!("Failed to {action} the FasTab login item");
         }
         let utf8: *const std::ffi::c_char = msg_send![description, UTF8String];
         if utf8.is_null() {
-            return format!("Failed to {action} the Fastab login item");
+            return format!("Failed to {action} the FasTab login item");
         }
         format!(
-            "Failed to {action} the Fastab login item: {}",
+            "Failed to {action} the FasTab login item: {}",
             std::ffi::CStr::from_ptr(utf8).to_string_lossy()
         )
     }
@@ -155,7 +155,7 @@ fn set_legacy_launch_agent_enabled(enabled: bool) -> Result<()> {
         .map_err(|error| Error::Custom(error.to_string().into()))?;
     let status = Command::new("launchctl").arg("load").arg(path.as_str()).status()?;
     if !status.success() {
-        return Err(Error::Custom("launchctl failed to load the Fastab LaunchAgent".into()));
+        return Err(Error::Custom("launchctl failed to load the FasTab LaunchAgent".into()));
     }
 
     Ok(())

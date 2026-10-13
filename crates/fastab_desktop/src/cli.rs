@@ -9,10 +9,10 @@ pub struct Cli {
     /// Checks the `app.launchOnStartup` setting before launching
     #[arg(long)]
     pub is_startup: bool,
-    /// Kill old Fastab instances
+    /// Kill old FasTab instances
     #[arg(long)]
     pub kill_old: bool,
-    /// Allow launching multiple Fastab instances
+    /// Allow launching multiple FasTab instances
     #[arg(long)]
     pub allow_multiple: bool,
     /// Don't attempt to update right away

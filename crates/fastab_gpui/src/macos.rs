@@ -21,7 +21,7 @@ const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: u64 = 1 << 8;
 const NS_WINDOW_COLLECTION_BEHAVIOR_STATIONARY: u64 = 1 << 4;
 
 /// Title used to find the GPUI overlay `NSWindow` without touching the dashboard.
-pub const OVERLAY_WINDOW_TITLE: &str = "Fastab Autocomplete";
+pub const OVERLAY_WINDOW_TITLE: &str = "FasTab Autocomplete";
 
 /// Invalidates queued frame requests when the overlay is hidden and lets only
 /// the newest position request bring the singleton overlay window forward.

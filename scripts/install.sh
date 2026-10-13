@@ -4,12 +4,13 @@ set -euo pipefail
 # ── Fastab macOS installer ──────────────────────────────────────────
 
 APP_NAME="fastab"          # binary / process name (no spaces)
-APP_DISPLAY="Fastab"       # human-readable / bundle directory name
+APP_DISPLAY="FasTab"       # human-readable product name
+APP_BUNDLE_NAME="Fastab.app" # stable installation path
 BUNDLE_ID="app.fastab"
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-STAGING_BUNDLE="${REPO_DIR}/build/${APP_DISPLAY}.app"
-APP_BUNDLE="/Applications/${APP_DISPLAY}.app"
+STAGING_BUNDLE="${REPO_DIR}/build/${APP_BUNDLE_NAME}"
+APP_BUNDLE="/Applications/${APP_BUNDLE_NAME}"
 LOCAL_BIN="${HOME}/.local/bin"
 
 GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -30,10 +31,10 @@ link_pty_binary() {
   if [ -L "${link}" ]; then
     case "$(readlink "${link}")" in
       "${APP_BUNDLE}/Contents/MacOS/fterm"|"${APP_BUNDLE}/Contents/MacOS/fastabterm") ;;
-      *) warn "Keeping existing ${link}; it does not belong to Fastab."; return 0 ;;
+      *) warn "Keeping existing ${link}; it does not belong to FasTab."; return 0 ;;
     esac
   elif [ -e "${link}" ]; then
-    warn "Keeping existing ${link}; it does not belong to Fastab."
+    warn "Keeping existing ${link}; it does not belong to FasTab."
     return 0
   fi
   ln -sfn "${APP_BUNDLE}/Contents/MacOS/${name}" "${link}"
@@ -77,7 +78,7 @@ stop_fastab_ime() {
     sleep 0.1
     waited=$((waited + 1))
   done
-  warn "Fastab IME did not exit; forcing it."
+  warn "FasTab IME did not exit; forcing it."
   for match in "${FASTAB_IME_MATCHES[@]}"; do
     pkill -9 -f "${match}" 2>/dev/null || true
   done
@@ -197,7 +198,7 @@ ditto "${STAGING_BUNDLE}" "${APP_BUNDLE}"
 # ── 4. Symlink CLI binaries to ~/.local/bin ───────────────────────────────────
 info "Linking binaries to ${LOCAL_BIN}..."
 mkdir -p "${LOCAL_BIN}"
-ln -sf "/Applications/${APP_DISPLAY}.app/Contents/MacOS/ftab"     "${LOCAL_BIN}/ftab"
+ln -sf "/Applications/${APP_BUNDLE_NAME}/Contents/MacOS/ftab"     "${LOCAL_BIN}/ftab"
 link_pty_binary fterm
 link_pty_binary fastabterm
 
@@ -241,24 +242,24 @@ if [ "${desktop_changed}" -eq 1 ]; then
       info "Accessibility grant did not survive; resetting it..."
       tccutil reset Accessibility "${BUNDLE_ID}" 2>/dev/null || true
       accessibility_reset=1
-      warn "Open Fastab Settings and click Grant Accessibility."
+      warn "Open FasTab Settings and click Grant Accessibility."
       ;;
     *)
       warn "Could not reach the desktop app to check its Accessibility grant. Once it is running, run:"
       warn "  ftab debug accessibility status"
-      warn "If it reports false, open Fastab Settings and click Grant Accessibility."
+      warn "If it reports false, open FasTab Settings and click Grant Accessibility."
       ;;
   esac
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
-info "Installation complete!"
+info "${APP_DISPLAY} installation complete!"
 echo ""
-echo "  App:  /Applications/${APP_DISPLAY}.app"
+echo "  App:  /Applications/${APP_BUNDLE_NAME}"
 echo "  CLI:  ${LOCAL_BIN}/ftab  ($(ftab --version 2>/dev/null || echo 'restart shell to verify'))"
 echo ""
 if [ "${accessibility_reset}" -eq 1 ]; then
-  echo "  If autocomplete does not appear, open Fastab Settings and click"
-  echo "    Grant Accessibility, then drag Fastab into the list."
+  echo "  If autocomplete does not appear, open FasTab Settings and click"
+  echo "    Grant Accessibility, then drag FasTab into the list."
 fi

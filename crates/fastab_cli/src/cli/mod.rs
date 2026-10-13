@@ -69,7 +69,7 @@ pub enum Processes {
     App,
 }
 
-/// The Fastab CLI
+/// The FasTab CLI
 #[deny(missing_docs)]
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum CliRootCommands {

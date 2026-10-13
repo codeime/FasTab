@@ -254,7 +254,7 @@ fn page_header(section: Section, zh: bool, chrome: Chrome) -> impl IntoElement {
         (Section::Appearance, true) => ("外观", "分别设置界面与终端补全提示的外观"),
         (Section::Appearance, false) => ("Appearance", "Personalize settings and your terminal completions"),
         (Section::Behavior, true) => ("行为", "调整启动方式、补全习惯与键盘操作"),
-        (Section::Behavior, false) => ("Behavior", "Choose how Fastab starts and responds as you type"),
+        (Section::Behavior, false) => ("Behavior", "Choose how FasTab starts and responds as you type"),
         (Section::Ai, true) => ("AI", "配置 Jev 推荐、服务商和密钥"),
         (Section::Ai, false) => ("AI", "Jev recommendations, providers, and API keys"),
         (Section::About, true) => ("关于", "版本、更新与支持"),
@@ -376,7 +376,7 @@ fn sidebar(section: Section, zh: bool, chrome: Chrome, entity: Entity<SettingsWi
                 .py(px(20.))
                 .text_size(px(11.))
                 .text_color(rgb(chrome.muted))
-                .child("Fastab")
+                .child("FasTab")
                 .child(div().mt(px(3.)).child(env!("CARGO_PKG_VERSION"))),
         )
 }
@@ -1176,9 +1176,9 @@ fn behavior_page(
                         "Show Menu Bar Icon"
                     },
                     Some(if zh {
-                        "隐藏后，再次启动 Fastab 可打开设置"
+                        "隐藏后，再次启动 FasTab 可打开设置"
                     } else {
-                        "When hidden, launch Fastab again to open settings"
+                        "When hidden, launch FasTab again to open settings"
                     }),
                     show_menubar_icon,
                     chrome,
@@ -1494,7 +1494,7 @@ fn about_page(zh: bool, chrome: Chrome, entity: Entity<SettingsWindow>, copied_d
         .flex()
         .flex_col()
         .child(card(
-            "Fastab",
+            "FasTab",
             chrome,
             div()
                 .px(px(16.))
@@ -1503,7 +1503,7 @@ fn about_page(zh: bool, chrome: Chrome, entity: Entity<SettingsWindow>, copied_d
                     div()
                         .text_size(px(20.))
                         .font_weight(gpui::FontWeight::BOLD)
-                        .child("Fastab"),
+                        .child("FasTab"),
                 )
                 .child(div().mt(px(4.)).text_color(rgb(chrome.muted)).child(if zh {
                     "适用于 macOS 的终端自动补全".to_string()
@@ -1520,7 +1520,7 @@ fn about_page(zh: bool, chrome: Chrome, entity: Entity<SettingsWindow>, copied_d
                             format!("{} {version}", if zh { "版本" } else { "Version" }),
                             chrome,
                             move |cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(format!("Fastab {version}")));
+                                cx.write_to_clipboard(ClipboardItem::new_string(format!("FasTab {version}")));
                                 entity_copy.update(cx, |_, cx| cx.notify());
                             },
                         ))
@@ -1712,9 +1712,9 @@ fn accessibility_hint(zh: bool) -> &'static str {
     #[cfg(not(target_os = "macos"))]
     {
         if zh {
-            "用于读取当前聚焦的终端窗口并定位补全弹窗。点击后打开系统设置；列表里失效的旧条目会先被移除，再把 Fastab 拖进旁边的列表。Fastab 有自己的 TCC 身份，可以和 Easy Complete 并排安装。"
+            "用于读取当前聚焦的终端窗口并定位补全弹窗。点击后打开系统设置；列表里失效的旧条目会先被移除，再把 FasTab 拖进旁边的列表。FasTab 有自己的 TCC 身份，可以和 Easy Complete 并排安装。"
         } else {
-            "Required to read the focused terminal window and position completions. Click to open System Settings. A stale list row is removed first, then drag Fastab into the list beside the card. Fastab has its own TCC identity and can sit beside Easy Complete."
+            "Required to read the focused terminal window and position completions. Click to open System Settings. A stale list row is removed first, then drag FasTab into the list beside the card. FasTab has its own TCC identity and can sit beside Easy Complete."
         }
     }
 }
@@ -1729,22 +1729,22 @@ fn perm_label(id: PermId, zh: bool) -> (&'static str, &'static str, &'static str
         ),
         (PermId::Shell, true) => (
             "Shell 集成",
-            "向 .zshrc / .bashrc 注入钩子，使 Fastab 能够跟踪 Shell 状态。",
+            "向 .zshrc / .bashrc 注入钩子，使 FasTab 能够跟踪 Shell 状态。",
             "安装 Shell 钩子",
         ),
         (PermId::Shell, false) => (
             "Shell Integration",
-            "Injects hooks into .zshrc / .bashrc so Fastab can track your shell state.",
+            "Injects hooks into .zshrc / .bashrc so FasTab can track your shell state.",
             "Install Shell Hooks",
         ),
         (PermId::InputMethod, true) => (
             "输入法集成",
-            "可选：用于 Kitty、Alacritty、Zed、Ghostty、WezTerm 和 Otty 的光标跟踪。启用后随 Fastab 启动自动恢复。",
+            "可选：用于 Kitty、Alacritty、Zed、Ghostty、WezTerm 和 Otty 的光标跟踪。启用后随 FasTab 启动自动恢复。",
             "启用输入法",
         ),
         (PermId::InputMethod, false) => (
             "Input Method",
-            "Optional cursor tracking in Kitty, Alacritty, Zed, Ghostty, WezTerm, and Otty. Restored automatically when Fastab starts.",
+            "Optional cursor tracking in Kitty, Alacritty, Zed, Ghostty, WezTerm, and Otty. Restored automatically when FasTab starts.",
             "Enable Input Method",
         ),
     }

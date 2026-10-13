@@ -6,7 +6,7 @@ set -euo pipefail
 # Expects build/Fastab.app to already exist (run scripts/build-app.sh
 # first). Produces a drag-to-install DMG with a custom background image.
 #
-# Background images (committed to the repo):
+# Background images (regenerated from source when packaging):
 #   bundle/dmg/background.png    — 1×
 #   bundle/dmg/background@2x.png — 2× (Retina)
 # To regenerate them: swift scripts/make-dmg-background.swift
@@ -14,11 +14,11 @@ set -euo pipefail
 # Usage: scripts/make-dmg.sh [output.dmg]
 #   Default output: dist/Fastab.dmg
 
-APP_DISPLAY="Fastab"
-VOL_NAME="Fastab"
+APP_BUNDLE_NAME="Fastab.app"
+VOL_NAME="FasTab"
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP="${REPO_DIR}/build/${APP_DISPLAY}.app"
+APP="${REPO_DIR}/build/${APP_BUNDLE_NAME}"
 OUT="${1:-${REPO_DIR}/dist/Fastab.dmg}"
 BG="${REPO_DIR}/bundle/dmg/background.png"
 
@@ -26,6 +26,9 @@ GREEN='\033[0;32m'; NC='\033[0m'
 info() { echo -e "${GREEN}==>${NC} $*"; }
 
 [ -d "$APP" ] || { echo "error: $APP not found — run scripts/build-app.sh first" >&2; exit 1; }
+# Keep the baked-in title in sync with the product name. This runs only in the
+# packaging environment, alongside the existing native build tools.
+swift "${REPO_DIR}/scripts/make-dmg-background.swift"
 [ -f "$BG" ]  || { echo "error: $BG not found — run: swift scripts/make-dmg-background.swift" >&2; exit 1; }
 
 "${REPO_DIR}/scripts/verify-license-bundle.sh" "$APP"
@@ -58,8 +61,8 @@ create-dmg \
   --window-pos      200 120 \
   --window-size     658 498 \
   --icon-size       128 \
-  --icon            "${APP_DISPLAY}.app" 165 236 \
-  --hide-extension  "${APP_DISPLAY}.app" \
+  --icon            "$APP_BUNDLE_NAME" 165 236 \
+  --hide-extension  "$APP_BUNDLE_NAME" \
   --app-drop-link   495 236 \
   --no-internet-enable \
   "$OUT" \

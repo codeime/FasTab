@@ -53,7 +53,7 @@ func renderBackground(scale: CGFloat) -> Data {
     // ── Title ─────────────────────────────────────────────────────────────────
     // ~100 pt from top  →  centerY = 460 − 100 = 360
     draw(
-        "Fastab",
+        "FasTab",
         font: NSFont.systemFont(ofSize: 30, weight: .semibold),
         color: NSColor(srgbRed: 0.10, green: 0.10, blue: 0.10, alpha: 1),
         centerY: 358

@@ -1,7 +1,7 @@
 //! Manual overlay driver: inject figterm edit-buffer hooks so the running
 //! desktop app shows the suggestion list without a real terminal.
 //!
-//! This is a live-app smoke tool, not a `cargo test`. It needs Fastab
+//! This is a live-app smoke tool, not a `cargo test`. It needs FasTab
 //! running (`remote.sock` + `desktop.sock`). Buffers are sent one character
 //! at a time so the overlay does not treat the change as a paste.
 
@@ -74,7 +74,7 @@ pub async fn execute(args: &DriveOverlayArgs) -> Result<ExitCode> {
     let remote_path = directories::remote_socket_path()?;
     let desktop_path = directories::desktop_socket_path()?;
     if !remote_path.exists() || !desktop_path.exists() {
-        bail!("Fastab is not running (missing {remote_path:?} or {desktop_path:?})");
+        bail!("FasTab is not running (missing {remote_path:?} or {desktop_path:?})");
     }
 
     let session_frames = args.session.as_deref().map(load_session_frames).transpose()?;

@@ -416,8 +416,6 @@ pub async fn get_file_type(ctx: &Context, variant: &Variant) -> Result<FileType,
 mod tests {
     use std::str::FromStr;
 
-    use fastab_util::PRODUCT_NAME;
-
     use super::*;
 
     macro_rules! test_ser_deser {
@@ -459,10 +457,7 @@ mod tests {
 
     #[test]
     fn test_product_name() {
-        assert_eq!(
-            serde_json::to_string(&ProductName::default()).unwrap(),
-            format!("\"{}\"", PRODUCT_NAME)
-        );
+        assert_eq!(serde_json::to_string(&ProductName::default()).unwrap(), "\"Fastab\"");
     }
 
     #[test]

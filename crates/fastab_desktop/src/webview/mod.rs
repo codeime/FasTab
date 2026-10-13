@@ -24,7 +24,7 @@ use crate::{EventLoopProxy, EventLoopWindowTarget, file_watcher, local_ipc};
 
 pub const DASHBOARD_SIZE: LogicalSize<f64> = LogicalSize::new(820.0, 640.0);
 
-pub const AUTOCOMPLETE_WINDOW_TITLE: &str = "Fastab Autocomplete";
+pub const AUTOCOMPLETE_WINDOW_TITLE: &str = "FasTab Autocomplete";
 
 fn map_theme(theme: &str) -> Option<TaoTheme> {
     match theme {

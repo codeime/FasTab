@@ -11,7 +11,8 @@ set -euo pipefail
 # Output: build/Fastab.app  (ad-hoc code-signed)
 
 APP_NAME="fastab"          # binary / process name (no spaces)
-APP_DISPLAY="Fastab"       # human-readable / bundle directory name
+APP_DISPLAY="FasTab"       # localized, human-readable product name
+APP_BUNDLE_NAME="Fastab.app" # stable installation path across display-name changes
 BUNDLE_ID="app.fastab"
 APP_CATEGORY="public.app-category.productivity"   # Finder / Launchpad "Developer Tools"
 COPYRIGHT="${COPYRIGHT:-© 2026 Fastab contributors}"
@@ -54,7 +55,7 @@ fi
 
 VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(next(pkg['version'] for pkg in json.load(sys.stdin)['packages'] if pkg['name'] == 'fastab_desktop'))")
 
-FINAL_BUNDLE="${REPO_DIR}/build/${APP_DISPLAY}.app"
+FINAL_BUNDLE="${REPO_DIR}/build/${APP_BUNDLE_NAME}"
 SPARKLE_APPCAST_URL="${SPARKLE_APPCAST_URL:-$DEFAULT_SPARKLE_APPCAST_URL}"
 SPARKLE_AUTOMATIC_CHECKS="${SPARKLE_AUTOMATIC_CHECKS:-}"
 if [ -z "$SPARKLE_AUTOMATIC_CHECKS" ]; then
@@ -80,7 +81,7 @@ cd "$REPO_DIR"
 
 mkdir -p "${REPO_DIR}/build"
 BUILD_WORK_ROOT="$(mktemp -d "${REPO_DIR}/build/.specs-inputs.XXXXXX")"
-STAGING_BUNDLE="${BUILD_WORK_ROOT}/${APP_DISPLAY}.app"
+STAGING_BUNDLE="${BUILD_WORK_ROOT}/${APP_BUNDLE_NAME}"
 MACOS_DIR="${STAGING_BUNDLE}/Contents/MacOS"
 RESOURCES_DIR="${STAGING_BUNDLE}/Contents/Resources"
 FRAMEWORKS_DIR="${STAGING_BUNDLE}/Contents/Frameworks"
@@ -229,7 +230,7 @@ if [ "$BUILD_HELPER_STATUS" -ne 0 ]; then
   exit "$BUILD_HELPER_STATUS"
 fi
 
-info "Assembling '${APP_DISPLAY}.app'..."
+info "Assembling '${APP_BUNDLE_NAME}' (${APP_DISPLAY})..."
 mkdir -p "$MACOS_DIR"
 mkdir -p "${RESOURCES_DIR}/themes"
 
@@ -349,9 +350,11 @@ cat > "${STAGING_BUNDLE}/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundleName</key>
-    <string>${APP_DISPLAY}</string>
+    <string>${APP_BUNDLE_NAME%.app}</string>
     <key>CFBundleDisplayName</key>
-    <string>${APP_DISPLAY}</string>
+    <string>${APP_BUNDLE_NAME%.app}</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
     <key>CFBundleExecutable</key>
     <string>${APP_NAME}</string>
     <key>CFBundleVersion</key>
@@ -397,6 +400,14 @@ ${SPARKLE_PLIST_ENTRIES}
 </dict>
 </plist>
 PLIST
+
+# Finder uses localized names only when the base name matches the bundle path.
+# Keep that path stable; the development language supplies the name in all locales.
+mkdir -p "${RESOURCES_DIR}/en.lproj"
+cat > "${RESOURCES_DIR}/en.lproj/InfoPlist.strings" <<STRINGS
+"CFBundleName" = "${APP_DISPLAY}";
+"CFBundleDisplayName" = "${APP_DISPLAY}";
+STRINGS
 
 # Copy app icon to Resources. This is the only app icon in the bundle.
 cp "${REPO_DIR}/crates/fastab_desktop/icons/icon.icns" "${RESOURCES_DIR}/icon.icns"

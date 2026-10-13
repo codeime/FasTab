@@ -99,7 +99,7 @@ mod tests {
         let desktop = fastab_util::directories::desktop_socket_path().expect("desktop socket path");
         assert!(
             remote.exists() && desktop.exists(),
-            "EC_OVERLAY_SESSION_LIVE set but Fastab sockets are missing"
+            "EC_OVERLAY_SESSION_LIVE set but FasTab sockets are missing"
         );
     }
 }

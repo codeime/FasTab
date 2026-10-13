@@ -196,7 +196,7 @@ jobs:
           ./scripts/build-app.sh
           ./scripts/assert-no-runtime-js.sh "build/Fastab.app/Contents/Resources"
 
-      - name: Verify built app version
+      - name: Verify built app version and display name
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
@@ -208,6 +208,14 @@ jobs:
             echo "Built app version ($short_version, $bundle_version) does not match release tag $GITHUB_REF_NAME." >&2
             exit 1
           fi
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$plist")" = "app.fastab"
+          test "$(plutil -extract CFBundleExecutable raw -o - "$plist")" = "fastab"
+          test "$(plutil -extract CFBundleName raw -o - "$plist")" = "Fastab"
+          test "$(plutil -extract CFBundleDisplayName raw -o - "$plist")" = "Fastab"
+          test "$(plutil -extract CFBundleDevelopmentRegion raw -o - "$plist")" = "en"
+          names="build/Fastab.app/Contents/Resources/en.lproj/InfoPlist.strings"
+          test "$(plutil -extract CFBundleName raw -o - "$names")" = "FasTab"
+          test "$(plutil -extract CFBundleDisplayName raw -o - "$names")" = "FasTab"
 
       - name: Sign app bundle
         if: startsWith(github.ref, 'refs/tags/') && steps.caps.outputs.signing == 'true'
@@ -227,6 +235,8 @@ jobs:
           hdiutil attach dist/Fastab-arm64.dmg -readonly -nobrowse -mountpoint "$MOUNT_DIR" >/dev/null
           trap 'hdiutil detach "$MOUNT_DIR" >/dev/null || true' EXIT
           ./scripts/verify-license-bundle.sh "$MOUNT_DIR/Fastab.app"
+          names="$MOUNT_DIR/Fastab.app/Contents/Resources/en.lproj/InfoPlist.strings"
+          test "$(plutil -extract CFBundleDisplayName raw -o - "$names")" = "FasTab"
           test ! -e "$MOUNT_DIR/Licenses"
 
       - name: Notarize DMG
@@ -415,10 +425,10 @@ jobs:
           {
             cat dist/changelog-notes.md
             printf '\n---\n\n### Install\n\n'
-            printf '%s\n' "1. Download \`Fastab-arm64.dmg\`, open it, and drag **Fastab** to Applications."
+            printf '%s\n' "1. Download \`Fastab-arm64.dmg\`, open it, and drag **FasTab** to Applications."
             if [ "$SIGNING" = "true" ]; then
               cat <<'EOF'
-          2. Launch **Fastab**, open Fastab Settings, and click **Grant
+          2. Launch **FasTab**, open FasTab Settings, and click **Grant
              Accessibility**. Follow the drag guide in System Settings -> Privacy &
              Security -> Device Control and Data Access (named Accessibility on macOS 26
              and earlier). The input method is optional and can be installed in Settings.
@@ -433,7 +443,7 @@ jobs:
              xattr -dr com.apple.quarantine "/Applications/Fastab.app"
              ```
 
-          3. Launch **Fastab**, open Fastab Settings, and click **Grant
+          3. Launch **FasTab**, open FasTab Settings, and click **Grant
              Accessibility**. Follow the drag guide in System Settings -> Privacy &
              Security -> Device Control and Data Access (named Accessibility on macOS 26
              and earlier). The input method is optional and can be installed in Settings.
@@ -497,7 +507,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PRODUCT_NAME: Fastab
+          PRODUCT_NAME: FasTab
           BUILD_RESULT: ${{ job.status }}
           GH_ACTOR: ${{ github.actor }}
           GH_REF: ${{ github.ref_name }}
