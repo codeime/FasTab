@@ -269,16 +269,15 @@ pub fn fuzzy_indexes(name: &str, query: &str) -> Option<Vec<usize>> {
         return Some(Vec::new());
     }
     let chars: Vec<char> = name.chars().collect();
-    let lower: Vec<char> = chars.iter().map(|ch| ch.to_ascii_lowercase()).collect();
     let search: Vec<char> = query.chars().map(|ch| ch.to_ascii_lowercase()).collect();
     let mut indexes = Vec::with_capacity(search.len());
     let mut pos = 0;
     for needle in &search {
-        let found = lower
+        let found = chars
             .iter()
             .enumerate()
             .skip(pos)
-            .find(|(_, haystack)| **haystack == *needle)
+            .find(|(_, haystack)| haystack.to_ascii_lowercase() == *needle)
             .map(|(index, _)| index)?;
         indexes.push(found);
         pos = found + 1;
@@ -308,7 +307,7 @@ pub fn fuzzy_indexes(name: &str, query: &str) -> Option<Vec<usize>> {
             search_i -= 1;
             let last_match = strict[search_i];
             target_i = next_beginning[last_match];
-        } else if search[search_i] == lower[target_i] {
+        } else if search[search_i] == chars[target_i].to_ascii_lowercase() {
             strict[search_i] = target_i;
             search_i += 1;
             if search_i == search.len() {
@@ -728,7 +727,6 @@ fn merge_runs(runs: Vec<TextRun>) -> Vec<TextRun> {
 }
 
 pub fn name_runs(name: &str, search: &str, fuzzy: bool, common_prefix: &str) -> Vec<TextRun> {
-    let chars: Vec<char> = name.chars().collect();
     let mut runs = if search.is_empty() {
         vec![TextRun {
             text: name.to_string(),
@@ -737,27 +735,47 @@ pub fn name_runs(name: &str, search: &str, fuzzy: bool, common_prefix: &str) -> 
     } else if fuzzy {
         match fuzzy_indexes(name, search) {
             Some(indexes) => {
-                let marked: std::collections::HashSet<usize> = indexes.into_iter().collect();
-                chars
-                    .iter()
-                    .enumerate()
-                    .map(|(index, ch)| TextRun {
-                        text: ch.to_string(),
-                        kind: if marked.contains(&index) {
-                            RunKind::Match
-                        } else {
-                            RunKind::Text
-                        },
-                    })
-                    .collect()
+                // Fuzzy positions are ordered character indexes. Form each
+                // contiguous run from the original UTF-8 byte range instead
+                // of allocating one String per character and merging later.
+                let mut marked = indexes.into_iter().peekable();
+                let mut runs = Vec::new();
+                let mut start = 0;
+                let mut kind = RunKind::Text;
+                for (index, (byte, _)) in name.char_indices().enumerate() {
+                    let next_kind = if marked.peek() == Some(&index) {
+                        marked.next();
+                        RunKind::Match
+                    } else {
+                        RunKind::Text
+                    };
+                    if next_kind != kind {
+                        if byte > start {
+                            runs.push(TextRun {
+                                text: name[start..byte].to_string(),
+                                kind,
+                            });
+                        }
+                        start = byte;
+                        kind = next_kind;
+                    }
+                }
+                if start < name.len() {
+                    runs.push(TextRun {
+                        text: name[start..].to_string(),
+                        kind,
+                    });
+                }
+                runs
             },
             None => vec![TextRun {
                 text: name.to_string(),
                 kind: RunKind::Text,
             }],
         }
-    } else if match_prefix_bytes(name, search) > 0 {
-        let bytes = match_prefix_bytes(name, search);
+    } else if let bytes = match_prefix_bytes(name, search)
+        && bytes > 0
+    {
         vec![
             TextRun {
                 text: name[..bytes].to_string(),
@@ -1217,7 +1235,10 @@ fn suggestion_row(
     );
     match_bg.a = 0.8;
     let match_text = brightness(text, 0.95 * 1.25);
-    let click_item = item.clone();
+    // A frame owns only a revision and row index. The result revision changes
+    // even for metadata-only refreshes; AI reordering changes the second part.
+    // Validate both before looking up the row, then clone only on an actual click.
+    let click_revision = state.read(cx).icon_request_revision();
     let title_name = visible_suggestion_title(item, typed);
     let highlight = if is_fileish(&item.kind) {
         strip_typed_directory_prefix(search_term, typed)
@@ -1380,6 +1401,10 @@ fn suggestion_row(
         // matching the old acceptance timing this avoids accepting a row when
         // the user presses and drags out of it before releasing.
         .on_click(move |_event, _window, cx| {
+            let Some(click_item) = click_insert_at_revision(state.read(cx), click_revision, ix, &insertion_search_term)
+            else {
+                return;
+            };
             state.update(cx, |overlay, cx| {
                 overlay.invalidate_ai_request();
                 overlay.selected = ix;
@@ -1387,7 +1412,7 @@ fn suggestion_row(
                 cx.notify();
             });
             if let Some(insert) = &click {
-                insert(click_insert_for(&click_item, &insertion_search_term));
+                insert(click_item);
             }
         })
         .into_any_element()
@@ -1470,6 +1495,21 @@ fn click_insert_for(item: &SuggestionItem, raw_search_term: &str) -> ClickInsert
         argument_value: item.argument_value,
         acceptance_scope: item.acceptance_scope.clone(),
     }
+}
+
+fn click_insert_at_revision(
+    overlay: &OverlayState,
+    revision: (u64, u64),
+    index: usize,
+    raw_search_term: &str,
+) -> Option<ClickInsert> {
+    if !overlay.visible || overlay.icon_request_revision() != revision || overlay.search_term != raw_search_term {
+        return None;
+    }
+    overlay
+        .items
+        .get(index)
+        .map(|item| click_insert_for(item, raw_search_term))
 }
 
 fn row_icon(kind: &str, png: Option<Arc<RenderImage>>, icon_identifier: Option<&str>, size: f32) -> impl IntoElement {
@@ -2231,6 +2271,75 @@ mod tests {
     fn fuzzy_indexes_prefer_word_boundaries_and_consecutive_matches() {
         assert_eq!(fuzzy_indexes("fooBar", "fb"), Some(vec![0, 3]));
         assert_eq!(fuzzy_indexes("aXab", "ab"), Some(vec![0, 3]));
+    }
+
+    #[test]
+    fn unicode_highlight_runs_preserve_bytes_and_ascii_only_case_matching() {
+        for (name, query) in [
+            ("é中🦀Ab", "中A"),
+            ("e\u{301}clair", "e\u{301}c"),
+            ("fooBar", "fb"),
+            ("Éclair", "é"),
+            ("alpha", ""),
+            ("", "x"),
+        ] {
+            let indexes = fuzzy_indexes(name, query).unwrap_or_default();
+            let runs = name_runs(name, query, true, "");
+            assert_eq!(runs.iter().map(|run| run.text.as_str()).collect::<String>(), name);
+            let expected: String = name
+                .chars()
+                .enumerate()
+                .filter(|(index, _)| indexes.contains(index))
+                .map(|(_, ch)| ch)
+                .collect();
+            let matched: String = runs
+                .iter()
+                .filter(|run| run.kind == RunKind::Match)
+                .map(|run| run.text.as_str())
+                .collect();
+            assert_eq!(matched, expected, "{name}/{query}");
+            assert!(runs.windows(2).all(|pair| pair[0].kind != pair[1].kind));
+        }
+        assert_eq!(fuzzy_indexes("Éclair", "é"), None);
+        let runs = name_runs("中Abc", "中a", false, "中Ab");
+        assert_eq!(
+            runs.iter().map(|run| (run.text.as_str(), run.kind)).collect::<Vec<_>>(),
+            [("中A", RunKind::Match), ("b", RunKind::Prefix), ("c", RunKind::Text)]
+        );
+    }
+
+    #[test]
+    fn row_click_snapshot_rejects_refresh_reorder_and_hidden_content() {
+        let mut overlay = OverlayState::default();
+        overlay.set_suggestions(vec![item("first", "arg"), item("second", "arg")], "f".into());
+        let first_frame = overlay.icon_request_revision();
+        assert_eq!(
+            click_insert_at_revision(&overlay, first_frame, 0, "f").unwrap().name,
+            "first"
+        );
+
+        let mut changed = item("first", "arg");
+        changed.should_add_space = true;
+        // A metadata-only refresh keeps the scroll revision but must retire
+        // the old frame's click: insertion semantics may have changed.
+        overlay.set_suggestions(vec![changed, item("second", "arg")], "f".into());
+        assert_eq!(first_frame.1, overlay.icon_request_revision().1);
+        assert!(click_insert_at_revision(&overlay, first_frame, 0, "f").is_none());
+        let refreshed = overlay.icon_request_revision();
+        assert!(
+            click_insert_at_revision(&overlay, refreshed, 0, "f")
+                .unwrap()
+                .should_add_space
+        );
+        assert!(overlay.promote_ai_suggestion(1));
+        assert!(click_insert_at_revision(&overlay, refreshed, 0, "f").is_none());
+        let promoted = overlay.icon_request_revision();
+        assert_eq!(
+            click_insert_at_revision(&overlay, promoted, 0, "f").unwrap().name,
+            "second"
+        );
+        overlay.hide();
+        assert!(click_insert_at_revision(&overlay, promoted, 0, "f").is_none());
     }
 
     #[test]

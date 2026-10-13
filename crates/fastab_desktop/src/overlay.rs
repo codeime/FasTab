@@ -132,6 +132,9 @@ pub struct OverlayController {
     last_input: Arc<Mutex<Option<LastInput>>>,
     completion_display: CompletionDisplayState,
     show_intent: Option<ShowIntent>,
+    /// Own the outer debounce future so obsolete input releases its payload
+    /// immediately. GPUI's already-enqueued native timer may still wake later.
+    debounce_task: Option<gpui::Task<()>>,
     /// Keep explicit Show's argument visibility through same-input debounce
     /// follow-ups after the first displayed rows have consumed its Tab.
     explicit_show_pending: bool,
@@ -254,6 +257,7 @@ impl OverlayController {
             last_input: Arc::new(Mutex::new(None)),
             completion_display: CompletionDisplayState::Idle,
             show_intent: None,
+            debounce_task: None,
             explicit_show_pending: false,
             show_token: 0,
             self_insertion: Arc::new(Mutex::new(None)),
@@ -285,7 +289,8 @@ impl OverlayController {
         self.layout_retry_token.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn bump_generation(&self) -> u64 {
+    fn bump_generation(&mut self) -> u64 {
+        self.debounce_task = None;
         self.generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 
@@ -343,7 +348,7 @@ impl OverlayController {
 
     /// Record the session that owns the overlay. Returns `true` only for a
     /// switch between two real sessions (not the initial assignment).
-    fn set_session(&self, session_id: Uuid) -> bool {
+    fn set_session(&mut self, session_id: Uuid) -> bool {
         let (changed, switched) = {
             let mut current = self.session_id.lock().unwrap_or_else(|err| err.into_inner());
             let switched = current.is_some() && *current != Some(session_id);
@@ -401,6 +406,7 @@ impl OverlayController {
     }
 
     fn retire_completion(&mut self) {
+        self.debounce_task = None;
         self.explicit_show_pending = false;
         self.completion_display = CompletionDisplayState::Idle;
         if let Some(session) = self.current_session() {
@@ -1273,18 +1279,21 @@ impl OverlayController {
         }
         self.schedule_jev(ai_candidates, cx);
         if let Some(delay_ms) = pending {
-            let generation = self.generation.load(Ordering::Relaxed);
-            let proxy = self.proxy.clone();
-            let executor = cx.background_executor().clone();
-            cx.spawn(async move |_cx| {
-                executor.timer(Duration::from_millis(delay_ms)).await;
-                let _ = proxy.send_event(Event::GpuiOverlayDebouncedComplete {
-                    generation,
-                    waited_ms: delay_ms,
-                });
-            })
-            .detach();
+            self.schedule_debounce(delay_ms, cx);
         }
+    }
+
+    fn schedule_debounce(&mut self, delay_ms: u64, cx: &mut App) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        let proxy = self.proxy.clone();
+        let executor = cx.background_executor().clone();
+        self.debounce_task = Some(cx.spawn(async move |_cx| {
+            executor.timer(Duration::from_millis(delay_ms)).await;
+            let _ = proxy.send_event(Event::GpuiOverlayDebouncedComplete {
+                generation,
+                waited_ms: delay_ms,
+            });
+        }));
     }
 
     /// The debounce elapsed: run the generators the last result deferred.
@@ -1298,6 +1307,7 @@ impl OverlayController {
         {
             return;
         }
+        self.debounce_task = None;
         let loading_threshold = LOADING_THRESHOLD.saturating_sub(Duration::from_millis(waited_ms));
         self.recomplete_with(
             RequestOptions {
@@ -3235,6 +3245,47 @@ fn screen_edges_containing(screens: &[(f64, f64, f64, f64)], x: f64, y: f64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn replaced_and_hidden_debounce_tasks_do_not_post_stale_events(cx: &mut gpui::TestAppContext) {
+        let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+        let specs = tempfile::tempdir().unwrap();
+        let engine = EngineClient::spawn(specs.path().to_path_buf()).unwrap();
+        let (proxy, events) = crate::event_loop::channel();
+        let platform = Arc::new(PlatformState::new(proxy.clone()));
+        let mut overlay = cx
+            .update(|cx| OverlayController::start(cx, engine, proxy, Arc::new(FigtermState::new()), platform).unwrap());
+        cx.update(|cx| overlay.schedule_debounce(60_000, cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            overlay.bump_generation();
+            overlay.schedule_debounce(100, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        let generations: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::GpuiOverlayDebouncedComplete { generation, .. } => Some(generation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(generations, [overlay.generation.load(Ordering::Relaxed)]);
+        cx.update(|cx| {
+            overlay.schedule_debounce(60_000, cx);
+            overlay.hide(cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(61));
+        cx.run_until_parked();
+        assert!(
+            events
+                .try_iter()
+                .all(|event| !matches!(event, Event::GpuiOverlayDebouncedComplete { .. }))
+        );
+        assert!(overlay.debounce_task.is_none());
+    }
 
     #[gpui::test]
     fn hidden_argument_hints_do_not_recreate_an_idle_overlay(cx: &mut gpui::TestAppContext) {

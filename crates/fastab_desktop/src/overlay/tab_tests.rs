@@ -23,7 +23,8 @@ fn presentation_refresh_preserves_temporary_and_effective_fuzzy_modes(cx: &mut g
         let platform = Arc::new(PlatformState::new(proxy.clone()));
         let session = Uuid::new_v4();
         let mut controller = cx.update(|cx| {
-            let controller = OverlayController::start(cx, engine.clone(), proxy, figterm.clone(), platform).unwrap();
+            let mut controller =
+                OverlayController::start(cx, engine.clone(), proxy, figterm.clone(), platform).unwrap();
             controller.set_session(session);
             controller.state.update(cx, |state, _| {
                 state.set_suggestions(vec![row("status", "subcommand")], "st".into());
@@ -292,7 +293,7 @@ fn default_tab_preserves_action_guards_and_normal_completion(cx: &mut gpui::Test
         intercept_global: InterceptMode::Unlocked,
     });
     let mut controller = cx.update(|cx| {
-        let controller = OverlayController::start(cx, engine, proxy, figterm.clone(), platform).unwrap();
+        let mut controller = OverlayController::start(cx, engine, proxy, figterm.clone(), platform).unwrap();
         controller.set_session(session);
         // No last_input: these acceptance checks must not write recency data.
         controller
