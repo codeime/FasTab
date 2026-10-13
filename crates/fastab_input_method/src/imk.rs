@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use objc2::mutability::InteriorMutable;
@@ -75,70 +75,75 @@ const CARET_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// keystroke starts a new one.
 const SENDER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Live only while carets are flowing; see [`SENDER_IDLE_TIMEOUT`].
-static SENDER: Mutex<Option<Sender<Vec<u8>>>> = Mutex::new(None);
+/// At most one pending frame, plus the one currently being sent. The worker
+/// retires while holding this same state lock, so enqueue cannot lose a frame
+/// between checking worker ownership and waking a thread about to exit.
+#[derive(Default)]
+struct CaretMailbox {
+    state: Mutex<CaretMailboxState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct CaretMailboxState {
+    pending: Option<Vec<u8>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+static SENDER: LazyLock<Arc<CaretMailbox>> = LazyLock::new(|| Arc::new(CaretMailbox::default()));
 
 fn enqueue_caret_frame(frame: Vec<u8>) {
-    let mut guard = SENDER.lock().unwrap_or_else(|err| err.into_inner());
-    if guard.is_none() {
-        *guard = start_caret_sender();
-    }
-    let Some(sender) = guard.as_ref() else {
-        return;
-    };
-    // Retirement takes this lock before exiting, so a disconnect here means the
-    // thread died some other way. Rebuild it and hand the frame straight over.
-    if let Err(err) = sender.send(frame) {
-        *guard = start_caret_sender();
-        if let Some(sender) = guard.as_ref() {
-            let _ = sender.send(err.0);
+    SENDER.enqueue_with(frame, |mailbox| {
+        std::thread::Builder::new()
+            .name("imk-caret".into())
+            .spawn(move || caret_sender_loop(mailbox, SENDER_IDLE_TIMEOUT, send_caret_frame))
+    });
+}
+
+impl CaretMailbox {
+    fn enqueue_with(
+        self: &Arc<Self>,
+        frame: Vec<u8>,
+        start: impl FnOnce(Arc<Self>) -> std::io::Result<JoinHandle<()>>,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        // Replace before waking the worker. Slow connect/write cannot retain
+        // a queue of obsolete carets; replacing also frees the old frame now.
+        state.pending = Some(frame);
+        if state.worker.as_ref().is_none_or(JoinHandle::is_finished) {
+            match start(self.clone()) {
+                Ok(worker) => state.worker = Some(worker),
+                Err(err) => {
+                    state.worker = None;
+                    state.pending = None;
+                    log_error!("could not start the caret sender thread: {err}");
+                    return;
+                },
+            }
         }
+        self.ready.notify_one();
+    }
+
+    fn next_frame(&self, idle_timeout: Duration) -> Option<Vec<u8>> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let (mut state, _) = self
+            .ready
+            .wait_timeout_while(state, idle_timeout, |state| state.pending.is_none())
+            .unwrap_or_else(|err| err.into_inner());
+        if state.pending.is_none() {
+            // Clear ownership atomically with the empty-slot decision. A new
+            // enqueue either fills this worker's slot or starts its successor.
+            state.worker = None;
+            return None;
+        }
+        state.pending.take()
     }
 }
 
-fn start_caret_sender() -> Option<Sender<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel();
-    match std::thread::Builder::new()
-        .name("imk-caret".into())
-        .spawn(move || caret_sender_loop(rx))
-    {
-        Ok(_) => Some(tx),
-        Err(err) => {
-            log_error!("could not start the caret sender thread: {err}");
-            None
-        },
-    }
-}
-
-fn drain_latest(rx: &Receiver<Vec<u8>>, first: Vec<u8>) -> Vec<u8> {
-    let mut latest = first;
-    while let Ok(next) = rx.try_recv() {
-        latest = next;
-    }
-    latest
-}
-
-fn caret_sender_loop(rx: Receiver<Vec<u8>>) {
-    loop {
-        let first = match rx.recv_timeout(SENDER_IDLE_TIMEOUT) {
-            Ok(frame) => frame,
-            Err(RecvTimeoutError::Timeout) => {
-                // Retire under the registry lock: an `enqueue_caret_frame` that
-                // has already taken a clone of this sender cannot then lose its
-                // frame to the exit.
-                let mut guard = SENDER.lock().unwrap_or_else(|err| err.into_inner());
-                match rx.try_recv() {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        guard.take();
-                        return;
-                    },
-                }
-            },
-            Err(RecvTimeoutError::Disconnected) => return,
-        };
-
-        send_caret_frame(&drain_latest(&rx, first));
+fn caret_sender_loop(mailbox: Arc<CaretMailbox>, idle_timeout: Duration, mut send: impl FnMut(&[u8])) {
+    while let Some(frame) = mailbox.next_frame(idle_timeout) {
+        // Never hold the mailbox mutex across filesystem/socket work.
+        send(&frame);
     }
 }
 
@@ -342,6 +347,9 @@ pub fn register_controller() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
     use super::*;
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
@@ -420,14 +428,104 @@ mod tests {
     }
 
     #[test]
-    fn caret_sender_keeps_only_the_latest_frame() {
-        let (tx, rx) = mpsc::channel();
+    fn blocked_caret_sender_retains_one_pending_latest_frame() {
+        let mailbox = Arc::new(CaretMailbox::default());
+        let (sent, frames) = mpsc::channel();
+        let (unblock, blocked) = mpsc::channel();
+        let (exited, exit) = mpsc::channel();
         let first = wire::caret_position_frame(1.0, 2.0, 1.0, 16.0, Origin::BottomLeft);
         let last = wire::caret_position_frame(9.0, 8.0, 1.0, 16.0, Origin::BottomLeft);
-        tx.send(first).unwrap();
-        tx.send(last.clone()).unwrap();
-        let seed = wire::caret_position_frame(0.0, 0.0, 1.0, 16.0, Origin::BottomLeft);
-        assert_eq!(drain_latest(&rx, seed), last);
+        let idle = Duration::from_millis(10);
+        mailbox.enqueue_with(first.clone(), move |mailbox| {
+            std::thread::Builder::new().spawn(move || {
+                let mut first = true;
+                caret_sender_loop(mailbox, idle, |frame| {
+                    sent.send(frame.to_vec()).unwrap();
+                    if first {
+                        first = false;
+                        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }
+                });
+                exited.send(()).unwrap();
+            })
+        });
+        assert_eq!(frames.recv_timeout(Duration::from_secs(2)).unwrap(), first);
+        for index in 0..10_000 {
+            let frame = wire::caret_position_frame(f64::from(index), 2.0, 1.0, 16.0, Origin::BottomLeft);
+            mailbox.enqueue_with(frame, |_| panic!("a blocked sender must keep its worker slot"));
+        }
+        mailbox.enqueue_with(last.clone(), |_| panic!("the original worker still owns the send"));
+        assert_eq!(mailbox.state.lock().unwrap().pending.as_ref(), Some(&last));
+        unblock.send(()).unwrap();
+        assert_eq!(frames.recv_timeout(Duration::from_secs(2)).unwrap(), last);
+        exit.recv_timeout(Duration::from_secs(2)).unwrap();
+        let state = mailbox.state.lock().unwrap();
+        assert!(state.pending.is_none());
+        assert!(state.worker.is_none());
+    }
+
+    #[test]
+    fn caret_enqueue_and_idle_retirement_do_not_lose_the_last_frame() {
+        let mailbox = Arc::new(CaretMailbox::default());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (sent, frames) = mpsc::channel();
+        let (retired, exits) = mpsc::channel();
+        let idle = Duration::from_millis(2);
+        for index in 0u64..64 {
+            let started = starts.clone();
+            let output = sent.clone();
+            let exited = retired.clone();
+            mailbox.enqueue_with(index.to_le_bytes().to_vec(), move |mailbox| {
+                started.fetch_add(1, Ordering::Relaxed);
+                std::thread::Builder::new().spawn(move || {
+                    caret_sender_loop(mailbox, idle, |frame| output.send(frame.to_vec()).unwrap());
+                    let _ = exited.send(());
+                })
+            });
+            assert_eq!(
+                frames.recv_timeout(Duration::from_secs(2)).unwrap(),
+                index.to_le_bytes()
+            );
+            // Alternate racing the idle boundary and proving an already
+            // retired worker gets a successor. All traffic is fixture-only.
+            if index % 2 == 0 {
+                std::thread::sleep(idle);
+            } else {
+                while mailbox.state.lock().unwrap().worker.is_some() {
+                    exits.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+            }
+        }
+        assert!(starts.load(Ordering::Relaxed) > 1);
+        assert!(mailbox.state.lock().unwrap().pending.is_none());
+    }
+
+    #[test]
+    fn a_failed_caret_worker_is_replaced_on_the_next_request() {
+        let mailbox = Arc::new(CaretMailbox::default());
+        let (failed, failure) = mpsc::channel();
+        mailbox.enqueue_with(vec![1], move |mailbox| {
+            std::thread::Builder::new().spawn(move || {
+                caret_sender_loop(mailbox, SENDER_IDLE_TIMEOUT, |_| {
+                    failed.send(()).unwrap();
+                    panic!("injected caret worker failure");
+                });
+            })
+        });
+        failure.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !mailbox.state.lock().unwrap().worker.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < deadline, "injected worker must exit");
+            std::thread::yield_now();
+        }
+        let (sent, frames) = mpsc::channel();
+        let frame = wire::caret_position_frame(9.0, 8.0, 1.0, 16.0, Origin::BottomLeft);
+        mailbox.enqueue_with(frame.clone(), move |mailbox| {
+            std::thread::Builder::new().spawn(move || {
+                caret_sender_loop(mailbox, Duration::ZERO, |frame| sent.send(frame.to_vec()).unwrap());
+            })
+        });
+        assert_eq!(frames.recv_timeout(Duration::from_secs(2)).unwrap(), frame);
     }
 
     #[test]
