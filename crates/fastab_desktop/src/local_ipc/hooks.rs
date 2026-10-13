@@ -30,7 +30,7 @@ pub async fn caret_position(
     }
 
     proxy
-        .send_event(Event::WindowEvent {
+        .send_event_async(Event::WindowEvent {
             window_id: AUTOCOMPLETE_ID,
             window_event: WindowEvent::CaretPositionHook(WindowPosition::RelativeToCaret {
                 caret_position: LogicalPosition::new(x, y).into(),
@@ -38,18 +38,18 @@ pub async fn caret_position(
                 origin: hook.origin(),
             }),
         })
-        .ok();
+        .await?;
 
     Ok(())
 }
 
 pub async fn focus_change(proxy: &EventLoopProxy) -> Result<()> {
     proxy
-        .send_event(Event::WindowEvent {
+        .send_event_async(Event::WindowEvent {
             window_id: AUTOCOMPLETE_ID.clone(),
             window_event: WindowEvent::Hide,
         })
-        .unwrap();
+        .await?;
 
     Ok(())
 }
@@ -79,15 +79,15 @@ pub async fn event(hook: EventHook, proxy: &EventLoopProxy) -> Result<()> {
     };
 
     if hook.apps.is_empty() {
-        proxy.send_event(Event::WindowEventAll { window_event }).unwrap();
+        proxy.send_event_async(Event::WindowEventAll { window_event }).await?;
     } else {
         for app in hook.apps {
             proxy
-                .send_event(Event::WindowEvent {
+                .send_event_async(Event::WindowEvent {
                     window_id: WindowId(app.into()),
                     window_event: window_event.clone(),
                 })
-                .unwrap();
+                .await?;
         }
     }
 
@@ -95,13 +95,15 @@ pub async fn event(hook: EventHook, proxy: &EventLoopProxy) -> Result<()> {
 }
 
 pub async fn clear_autocomplete_cache(hook: ClearAutocompleteCacheHook, proxy: &EventLoopProxy) -> Result<()> {
-    proxy.send_event(Event::WindowEvent {
-        window_id: AUTOCOMPLETE_ID,
-        window_event: WindowEvent::Event {
-            event_name: "clear-cache".into(),
-            payload: Some(serde_json::to_string(&hook.clis)?.into()),
-        },
-    })?;
+    proxy
+        .send_event_async(Event::WindowEvent {
+            window_id: AUTOCOMPLETE_ID,
+            window_event: WindowEvent::Event {
+                event_name: "clear-cache".into(),
+                payload: Some(serde_json::to_string(&hook.clis)?.into()),
+            },
+        })
+        .await?;
 
     Ok(())
 }

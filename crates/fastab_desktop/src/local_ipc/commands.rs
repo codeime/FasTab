@@ -42,18 +42,20 @@ pub async fn debug(command: DebugModeCommand, proxy: &EventLoopProxy) -> LocalRe
     };
 
     proxy
-        .send_event(Event::WindowEvent {
+        .send_event_async(Event::WindowEvent {
             window_id: AUTOCOMPLETE_ID.clone(),
             window_event: WindowEvent::DebugMode(debug_mode),
         })
-        .unwrap();
+        .await
+        .map_err(event_admission_error)?;
 
     Ok(LocalResponse::Success(None))
 }
 
 pub async fn quit(_: QuitCommand, proxy: &EventLoopProxy) -> LocalResult {
     proxy
-        .send_event(Event::ControlFlow(ControlFlow::Exit))
+        .send_event_async(Event::ControlFlow(ControlFlow::Exit))
+        .await
         .map(|_| LocalResponse::Success(None))
         .map_err(|_err| {
             #[allow(clippy::exit)]
@@ -127,7 +129,7 @@ pub async fn open_ui_element(command: OpenUiElementCommand, proxy: &EventLoopPro
     match command.element() {
         UiElement::Settings => {
             proxy
-                .send_event(Event::WindowEvent {
+                .send_event_async(Event::WindowEvent {
                     window_id: DASHBOARD_ID.clone(),
                     window_event: WindowEvent::Batch(vec![
                         WindowEvent::NavigateRelative {
@@ -136,7 +138,8 @@ pub async fn open_ui_element(command: OpenUiElementCommand, proxy: &EventLoopPro
                         WindowEvent::Show,
                     ]),
                 })
-                .unwrap();
+                .await
+                .map_err(event_admission_error)?;
         },
         UiElement::MissionControl => {
             let events = if let Some(path) = command.route {
@@ -146,11 +149,12 @@ pub async fn open_ui_element(command: OpenUiElementCommand, proxy: &EventLoopPro
             };
 
             proxy
-                .send_event(Event::WindowEvent {
+                .send_event_async(Event::WindowEvent {
                     window_id: DASHBOARD_ID.clone(),
                     window_event: WindowEvent::Batch(events),
                 })
-                .unwrap();
+                .await
+                .map_err(event_admission_error)?;
         },
         UiElement::MenuBar => error!("Opening menu bar is unimplemented"),
         UiElement::InputMethodPrompt => error!("Opening input method prompt is unimplemented"),
@@ -208,7 +212,7 @@ pub fn log_level(LogLevelCommand { level }: LogLevelCommand) -> LocalResult {
 
 pub async fn login(proxy: &EventLoopProxy) -> LocalResult {
     proxy
-        .send_event(Event::WindowEvent {
+        .send_event_async(Event::WindowEvent {
             window_id: DASHBOARD_ID,
             window_event: WindowEvent::Batch(vec![
                 WindowEvent::UpdateWindowGeometry {
@@ -222,13 +226,13 @@ pub async fn login(proxy: &EventLoopProxy) -> LocalResult {
                 WindowEvent::Show,
             ]),
         })
-        .map_err(|err| error!(?err))
-        .ok();
+        .await
+        .map_err(event_admission_error)?;
 
     proxy
-        .send_event(Event::ReloadTray { is_logged_in: true })
-        .map_err(|err| error!(?err))
-        .ok();
+        .send_event_async(Event::ReloadTray { is_logged_in: true })
+        .await
+        .map_err(event_admission_error)?;
 
     Ok(LocalResponse::Success(None))
 }
@@ -237,17 +241,17 @@ pub async fn logout(proxy: &EventLoopProxy) -> LocalResult {
     // fig_auth removed
 
     proxy
-        .send_event(Event::WindowEvent {
+        .send_event_async(Event::WindowEvent {
             window_id: DASHBOARD_ID,
             window_event: WindowEvent::Batch(vec![WindowEvent::Reload, WindowEvent::Show]),
         })
-        .map_err(|err| error!(?err))
-        .ok();
+        .await
+        .map_err(event_admission_error)?;
 
     proxy
-        .send_event(Event::ReloadTray { is_logged_in: true })
-        .map_err(|err| error!(?err))
-        .ok();
+        .send_event_async(Event::ReloadTray { is_logged_in: true })
+        .await
+        .map_err(event_admission_error)?;
 
     Ok(LocalResponse::Success(None))
 }
@@ -287,16 +291,26 @@ pub async fn dump_state(
 
 async fn engine_diagnostics_json(proxy: &EventLoopProxy, timeout: Duration) -> Result<String, LocalResponse> {
     let (reply, receiver) = futures::channel::oneshot::channel();
-    proxy
-        .send_event(Event::EngineDiagnostics { reply })
-        .map_err(|_disconnected| engine_diagnostics_error("Desktop event loop is unavailable"))?;
-    let snapshot = tokio::time::timeout(timeout, receiver)
-        .await
-        .map_err(|_timeout| engine_diagnostics_error("Engine resource diagnostics timed out"))?
-        .map_err(|_cancelled| engine_diagnostics_error("Desktop dropped the engine resource diagnostics request"))?
-        .map_err(|_engine_error| engine_diagnostics_error("Engine resource diagnostics are unavailable"))?;
+    let snapshot = tokio::time::timeout(timeout, async {
+        proxy
+            .send_event_async(Event::EngineDiagnostics { reply })
+            .await
+            .map_err(|_disconnected| engine_diagnostics_error("Desktop event loop is unavailable"))?;
+        Ok::<_, LocalResponse>(receiver.await)
+    })
+    .await
+    .map_err(|_timeout| engine_diagnostics_error("Engine resource diagnostics timed out"))??
+    .map_err(|_cancelled| engine_diagnostics_error("Desktop dropped the engine resource diagnostics request"))?
+    .map_err(|_engine_error| engine_diagnostics_error("Engine resource diagnostics are unavailable"))?;
     serde_json::to_string_pretty(&snapshot)
         .map_err(|_serialization_error| engine_diagnostics_error("Unable to serialize engine resource diagnostics"))
+}
+
+fn event_admission_error(error: crate::event_loop::EventAdmissionError) -> LocalResponse {
+    LocalResponse::Error {
+        code: None,
+        message: Some(error.to_string()),
+    }
 }
 
 fn engine_diagnostics_error(message: &str) -> LocalResponse {

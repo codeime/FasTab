@@ -441,6 +441,15 @@ fn apply_autocomplete_window_level(_window_map: &FigIdMap, terminal_level: Optio
 }
 
 impl PlatformStateImpl {
+    pub(crate) fn pending_ax_events(&self) -> usize {
+        UNMANAGED
+            .window_server
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |server| server.lock().unwrap().pending_events())
+    }
+
     pub(super) fn new(proxy: EventLoopProxy) -> Self {
         let focused_window: Option<PlatformWindowImpl> = None;
         Self {
@@ -482,6 +491,10 @@ impl PlatformStateImpl {
                 }
 
                 UNMANAGED.event_sender.write().unwrap().replace(self.proxy.clone());
+                // Native AX/NSWorkspace callbacks cannot wait on the GPUI
+                // consumer. This remains a separately diagnosed FIFO until
+                // a source protocol can preserve every focus/input barrier;
+                // bounded send would deadlock and try_send would lose focus.
                 let (tx, rx) = flume::unbounded::<WindowServerEvent>();
 
                 UNMANAGED

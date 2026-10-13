@@ -35,18 +35,42 @@ impl WebviewNotificationsState {
         notification: Notification,
         proxy: &EventLoopProxy,
     ) -> Result<()> {
+        // Legacy native callers may spawn a broadcast per callback. Keep
+        // those on the explicitly diagnosed synchronous lane; awaiting here
+        // would relocate an unbounded source into suspended sender tasks.
+        self.broadcast_notification(notification_type, notification, proxy, false)
+            .await
+    }
+
+    pub async fn broadcast_notification_all_bounded(
+        &self,
+        notification_type: &NotificationType,
+        notification: Notification,
+        proxy: &EventLoopProxy,
+    ) -> Result<()> {
+        self.broadcast_notification(notification_type, notification, proxy, true)
+            .await
+    }
+
+    async fn broadcast_notification(
+        &self,
+        notification_type: &NotificationType,
+        notification: Notification,
+        proxy: &EventLoopProxy,
+        bounded: bool,
+    ) -> Result<()> {
         if self.subscriptions.is_empty() {
             return Ok(());
         }
 
         debug!(?notification_type, "Broadcasting webview notification");
 
-        for sub in self.subscriptions.iter() {
-            let message_id = match sub.get(notification_type) {
-                Some(id) => *id,
-                None => continue,
-            };
-
+        let subscribers: Vec<_> = self
+            .subscriptions
+            .iter()
+            .filter_map(|sub| sub.get(notification_type).map(|id| (sub.key().clone(), *id)))
+            .collect();
+        for (window_id, message_id) in subscribers {
             let message = ServerOriginatedMessage {
                 id: Some(message_id),
                 submessage: Some(ServerOriginatedSubMessage::Notification(notification.clone())),
@@ -55,13 +79,18 @@ impl WebviewNotificationsState {
             let mut encoded = BytesMut::new();
             message.encode(&mut encoded)?;
 
-            proxy.send_event(Event::WindowEvent {
-                window_id: sub.key().clone(),
+            let event = Event::WindowEvent {
+                window_id,
                 window_event: WindowEvent::Emit {
                     event_name: EmitEventName::Notification,
                     payload: BASE64_STANDARD.encode(encoded).into(),
                 },
-            })?;
+            };
+            if bounded {
+                proxy.send_event_async(event).await?;
+            } else {
+                proxy.send_event(event)?;
+            }
         }
 
         Ok(())

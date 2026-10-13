@@ -378,6 +378,13 @@ fn query_activated_window(app: &ApplicationSpecifier) -> Option<WindowServerEven
 }
 
 impl WindowServer {
+    /// Native callbacks cannot block their run loop to await the desktop.
+    /// Expose the existing FIFO ownership rather than silently discarding
+    /// focus transitions when an arbitrary bounded channel would be full.
+    pub fn pending_events(&self) -> usize {
+        self._inner.sender.len()
+    }
+
     pub fn new(sender: Sender<WindowServerEvent>) -> Self {
         let (mut inner, observer) = WindowServerInner::new_with_observer(sender);
 

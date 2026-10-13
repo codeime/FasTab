@@ -166,7 +166,7 @@ fn pending_generator_finishes(cx: &mut gpui::TestAppContext, only_show_on_tab: b
 fn completion_event(
     cx: &mut gpui::TestAppContext,
     engine: &EngineClient,
-    events: &flume::Receiver<Event>,
+    events: &crate::event_loop::EventLoopReceiver,
 ) -> (u64, CompleteResult, Uuid, String) {
     // This FIFO barrier waits for the real worker before GPUI polls its
     // completion future, avoiding wall-clock races with the loading timer.

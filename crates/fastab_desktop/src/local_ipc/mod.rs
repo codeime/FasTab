@@ -2,6 +2,8 @@ pub(crate) mod commands;
 mod hooks;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fastab_ipc::{BufferedUnixStream, RecvMessage, SendMessage};
@@ -14,12 +16,31 @@ use fastab_settings::settings::SettingsProvider;
 use fastab_settings::{Settings, State, StateProvider};
 use fastab_util::directories;
 use tokio::net::UnixListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, trace, warn};
 
 use crate::event::Event;
 use crate::platform::PlatformState;
 use crate::webview::notification::WebviewNotificationsState;
 use crate::{AUTOCOMPLETE_ID, DASHBOARD_ID, EventLoopProxy};
+
+const MAX_LOCAL_CONNECTIONS: usize = 64;
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn active_connections() -> usize {
+    ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+struct ConnectionAdmission {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ConnectionAdmission {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 pub enum LocalResponse {
     Error { code: Option<i32>, message: Option<String> },
@@ -94,15 +115,29 @@ pub async fn start_local_ipc(
 
     let listener = UnixListener::bind(&socket_path)?;
 
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(handle_local_ipc(
-            BufferedUnixStream::new(stream),
-            platform_state.clone(),
-            figterm_state.clone(),
-            webview_notifications_state.clone(),
-            proxy.clone(),
-            LocalIpcContext::new(),
-        ));
+    let slots = Arc::new(Semaphore::new(MAX_LOCAL_CONNECTIONS));
+    while let Ok(permit) = slots.clone().acquire_owned().await {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        let admission = ConnectionAdmission { _permit: permit };
+        let platform = platform_state.clone();
+        let figterm = figterm_state.clone();
+        let notifications = webview_notifications_state.clone();
+        let proxy = proxy.clone();
+        tokio::spawn(async move {
+            let _admission = admission;
+            handle_local_ipc(
+                BufferedUnixStream::new(stream),
+                platform,
+                figterm,
+                notifications,
+                proxy,
+                LocalIpcContext::new(),
+            )
+            .await;
+        });
     }
 
     Ok(())
@@ -118,12 +153,32 @@ async fn handle_local_ipc<Ctx>(
 ) where
     Ctx: SettingsProvider + StateProvider + ContextProvider + ContextArcProvider + Send + Sync,
 {
-    while let Some(message) = stream.recv_message::<LocalMessage>().await.unwrap_or_else(|err| {
-        if !err.is_disconnect() {
-            error!("Failed receiving local message: {err}");
-        }
-        None
-    }) {
+    let mut first_frame = true;
+    loop {
+        let received = if first_frame {
+            // Covers both a silent peer and an incomplete first frame. Once
+            // established, preserve the idle policy of existing IPC clients.
+            match tokio::time::timeout(FIRST_FRAME_TIMEOUT, stream.recv_message::<LocalMessage>()).await {
+                Ok(received) => received,
+                Err(_) => {
+                    debug!("Local IPC first frame timed out");
+                    break;
+                },
+            }
+        } else {
+            stream.recv_message::<LocalMessage>().await
+        };
+        first_frame = false;
+        let message = match received {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(err) => {
+                if !err.is_disconnect() {
+                    error!("Failed receiving local message: {err}");
+                }
+                break;
+            },
+        };
         trace!("Received local message: {message:?}");
         match message.r#type {
             Some(LocalMessageType::Command(command)) => {
@@ -181,10 +236,11 @@ async fn handle_local_ipc<Ctx>(
                                 };
 
                                 proxy
-                                    .send_event(Event::WindowEvent {
+                                    .send_event_async(Event::WindowEvent {
                                         window_id,
                                         window_event: crate::event::WindowEvent::Devtools,
                                     })
+                                    .await
                                     .ok();
 
                                 Ok(LocalResponse::Success(None))
@@ -227,9 +283,15 @@ async fn handle_local_ipc<Ctx>(
                             }
                         };
 
-                        if let Err(err) = stream.send_message(message).await {
-                            error!(%err, "Failed sending local response");
-                            break;
+                        match tokio::time::timeout(Duration::from_secs(5), stream.send_message(message)).await {
+                            Ok(Ok(())) => {},
+                            result => {
+                                error!(?result, "Failed sending local response; retiring connection");
+                                // The command might already have executed, or
+                                // its reply might be partially written. Close
+                                // this stream; never replay either on a new one.
+                                break;
+                            },
                         }
                     },
                 }
@@ -278,5 +340,45 @@ async fn handle_local_ipc<Ctx>(
             },
             None => warn!("Received empty local message"),
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn silent_and_partial_first_frames_do_not_keep_connections_forever() {
+        let (proxy, _events) = crate::event_loop::channel();
+        let platform = Arc::new(PlatformState::new(proxy.clone()));
+        let figterm = Arc::new(FigtermState::new());
+        let notifications = Arc::new(WebviewNotificationsState::default());
+        let mut clients = Vec::new();
+        let mut servers = tokio::task::JoinSet::new();
+        for partial in [false, true] {
+            let (mut client, stream) = tokio::net::UnixStream::pair().unwrap();
+            if partial {
+                client.write_all(b"\x1b").await.unwrap();
+            }
+            clients.push(client);
+            servers.spawn(handle_local_ipc(
+                BufferedUnixStream::new(stream),
+                platform.clone(),
+                figterm.clone(),
+                notifications.clone(),
+                proxy.clone(),
+                LocalIpcContext::new(),
+            ));
+        }
+        tokio::time::timeout(FIRST_FRAME_TIMEOUT + Duration::from_secs(1), async {
+            while let Some(server) = servers.join_next().await {
+                server.unwrap();
+            }
+        })
+        .await
+        .expect("first-frame deadline must retire live silent/partial peers");
+        // Peers stayed alive throughout: EOF cannot explain retirement.
+        drop(clients);
     }
 }

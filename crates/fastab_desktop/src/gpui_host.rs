@@ -130,10 +130,29 @@ impl DesktopHost {
                 let diagnostics = self.overlay.engine_diagnostics();
                 let mut host = self.overlay.resource_diagnostics(cx);
                 host.gpui_windows = cx.windows().len();
+                let events = self.proxy.diagnostics();
+                host.host_async_events = events.async_events;
+                host.host_async_payload_bytes = events.async_payload_bytes;
+                host.host_async_waiters = events.async_waiters;
+                host.host_async_waiting_bytes = events.async_waiting_bytes;
+                host.host_sync_events = events.sync_events;
+                host.host_sync_payload_bytes = events.sync_payload_bytes;
+                host.ipc_remote_connections = fastab_remote_ipc::remote::active_connections();
+                host.ipc_local_connections = crate::local_ipc::active_connections();
+                #[cfg(target_os = "macos")]
+                {
+                    host.host_ax_events = self.platform_state.inner().pending_ax_events();
+                }
                 {
                     let sessions = self.figterm_state.inner.lock();
                     host.ipc_sessions = sessions.linked_sessions.len();
                     for session in sessions.linked_sessions.values() {
+                        host.ipc_session_edit_bytes = host
+                            .ipc_session_edit_bytes
+                            .saturating_add(session.edit_buffer.text.len());
+                        host.ipc_session_edit_capacity = host
+                            .ipc_session_edit_capacity
+                            .saturating_add(session.edit_buffer.text.capacity());
                         let pending = session.sender.diagnostics();
                         host.ipc_pending_messages = host.ipc_pending_messages.saturating_add(pending.pending_messages);
                         host.ipc_pending_bytes = host.ipc_pending_bytes.saturating_add(pending.pending_bytes);
@@ -443,15 +462,27 @@ fn autocomplete_should_run() -> bool {
     }
 }
 
-pub fn run(host: Entity<DesktopHost>, event_rx: flume::Receiver<Event>, cx: &mut App) {
+pub fn run(host: Entity<DesktopHost>, event_rx: crate::event_loop::EventLoopReceiver, cx: &mut App) {
     cx.spawn(async move |cx| {
-        while let Ok(event) = event_rx.recv_async().await {
-            let result = cx.update(|cx| {
-                host.update(cx, |host, cx| host.dispatch(event, cx));
+        let executor = cx.background_executor().clone();
+        let mut dispatched = 0;
+        while let Ok(event) = event_rx.recv_queued().await {
+            let result = event.dispatch(|event| {
+                cx.update(|cx| {
+                    host.update(cx, |host, cx| host.dispatch(event, cx));
+                })
             });
             if let Err(err) = result {
                 error!(%err, "GPUI app released while dispatching desktop event");
                 break;
+            }
+            dispatched += 1;
+            if dispatched == 64 {
+                // A zero-duration GPUI timer is immediately ready. A real
+                // timer turn lets AppKit paint and handle native callbacks
+                // even while IPC keeps the queue continuously readable.
+                executor.timer(std::time::Duration::from_millis(1)).await;
+                dispatched = 0;
             }
         }
     })
@@ -472,7 +503,8 @@ pub fn ensure_gpui_ns_application() {
 
 /// Builds the host once GPUI's `App` exists. Produced by the async prelude and
 /// consumed by [`start_application`] from `main`, outside `block_on`.
-pub type Setup = Box<dyn FnOnce(&mut App) -> anyhow::Result<(Entity<DesktopHost>, flume::Receiver<Event>)>>;
+pub type Setup =
+    Box<dyn FnOnce(&mut App) -> anyhow::Result<(Entity<DesktopHost>, crate::event_loop::EventLoopReceiver)>>;
 
 #[cfg(target_os = "macos")]
 fn should_show_settings_after_launch(
@@ -484,7 +516,7 @@ fn should_show_settings_after_launch(
 }
 
 pub fn start_application(
-    setup: impl FnOnce(&mut App) -> anyhow::Result<(Entity<DesktopHost>, flume::Receiver<Event>)> + 'static,
+    setup: impl FnOnce(&mut App) -> anyhow::Result<(Entity<DesktopHost>, crate::event_loop::EventLoopReceiver)> + 'static,
 ) -> anyhow::Result<()> {
     let application = Application::new();
     let reopen_proxy: Rc<RefCell<Option<EventLoopProxy>>> = Rc::new(RefCell::new(None));

@@ -32,11 +32,14 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
     type Error = anyhow::Error;
 
     async fn sessions_changed(&mut self, _figterm_state: &Arc<FigtermState>) {
-        let _ = self.proxy.send_event(Event::JevContextChanged);
+        let _ = self.proxy.send_event_async(Event::JevContextChanged).await;
     }
 
     async fn session_closed(&mut self, session_id: Uuid) {
-        let _ = self.proxy.send_event(Event::GpuiOverlayEndInput { session_id });
+        let _ = self
+            .proxy
+            .send_event_async(Event::GpuiOverlayEndInput { session_id })
+            .await;
     }
 
     async fn edit_buffer(
@@ -46,8 +49,7 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         figterm_state: &Arc<FigtermState>,
     ) -> Result<Option<clientbound::response::Response>> {
         let _old_metrics = figterm_state.with_update(session_id, |session| {
-            session.edit_buffer.text.clone_from(&hook.text);
-            session.edit_buffer.cursor.clone_from(&hook.cursor);
+            session.edit_buffer.update(&hook.text, hook.cursor);
             session
                 .terminal_cursor_coordinates
                 .clone_from(&hook.terminal_cursor_coordinates);
@@ -79,12 +81,17 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
                 .get(..hook.cursor as usize)
                 .map(|s| s.encode_utf16().count() as i32);
 
-            for sub in self.notifications_state.subscriptions.iter() {
-                let message_id = match sub.get(&NotificationType::NotifyOnEditbuffferChange) {
-                    Some(id) => *id,
-                    None => continue,
-                };
-
+            // Do not retain a DashMap shard guard across bounded admission.
+            let subscribers: Vec<_> = self
+                .notifications_state
+                .subscriptions
+                .iter()
+                .filter_map(|sub| {
+                    sub.get(&NotificationType::NotifyOnEditbuffferChange)
+                        .map(|id| (sub.key().clone(), *id))
+                })
+                .collect();
+            for (window_id, message_id) in subscribers {
                 let hook = hook.clone();
                 let message = ServerOriginatedMessage {
                     id: Some(message_id),
@@ -106,14 +113,14 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
                 debug!(%message_id, "Sending edit buffer change notification to webview");
 
                 self.proxy
-                    .send_event(Event::WindowEvent {
-                        window_id: sub.key().clone(),
+                    .send_event_async(Event::WindowEvent {
+                        window_id,
                         window_event: WindowEvent::Emit {
                             event_name: EmitEventName::Notification,
                             payload: BASE64_STANDARD.encode(encoded).into(),
                         },
                     })
-                    .unwrap();
+                    .await?;
             }
         }
 
@@ -126,12 +133,14 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        self.proxy.send_overlay_input(crate::event_loop::OverlayInput {
-            buffer: hook.text.clone(),
-            cwd,
-            cursor: hook.cursor.max(0) as u32,
-            session_id,
-        })?;
+        self.proxy
+            .send_overlay_input_async(crate::event_loop::OverlayInput {
+                buffer: hook.text.clone(),
+                cwd,
+                cursor: hook.cursor.max(0) as u32,
+                session_id,
+            })
+            .await?;
 
         Ok(None)
     }
@@ -145,6 +154,7 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         let mut cwd_changed = false;
         let mut new_cwd = None;
         figterm_state.with(&session_id, |session| {
+            session.edit_buffer.end_input();
             if let (Some(old_context), Some(new_context)) = (&session.context, &hook.context) {
                 cwd_changed = old_context.current_working_directory != new_context.current_working_directory;
                 new_cwd.clone_from(&new_context.current_working_directory);
@@ -153,12 +163,12 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
             session.apply_context(hook.context.clone());
         });
 
-        let _ = self.proxy.send_event(Event::JevContextChanged);
+        let _ = self.proxy.send_event_async(Event::JevContextChanged).await;
 
         if cwd_changed {
             if let Err(err) = self
                 .notifications_state
-                .broadcast_notification_all(
+                .broadcast_notification_all_bounded(
                     &NotificationType::NotifyOnLocationChange,
                     Notification {
                         r#type: Some(fastab_proto::fig::notification::Type::LocationChangedNotification(
@@ -180,7 +190,7 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
 
         if let Err(err) = self
             .notifications_state
-            .broadcast_notification_all(
+            .broadcast_notification_all_bounded(
                 &NotificationType::NotifyOnPrompt,
                 Notification {
                     r#type: Some(fastab_proto::fig::notification::Type::ShellPromptReturnedNotification(
@@ -212,13 +222,16 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         figterm_state: &Arc<FigtermState>,
     ) -> Result<Option<clientbound::response::Response>> {
         figterm_state.with_update(session_id, |session| {
+            session.edit_buffer.end_input();
             session.apply_context(hook.context.clone());
         });
 
-        self.proxy.send_event(Event::GpuiOverlayEndInput { session_id })?;
+        self.proxy
+            .send_event_async(Event::GpuiOverlayEndInput { session_id })
+            .await?;
 
         self.notifications_state
-            .broadcast_notification_all(
+            .broadcast_notification_all_bounded(
                 &NotificationType::NotifyOnProcessChanged,
                 Notification {
                     r#type: Some(fastab_proto::fig::notification::Type::ProcessChangeNotification(
@@ -251,10 +264,10 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
             session.apply_context(hook.context.clone());
         });
 
-        let _ = self.proxy.send_event(Event::JevContextChanged);
+        let _ = self.proxy.send_event_async(Event::JevContextChanged).await;
 
         self.notifications_state
-            .broadcast_notification_all(
+            .broadcast_notification_all_bounded(
                 &NotificationType::NotifyOnHistoryUpdated,
                 Notification {
                     r#type: Some(fastab_proto::fig::notification::Type::HistoryUpdatedNotification(
@@ -285,10 +298,12 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
     ) -> Result<Option<clientbound::response::Response>> {
         debug!(%action, "Intercepted Key Action");
 
-        self.proxy.send_event(Event::AutocompleteAction {
-            action,
-            session_id: _session_id,
-        })?;
+        self.proxy
+            .send_event_async(Event::AutocompleteAction {
+                action,
+                session_id: _session_id,
+            })
+            .await?;
 
         Ok(None)
     }
@@ -302,11 +317,35 @@ mod tests {
     use fastab_proto::remote::{Hostbound, hostbound};
     use tokio::net::UnixStream;
 
-    async fn next_event(events: &flume::Receiver<Event>) -> Event {
+    async fn next_event(events: &crate::event_loop::EventLoopReceiver) -> Event {
         tokio::time::timeout(Duration::from_secs(3), events.recv_async())
             .await
             .expect("desktop event deadline")
             .expect("desktop event")
+    }
+
+    async fn send_hook(client: &mut UnixStream, request: hostbound::request::Request) {
+        client
+            .send_message(Hostbound {
+                packet: Some(hostbound::Packet::Request(hostbound::Request {
+                    request: Some(request),
+                    nonce: None,
+                })),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn edit_request(text: &str) -> hostbound::request::Request {
+        hostbound::request::Request::EditBuffer(EditBufferHook {
+            context: Some(ShellContext {
+                current_working_directory: Some("/fixture".into()),
+                ..Default::default()
+            }),
+            text: text.into(),
+            cursor: text.len() as i64,
+            ..Default::default()
+        })
     }
 
     #[tokio::test]
@@ -342,24 +381,9 @@ mod tests {
             assert!(!session_ids.contains(&session_id));
             session_ids.push(session_id);
 
-            for text in ["tool ", empty_buffer] {
-                client
-                    .send_message(Hostbound {
-                        packet: Some(hostbound::Packet::Request(hostbound::Request {
-                            request: Some(hostbound::request::Request::EditBuffer(EditBufferHook {
-                                context: Some(ShellContext {
-                                    current_working_directory: Some("/fixture".into()),
-                                    ..Default::default()
-                                }),
-                                text: text.into(),
-                                cursor: text.len() as i64,
-                                ..Default::default()
-                            })),
-                            nonce: None,
-                        })),
-                    })
-                    .await
-                    .unwrap();
+            let large = "x".repeat(128 * 1024);
+            for text in [large.as_str(), "tool ", empty_buffer] {
+                send_hook(&mut client, edit_request(text)).await;
                 let Event::GpuiOverlayInput(queued) = next_event(&events).await else {
                     panic!("expected queued input");
                 };
@@ -368,6 +392,35 @@ mod tests {
                 assert_eq!(input.cwd, "/fixture");
                 assert_eq!(input.cursor, text.len() as u32);
                 assert_eq!(input.session_id, session_id);
+                state.with(&session_id, |session| {
+                    assert_eq!(session.edit_buffer.text, text);
+                    if text.len() < 64 * 1024 {
+                        assert!(session.edit_buffer.text.capacity() < 64 * 1024);
+                    }
+                });
+            }
+
+            // End-input hooks must release a large retained command even when
+            // the shell does not send an intervening empty EditBufferHook.
+            for request in [
+                hostbound::request::Request::Prompt(PromptHook::default()),
+                hostbound::request::Request::PreExec(PreExecHook::default()),
+            ] {
+                send_hook(&mut client, edit_request(&large)).await;
+                assert!(matches!(next_event(&events).await, Event::GpuiOverlayInput(_)));
+                let is_prompt = matches!(request, hostbound::request::Request::Prompt(_));
+                send_hook(&mut client, request).await;
+                let event = next_event(&events).await;
+                if is_prompt {
+                    assert!(matches!(event, Event::JevContextChanged));
+                } else {
+                    assert!(matches!(event, Event::GpuiOverlayEndInput { session_id: owner } if owner == session_id));
+                }
+                state.with(&session_id, |session| {
+                    assert!(session.edit_buffer.text.is_empty());
+                    assert_eq!(session.edit_buffer.text.capacity(), 0);
+                    assert_eq!(session.edit_buffer.cursor, 0);
+                });
             }
 
             drop(client);

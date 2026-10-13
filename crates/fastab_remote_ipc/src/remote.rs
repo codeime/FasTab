@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use fastab_ipc::{BufferedReader, RecvMessage};
@@ -9,6 +10,7 @@ use fastab_proto::remote::{Clientbound, Hostbound, hostbound};
 use fastab_util::PTY_BINARY_NAME;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -18,6 +20,34 @@ use crate::figterm::{EditBuffer, FigtermSession, FigtermState, InterceptMode};
 use crate::outbox::{self, FigtermSender, Outbox};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REMOTE_CONNECTIONS: usize = 32;
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Accepted sockets, including authentication, blocked hooks and cleanup.
+/// The listener's one permit reserved before accept is not an open connection.
+pub fn active_connections() -> usize {
+    ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+struct ConnectionAdmission {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectionAdmission {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for ConnectionAdmission {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+        // The permit remains owned through session_closed/sessions_changed,
+        // so a stalled host cannot collect detached cleanup-hook waiters.
+    }
+}
 
 /// Own the background tasks and session even while an awaited hook is pending.
 /// Aborting the parent future must not detach a live writer or heartbeat loop.
@@ -59,11 +89,30 @@ pub async fn start_remote_ipc(
 
     let listener = UnixListener::bind(socket_path)?;
 
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(handle_remote_ipc(stream, figterm_state.clone(), hook.clone()));
-    }
+    serve_remote_listener(listener, figterm_state, hook, MAX_REMOTE_CONNECTIONS).await;
 
     Ok(())
+}
+
+async fn serve_remote_listener(
+    listener: UnixListener,
+    figterm_state: Arc<FigtermState>,
+    hook: impl RemoteHookHandler + Send + Clone + 'static,
+    limit: usize,
+) {
+    let slots = Arc::new(Semaphore::new(limit));
+    while let Ok(permit) = slots.clone().acquire_owned().await {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let admission = ConnectionAdmission::new(permit);
+        let state = figterm_state.clone();
+        let hook = hook.clone();
+        tokio::spawn(async move {
+            let _admission = admission;
+            handle_remote_ipc(stream, state, hook).await;
+        });
+    }
 }
 
 pub async fn handle_remote_ipc(
@@ -74,6 +123,7 @@ pub async fn handle_remote_ipc(
     let (reader, writer) = tokio::io::split(stream);
     let (clientbound_tx, clientbound_rx) = outbox::channel();
     let mut initialized = false;
+    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let session_id = Uuid::new_v4();
     let mut connection = RemoteConnection {
         sender: clientbound_tx.clone(),
@@ -99,6 +149,10 @@ pub async fn handle_remote_ipc(
         _ = async {
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(handshake_deadline), if !initialized => {
+                debug!(?session_id, "Remote handshake timed out");
+                break;
+            }
             _ = clientbound_tx.closed() => {
                 debug!("Connection closed");
                 break;
@@ -162,13 +216,10 @@ pub async fn handle_remote_ipc(
                             result
                         },
                         Some(hostbound::Packet::Request(hostbound::Request { request: Some(request), nonce })) => {
-                            if matches!(
-                                request,
-                                hostbound::request::Request::EditBuffer(_)
-                                | hostbound::request::Request::Prompt(_)
-                                | hostbound::request::Request::PreExec(_)
-                                | hostbound::request::Request::InterceptedKey(_)
-                            ) && !initialized {
+                            // Every hook, including PostExec, belongs to an
+                            // authenticated session. No pre-handshake hook may
+                            // await host admission outside the timer select.
+                            if !initialized {
                                 debug!("Client tried to send remote hook without auth");
                                 Some(clientbound::Packet::HandshakeResponse(HandshakeResponse {
                                     success: false,
@@ -450,6 +501,103 @@ mod lifecycle_tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn listener_admission_includes_blocked_session_cleanup() {
+        let path = std::env::temp_dir().join(format!("fi-{}.sock", &Uuid::new_v4().simple().to_string()[..8]));
+        let listener = UnixListener::bind(&path).unwrap();
+        let state = Arc::new(FigtermState::new());
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hook = Hook {
+            cleanup_release: Some(release.clone()),
+            ..Hook::new(tx)
+        };
+        let server = tokio::spawn(serve_remote_listener(listener, state.clone(), hook, 1));
+        let handshake = || Hostbound {
+            packet: Some(hostbound::Packet::Handshake(hostbound::Handshake {
+                id: "limited-session".into(),
+                secret: "fixture".into(),
+                parent_id: None,
+            })),
+        };
+        let mut first = UnixStream::connect(&path).await.unwrap();
+        first.send_message(handshake()).await.unwrap();
+        assert!(matches!(next_event(&mut events).await, Lifecycle::Changed(ids) if ids.len() == 1));
+        let mut second = UnixStream::connect(&path).await.unwrap();
+        second.send_message(handshake()).await.unwrap();
+        drop(first);
+        assert!(matches!(next_event(&mut events).await, Lifecycle::Closed(_)));
+        assert!(state.inner.lock().linked_sessions.is_empty());
+        // The old socket is already retired, but its blocked cleanup still
+        // owns admission. No second decoded hook or extra cleanup task exists.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), events.recv())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        assert!(matches!(next_event(&mut events).await, Lifecycle::Changed(ids) if ids.is_empty()));
+        assert!(matches!(next_event(&mut events).await, Lifecycle::Changed(ids) if ids.len() == 1));
+        drop(second);
+        assert!(matches!(next_event(&mut events).await, Lifecycle::Closed(_)));
+        release.notify_one();
+        assert!(matches!(next_event(&mut events).await, Lifecycle::Changed(ids) if ids.is_empty()));
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_unauthenticated_connection_expires_without_session_notifications() {
+        let state = Arc::new(FigtermState::new());
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (_client, stream) = UnixStream::pair().unwrap();
+        tokio::time::timeout(
+            HANDSHAKE_TIMEOUT + Duration::from_secs(1),
+            handle_remote_ipc(stream, state.clone(), Hook::new(tx)),
+        )
+        .await
+        .expect("authentication deadline must retire an otherwise live socket");
+        assert!(state.inner.lock().linked_sessions.is_empty());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn post_exec_cannot_enter_a_hook_before_authentication() {
+        let state = Arc::new(FigtermState::new());
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (client, stream) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(handle_remote_ipc(stream, state.clone(), Hook::new(tx)));
+        let mut client = BufferedReader::new(client);
+        client
+            .send_message(Hostbound {
+                packet: Some(hostbound::Packet::Request(hostbound::Request {
+                    nonce: None,
+                    request: Some(hostbound::request::Request::PostExec(PostExecHook::default())),
+                })),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match client.recv_message::<Clientbound>().await.unwrap().unwrap().packet {
+                    Some(clientbound::Packet::Ping(())) => {},
+                    Some(clientbound::Packet::HandshakeResponse(response)) => {
+                        assert!(!response.success);
+                        break;
+                    },
+                    other => panic!("unexpected unauthenticated response: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("pre-handshake PostExec must be rejected before hook dispatch");
+        drop(client);
+        server.await.unwrap();
+        assert!(state.inner.lock().linked_sessions.is_empty());
+        assert!(events.try_recv().is_err());
     }
 
     struct BlockedConnection {

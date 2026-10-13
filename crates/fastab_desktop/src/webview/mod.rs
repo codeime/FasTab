@@ -38,7 +38,7 @@ pub type FigIdMap = HashSet<WindowId, FnvBuildHasher>;
 
 pub struct WebviewManager {
     pub(crate) fig_id_map: FigIdMap,
-    pub(crate) event_rx: flume::Receiver<Event>,
+    pub(crate) event_rx: crate::event_loop::EventLoopReceiver,
     pub(crate) proxy: EventLoopProxy,
     pub(crate) figterm_state: Arc<FigtermState>,
     pub(crate) platform_state: Arc<PlatformState>,
