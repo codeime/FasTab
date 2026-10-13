@@ -26,6 +26,12 @@ pub mod remote {
     pub use crate::proto::remote::*;
 }
 
+/// Maximum encoded frame, including its fixed header. Match the existing
+/// desktop/PTY outbox budget and reject a size before buffering its body.
+pub const MAX_FIG_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const FIG_MESSAGE_HEADER_BYTES: usize = 18;
+const MAX_FIG_MESSAGE_BODY_BYTES: usize = MAX_FIG_MESSAGE_BYTES - FIG_MESSAGE_HEADER_BYTES;
+
 // This is not used explicitly, but it must be here for the derive
 // impls on the protos for dynamic message
 static DESCRIPTOR_POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
@@ -82,6 +88,8 @@ pub enum FigMessageParseError {
     InvalidHeader(String, String),
     #[error("invalid message type")]
     InvalidMessageType([u8; 8]),
+    #[error("message body is too large: {0} bytes")]
+    BodyTooLarge(u64),
     #[error("failed to convert int: {0}")]
     TryFromInt(#[from] TryFromIntError),
     #[error(transparent)]
@@ -102,6 +110,8 @@ pub enum FigMessageDecodeError {
 
 #[derive(Debug, Error)]
 pub enum FigMessageEncodeError {
+    #[error("message body is too large: {0} bytes")]
+    BodyTooLarge(usize),
     #[error(transparent)]
     IntError(#[from] std::num::TryFromIntError),
     #[error(transparent)]
@@ -123,6 +133,9 @@ impl FigMessage {
 
     pub fn encode_buf(&self, dst: &mut BytesMut) -> Result<(), FigMessageEncodeError> {
         let body = &self.inner;
+        if body.len() > MAX_FIG_MESSAGE_BODY_BYTES {
+            return Err(FigMessageEncodeError::BodyTooLarge(body.len()));
+        }
         let message_type = self.message_type;
 
         let message_len: u64 = body.len().try_into()?;
@@ -145,7 +158,7 @@ impl FigMessage {
 
     pub fn encode(message_type: FigMessageType, body: Bytes) -> Result<Bytes, FigMessageEncodeError> {
         let msg = Self {
-            inner: Bytes::from(body.to_vec()),
+            inner: body,
             message_type,
         };
 
@@ -190,7 +203,11 @@ impl FigMessage {
             ));
         }
 
-        let len: usize = src.get_u64().try_into()?;
+        let body_len = src.get_u64();
+        if body_len > MAX_FIG_MESSAGE_BODY_BYTES as u64 {
+            return Err(FigMessageParseError::BodyTooLarge(body_len));
+        }
+        let len: usize = body_len.try_into()?;
 
         if src.remaining() < len {
             return Err(FigMessageParseError::Incomplete(
@@ -258,6 +275,39 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn frame_budget_is_checked_before_waiting_for_the_body() {
+        for size in [MAX_FIG_MESSAGE_BODY_BYTES as u64 + 1, u64::MAX] {
+            let mut header = b"\x1b@fig-pbuf".to_vec();
+            header.extend_from_slice(&size.to_be_bytes());
+            assert!(matches!(
+                FigMessage::parse(&mut header.as_slice()),
+                Err(FigMessageParseError::BodyTooLarge(actual)) if actual == size
+            ));
+        }
+    }
+
+    #[test]
+    fn largest_frame_round_trips_and_larger_encoding_does_not_touch_destination() {
+        let body = Bytes::from(vec![b'x'; MAX_FIG_MESSAGE_BODY_BYTES]);
+        let encoded = FigMessage::encode(FigMessageType::Protobuf, body.clone()).unwrap();
+        assert_eq!(encoded.len(), MAX_FIG_MESSAGE_BYTES);
+        let (length, decoded) = FigMessage::parse(&mut encoded.as_ref()).unwrap();
+        assert_eq!(length, MAX_FIG_MESSAGE_BYTES);
+        assert_eq!(decoded.inner, body);
+
+        let oversized = FigMessage {
+            inner: Bytes::from(vec![0; MAX_FIG_MESSAGE_BODY_BYTES + 1]),
+            message_type: FigMessageType::Protobuf,
+        };
+        let mut destination = BytesMut::from(&b"prior frame"[..]);
+        assert!(matches!(
+            oversized.encode_buf(&mut destination),
+            Err(FigMessageEncodeError::BodyTooLarge(_))
+        ));
+        assert_eq!(&destination[..], b"prior frame");
+    }
 
     fn test_message() -> local::LocalMessage {
         let ctx = local::ShellContext {

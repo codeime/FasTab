@@ -19,6 +19,24 @@ pub struct EditBuffer {
     pub cursor: i64,
 }
 
+impl EditBuffer {
+    pub fn update(&mut self, text: &str, cursor: i64) {
+        // Keep normal keystrokes allocation-free, but do not pin an unusually
+        // large input for the lifetime of a now-small/empty shell session.
+        if self.text.capacity() > 64 * 1024 && text.len() < self.text.capacity() / 4 {
+            self.text = text.to_owned();
+        } else {
+            self.text.clear();
+            self.text.push_str(text);
+        }
+        self.cursor = cursor;
+    }
+
+    pub fn end_input(&mut self) {
+        self.update("", 0);
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMetrics {
     pub start_time: OffsetDateTime,
@@ -337,6 +355,27 @@ impl FigtermCommand {
 mod tests {
     use super::*;
     use fastab_proto::local::EnvironmentVariable;
+
+    #[test]
+    fn edit_buffer_keeps_normal_capacity_but_retires_large_inputs() {
+        let mut buffer = EditBuffer::default();
+        buffer.update("git checkout", 12);
+        let small_capacity = buffer.text.capacity();
+        buffer.update("git", 3);
+        assert_eq!(buffer.text.capacity(), small_capacity);
+
+        buffer.update(&"x".repeat(256 * 1024), 5);
+        buffer.update("git 日", 7);
+        assert_eq!(buffer.text, "git 日");
+        assert_eq!(buffer.cursor, 7);
+        assert!(buffer.text.capacity() < 64 * 1024);
+
+        buffer.update(&"x".repeat(256 * 1024), 5);
+        buffer.end_input();
+        assert!(buffer.text.is_empty());
+        assert_eq!(buffer.text.capacity(), 0);
+        assert_eq!(buffer.cursor, 0);
+    }
 
     fn dummy_session() -> FigtermSession {
         let (sender, _outbox) = crate::outbox::channel();

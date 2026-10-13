@@ -12,7 +12,10 @@ pin_project! {
     pub struct BufferedReader<T> {
         #[pin]
         pub(crate) inner: T,
-        pub(crate) buffer: BytesMut
+        pub(crate) buffer: BytesMut,
+        // `advance` can hide an entire allocation behind a zero-capacity tail.
+        // Track the allocation before consumption, not just the visible view.
+        pub(crate) buffer_high_water: usize,
     }
 }
 
@@ -21,6 +24,7 @@ impl<T> BufferedReader<T> {
         Self {
             inner,
             buffer: BytesMut::new(),
+            buffer_high_water: 0,
         }
     }
 
@@ -31,6 +35,17 @@ impl<T> BufferedReader<T> {
     /// Converts into inner `BufStream<UnixStream>`
     pub fn into_inner(self) -> T {
         self.inner
+    }
+
+    pub(crate) fn reclaim_consumed_buffer(&mut self) {
+        const RETAIN_LIMIT: usize = 64 * 1024;
+        const SMALL_TAIL: usize = 16 * 1024;
+        if self.buffer_high_water > RETAIN_LIMIT && self.buffer.len() <= SMALL_TAIL {
+            // A small unread suffix may contain the next frame's header/body.
+            // Copy that suffix before dropping the original backing allocation.
+            self.buffer = BytesMut::from(self.buffer.as_ref());
+            self.buffer_high_water = self.buffer.capacity();
+        }
     }
 }
 
