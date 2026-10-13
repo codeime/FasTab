@@ -18,8 +18,8 @@ const FOOTER_LABELS: Record<Locale, { privacy: string }> = {
 };
 
 const FOOTER_TAGLINE: Record<Locale, string> = {
-  en: "Fastab · local terminal autocomplete",
-  "zh-CN": "Fastab · 本地终端自动补全",
+  en: "FasTab · local terminal autocomplete",
+  "zh-CN": "FasTab · 本地终端自动补全",
 };
 
 const FORK_CREDIT: Record<
@@ -162,7 +162,7 @@ export function SiteHeader({
             alt=""
             className="h-7 w-7 rounded-md"
           />
-          <span>Fastab</span>
+          <span>FasTab</span>
         </a>
 
         <nav className="ml-auto flex items-center gap-2 text-sm sm:gap-6.5">
@@ -191,7 +191,7 @@ export function SiteHeader({
                 placement: "header",
               })
             }
-            aria-label="Fastab on GitHub"
+            aria-label="FasTab on GitHub"
             className="inline-flex items-center gap-1.75 rounded-lg border border-(--border) bg-(--surface) px-3.25 py-1.75 text-(--ink) transition-colors hover:border-(--accent-line)"
           >
             <GitHubIcon />

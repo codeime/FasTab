@@ -81,7 +81,7 @@ export function OverlayPreview({ className = "" }: { className?: string }) {
             color: "#141413",
           }}
           role="img"
-          aria-label="Fastab overlay suggesting git subcommands"
+          aria-label="FasTab overlay suggesting git subcommands"
         >
           {ROWS.map((row) => (
             <div

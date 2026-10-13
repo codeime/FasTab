@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Security updates are provided for the latest released version of Fastab.
+Security updates are provided for the latest released version of FasTab.
 Please update to the newest release before reporting an issue that may already
 have been fixed.
 
@@ -21,7 +21,7 @@ Report them privately through
 Include, when possible:
 
 - A description of the vulnerability and its potential impact.
-- The affected Fastab version and macOS version.
+- The affected FasTab version and macOS version.
 - Reproduction steps or a minimal proof of concept.
 - Relevant logs, crash reports, or screenshots with secrets and personal data
   removed.
@@ -34,10 +34,10 @@ before publishing details.
 
 ## Scope
 
-Reports about the Fastab application, bundled command-line tools, shell
+Reports about the FasTab application, bundled command-line tools, shell
 integrations, input method, update mechanism, website, and release artifacts are
 in scope. Vulnerabilities in third-party dependencies are also welcome when they
-have a demonstrated impact on Fastab.
+have a demonstrated impact on FasTab.
 
 General bugs, feature requests, and support questions should be filed through
 [GitHub Issues](https://github.com/codeime/easy-complete/issues).

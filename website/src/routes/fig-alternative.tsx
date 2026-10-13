@@ -10,9 +10,9 @@ import {
 import { DOWNLOAD_URL } from "../download.ts";
 import { SeoJsonLd, guideSchema, pageHead } from "../seo.tsx";
 
-const TITLE = "Open-Source Fig Alternative for macOS — Fastab";
+const TITLE = "Open-Source Fig Alternative for macOS — FasTab";
 const DESCRIPTION =
-  "Fastab is a free, open-source, fully local Fig-style terminal autocomplete app for zsh, bash, and fish on Apple Silicon Macs.";
+  "FasTab is a free, open-source, fully local Fig-style terminal autocomplete app for zsh, bash, and fish on Apple Silicon Macs.";
 const ALTERNATES = [
   { locale: "en" as const, path: "/fig-alternative" },
   { locale: "zh-CN" as const, path: "/zh/fig-alternative" },
@@ -43,10 +43,10 @@ function FigAlternativePage() {
       <GuidePage
         eyebrow="Fig alternative"
         title="The autocomplete workflow, without the assistant around it."
-        intro="Fastab is a focused, open-source terminal completion engine for people who liked Fig-style suggestions and want a local macOS tool dedicated to autocomplete."
+        intro="FasTab is a focused, open-source terminal completion engine for people who liked Fig-style suggestions and want a local macOS tool dedicated to autocomplete."
       >
         <GuideCallout>
-          Fastab is a fork of{" "}
+          FasTab is a fork of{" "}
           <a href="https://github.com/chen86860/easy-complete">Easy Complete</a>,
           based on{" "}
           <a href="https://github.com/aws/amazon-q-developer-cli">
@@ -56,7 +56,7 @@ function FigAlternativePage() {
           to the Easy Complete, Amazon, and Fig contributors.
         </GuideCallout>
 
-        <h2 className={GUIDE_HEADING}>What Fastab keeps</h2>
+        <h2 className={GUIDE_HEADING}>What FasTab keeps</h2>
         <GuideList>
           <li>
             IDE-style suggestions for flags, subcommands, arguments, and paths.
@@ -71,7 +71,7 @@ function FigAlternativePage() {
 
         <h2 className={GUIDE_HEADING}>What it deliberately leaves out</h2>
         <p className={GUIDE_PARAGRAPH}>
-          Fastab is not a chat product or a cloud coding assistant.
+          FasTab is not a chat product or a cloud coding assistant.
           Completion generation stays on your Mac, requires no account, and
           makes no AI requests. This fork has all telemetry off.
         </p>
@@ -81,7 +81,7 @@ function FigAlternativePage() {
             <thead className="border-b border-(--border) bg-(--surface) font-mono text-xs uppercase tracking-wider text-(--muted)">
               <tr>
                 <th className="px-5 py-4">Capability</th>
-                <th className="px-5 py-4">Fastab</th>
+                <th className="px-5 py-4">FasTab</th>
               </tr>
             </thead>
             <tbody className="text-(--muted)">
@@ -110,7 +110,7 @@ function FigAlternativePage() {
 
         <h2 className={GUIDE_HEADING}>Who it is for</h2>
         <p className={GUIDE_PARAGRAPH}>
-          Fastab is a good fit if you want structured command
+          FasTab is a good fit if you want structured command
           suggestions, prefer local software, use an Apple Silicon Mac, and do
           not need a terminal chat assistant bundled with autocomplete.
         </p>
@@ -119,7 +119,7 @@ function FigAlternativePage() {
             href={DOWNLOAD_URL}
             className="inline-flex rounded-md bg-(--accent) px-5 py-3 font-semibold text-(--accent-fg) transition-opacity hover:opacity-90"
           >
-            Download Fastab
+            Download FasTab
           </a>
         </p>
 
@@ -127,7 +127,7 @@ function FigAlternativePage() {
           links={[
             {
               href: "/install",
-              label: "Install Fastab",
+              label: "Install FasTab",
               description: "Get the ARM64 app running on macOS.",
             },
             {

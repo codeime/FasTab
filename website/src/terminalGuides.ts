@@ -33,7 +33,7 @@ export interface TerminalGuide {
 const INPUT_METHOD_SETUP: TerminalGuideSection = {
   heading: "Set it up",
   body: [
-    "Install Fastab, approve Accessibility, then install the optional input method from Settings → Behavior or `ftab integrations install input-method`.",
+    "Install FasTab, approve Accessibility, then install the optional input method from Settings → Behavior or `ftab integrations install input-method`.",
     "Quit the terminal completely after that — macOS loads input methods when a process starts, so a reopened window is not enough.",
     "`ftab doctor` reports the shell hook and the input method separately, so it tells you which half is missing.",
   ],
@@ -47,29 +47,29 @@ export const terminalGuides: TerminalGuide[] = [
     integration: "input-method",
     bundleId: "io.appmakes.otty",
     processNames: ["Otty", "otty"],
-    seoTitle: "Otty Autocomplete on macOS — Fastab",
+    seoTitle: "Otty Autocomplete on macOS — FasTab",
     seoDescription:
-      "Add IDE-style autocomplete to Otty on macOS. Fastab tracks the Otty caret through its bundled input method and coexists with Otty's own shell integration.",
+      "Add IDE-style autocomplete to Otty on macOS. FasTab tracks the Otty caret through its bundled input method and coexists with Otty's own shell integration.",
     eyebrow: "Otty autocomplete",
     heading: "Autocomplete in Otty, without fighting its shell integration.",
     intro:
-      "Otty support landed in Fastab v2.1.0: input-method cursor tracking, plus explicit handling for the shell-integration block Otty writes into your rc file.",
+      "Otty support landed in FasTab v2.1.0: input-method cursor tracking, plus explicit handling for the shell-integration block Otty writes into your rc file.",
     callout:
-      "Otty and Fastab both write to your shell rc file. Since v2.1.0 they coexist — Fastab no longer reports its own integration as broken when Otty owns the end of the file.",
+      "Otty and FasTab both write to your shell rc file. Since v2.1.0 they coexist — FasTab no longer reports its own integration as broken when Otty owns the end of the file.",
     sections: [
       INPUT_METHOD_SETUP,
       {
         heading: "Why both shell integrations can stay installed",
         body: [
-          "Otty appends its block to the absolute end of `~/.bashrc` and rewrites it whenever the app launches. Fastab used to require its own block to be last, so each app kept moving the other and Settings flip-flopped between working and \"needs setup\".",
-          "Fastab now accepts its block sitting near the end rather than demanding the last line, and leaves Otty's trailer in place. Otty's block is inert unless `$OTTY_SHELL_INTEGRATION` is set, so it costs nothing in other terminals.",
+          "Otty appends its block to the absolute end of `~/.bashrc` and rewrites it whenever the app launches. FasTab used to require its own block to be last, so each app kept moving the other and Settings flip-flopped between working and \"needs setup\".",
+          "FasTab now accepts its block sitting near the end rather than demanding the last line, and leaves Otty's trailer in place. Otty's block is inert unless `$OTTY_SHELL_INTEGRATION` is set, so it costs nothing in other terminals.",
         ],
       },
       {
-        heading: "Launch Fastab before you open Otty",
+        heading: "Launch FasTab before you open Otty",
         body: [
           "When the desktop app is not running, the shell integration stands down completely so Otty keeps its own completions. That decision is made once, when the shell starts.",
-          "A terminal opened while Fastab was closed stays uninstrumented for that whole session — start the app, then open a new Otty tab.",
+          "A terminal opened while FasTab was closed stays uninstrumented for that whole session — start the app, then open a new Otty tab.",
         ],
       },
       {
@@ -87,13 +87,13 @@ export const terminalGuides: TerminalGuide[] = [
     integration: "input-method",
     bundleId: "net.kovidgoyal.kitty",
     processNames: ["kitty"],
-    seoTitle: "Kitty Autocomplete on macOS — Fastab",
+    seoTitle: "Kitty Autocomplete on macOS — FasTab",
     seoDescription:
-      "Add IDE-style autocomplete to Kitty on macOS with Fastab. Set up input-method cursor tracking and fix suggestions that lag behind the caret.",
+      "Add IDE-style autocomplete to Kitty on macOS with FasTab. Set up input-method cursor tracking and fix suggestions that lag behind the caret.",
     eyebrow: "Kitty autocomplete",
     heading: "Completions that keep up with Kitty.",
     intro:
-      "Kitty renders its own glyphs on the GPU and does not expose the caret through the standard path, so Fastab reads the cursor position from a bundled macOS input method instead.",
+      "Kitty renders its own glyphs on the GPU and does not expose the caret through the standard path, so FasTab reads the cursor position from a bundled macOS input method instead.",
     callout:
       "Kitty runs as a single process for all its windows. Closing every window is not the same as quitting — use ⌘Q so the input method is reloaded on next launch.",
     sections: [
@@ -110,7 +110,7 @@ export const terminalGuides: TerminalGuide[] = [
         heading: "Kitty tabs, splits, and shell state",
         body: [
           "Each Kitty window, tab, and split runs its own shell, so each one reports its own working directory and edit buffer. Suggestions follow whichever pane has focus.",
-          "If one split has completions and another does not, the second shell started before Fastab was running — reload it.",
+          "If one split has completions and another does not, the second shell started before FasTab was running — reload it.",
         ],
         code: "exec $SHELL",
       },
@@ -122,22 +122,22 @@ export const terminalGuides: TerminalGuide[] = [
     integration: "input-method",
     bundleId: "com.github.wez.wezterm",
     processNames: ["wezterm", "wezterm-gui"],
-    seoTitle: "WezTerm Autocomplete on macOS — Fastab",
+    seoTitle: "WezTerm Autocomplete on macOS — FasTab",
     seoDescription:
-      "Add IDE-style autocomplete to WezTerm on macOS with Fastab, including how the multiplexer and wezterm-gui process affect cursor tracking.",
+      "Add IDE-style autocomplete to WezTerm on macOS with FasTab, including how the multiplexer and wezterm-gui process affect cursor tracking.",
     eyebrow: "WezTerm autocomplete",
     heading: "WezTerm completions, including the panes you multiplex.",
     intro:
       "WezTerm gets pixel-accurate cursor tracking from the bundled macOS input method, and its shell hooks report the edit buffer from every pane.",
     callout:
-      "WezTerm ships two binaries: `wezterm` is the CLI front end, `wezterm-gui` is the window you actually type in. Fastab matches both, which is why `ftab doctor` may name `wezterm-gui`.",
+      "WezTerm ships two binaries: `wezterm` is the CLI front end, `wezterm-gui` is the window you actually type in. FasTab matches both, which is why `ftab doctor` may name `wezterm-gui`.",
     sections: [
       INPUT_METHOD_SETUP,
       {
         heading: "Multiplexer domains change where completions come from",
         body: [
           "`wezterm connect` and SSH domains run your shell on the remote host. Completions are generated from the shell that is actually running, so a remote pane suggests remote paths and remote binaries.",
-          "That also means a remote pane needs Fastab's shell integration installed on the remote side to suggest anything beyond the current token.",
+          "That also means a remote pane needs FasTab's shell integration installed on the remote side to suggest anything beyond the current token.",
         ],
       },
       {
@@ -155,22 +155,22 @@ export const terminalGuides: TerminalGuide[] = [
     integration: "input-method",
     bundleId: "org.alacritty",
     processNames: ["alacritty"],
-    seoTitle: "Alacritty Autocomplete on macOS — Fastab",
+    seoTitle: "Alacritty Autocomplete on macOS — FasTab",
     seoDescription:
-      "Add IDE-style autocomplete to Alacritty on macOS with Fastab, including how it behaves inside tmux where Alacritty has no native tabs.",
+      "Add IDE-style autocomplete to Alacritty on macOS with FasTab, including how it behaves inside tmux where Alacritty has no native tabs.",
     eyebrow: "Alacritty autocomplete",
     heading: "Alacritty is minimal. Completions do not have to be.",
     intro:
-      "Alacritty deliberately ships no tabs, splits, or scrollback UI. Fastab adds the completion layer on top through the bundled input method, without changing your prompt.",
+      "Alacritty deliberately ships no tabs, splits, or scrollback UI. FasTab adds the completion layer on top through the bundled input method, without changing your prompt.",
     callout:
-      "Alacritty has no tabs, so most users reach for tmux. Fastab follows the shell inside tmux — it treats tmux as a pseudoterminal to launch within, not as a terminal to skip.",
+      "Alacritty has no tabs, so most users reach for tmux. FasTab follows the shell inside tmux — it treats tmux as a pseudoterminal to launch within, not as a terminal to skip.",
     sections: [
       INPUT_METHOD_SETUP,
       {
         heading: "Working inside tmux",
         body: [
-          "Each Alacritty window is its own `alacritty` process, and inside it tmux owns the panes. Fastab instruments the shell in the pane, so completions follow the pane you are typing in.",
-          "Attaching to a tmux session created before Fastab was running gives you shells that were never instrumented. Start a new window in that session rather than restarting tmux.",
+          "Each Alacritty window is its own `alacritty` process, and inside it tmux owns the panes. FasTab instruments the shell in the pane, so completions follow the pane you are typing in.",
+          "Attaching to a tmux session created before FasTab was running gives you shells that were never instrumented. Start a new window in that session rather than restarting tmux.",
         ],
         code: "tmux new-window",
       },
@@ -189,21 +189,21 @@ export const terminalGuides: TerminalGuide[] = [
     integration: "input-method",
     bundleId: "dev.zed.Zed",
     processNames: ["zed"],
-    seoTitle: "Zed Terminal Autocomplete on macOS — Fastab",
+    seoTitle: "Zed Terminal Autocomplete on macOS — FasTab",
     seoDescription:
-      "Add IDE-style autocomplete to the Zed integrated terminal on macOS with Fastab, alongside Zed's own editor completions.",
+      "Add IDE-style autocomplete to the Zed integrated terminal on macOS with FasTab, alongside Zed's own editor completions.",
     eyebrow: "Zed terminal autocomplete",
     heading: "Completions in the Zed terminal panel.",
     intro:
-      "Zed's integrated terminal is a real terminal emulator, so Fastab treats it like one: shell hooks for the edit buffer, and the bundled input method for the caret.",
+      "Zed's integrated terminal is a real terminal emulator, so FasTab treats it like one: shell hooks for the edit buffer, and the bundled input method for the caret.",
     callout:
-      "Fastab only touches the terminal panel. Zed's editor completions and edit predictions are a separate system and are not affected either way.",
+      "FasTab only touches the terminal panel. Zed's editor completions and edit predictions are a separate system and are not affected either way.",
     sections: [
       INPUT_METHOD_SETUP,
       {
         heading: "The panel is one terminal among many",
         body: [
-          "Each terminal tab in the panel runs its own shell. A tab restored from a previous session — before Fastab was launched — will not have the integration loaded.",
+          "Each terminal tab in the panel runs its own shell. A tab restored from a previous session — before FasTab was launched — will not have the integration loaded.",
           "Open a new terminal tab, or reload the shell in the existing one.",
         ],
         code: "exec $SHELL",
@@ -223,20 +223,20 @@ export const terminalGuides: TerminalGuide[] = [
     integration: "accessibility",
     bundleId: "com.googlecode.iterm2",
     processNames: ["iTerm2"],
-    seoTitle: "iTerm2 Autocomplete on macOS — Fastab",
+    seoTitle: "iTerm2 Autocomplete on macOS — FasTab",
     seoDescription:
-      "Add IDE-style autocomplete to iTerm2 on macOS with Fastab. iTerm2 uses the Accessibility API rather than the bundled input method.",
+      "Add IDE-style autocomplete to iTerm2 on macOS with FasTab. iTerm2 uses the Accessibility API rather than the bundled input method.",
     eyebrow: "iTerm2 autocomplete",
     heading: "iTerm2 completions, without an input method.",
     intro:
-      "iTerm2 exposes its caret through the macOS Accessibility API, so Fastab reads the cursor position directly. There is no input method to register for this one.",
+      "iTerm2 exposes its caret through the macOS Accessibility API, so FasTab reads the cursor position directly. There is no input method to register for this one.",
     callout:
       "If a guide tells you to run `ftab integrations install input-method`, that advice is for Ghostty, Otty, Kitty, WezTerm, Alacritty, Zed, and JetBrains. In iTerm2 the equivalent fix is re-approving Accessibility.",
     sections: [
       {
         heading: "Set it up",
         body: [
-          "Install Fastab, approve it under System Settings → Privacy & Security → Device Control and Data Access (Accessibility on macOS 26 and earlier), then reload your shell. iTerm2 needs no further integration.",
+          "Install FasTab, approve it under System Settings → Privacy & Security → Device Control and Data Access (Accessibility on macOS 26 and earlier), then reload your shell. iTerm2 needs no further integration.",
           "If the permission prompt never appeared, trigger it again from the CLI.",
         ],
         code: "ftab debug prompt-accessibility\nexec $SHELL",
@@ -244,7 +244,7 @@ export const terminalGuides: TerminalGuide[] = [
       {
         heading: "It coexists with iTerm2 Shell Integration",
         body: [
-          "iTerm2's own Shell Integration writes its own prompt markers and status bar hooks. Fastab's hooks are separate and additive — you can keep both installed.",
+          "iTerm2's own Shell Integration writes its own prompt markers and status bar hooks. FasTab's hooks are separate and additive — you can keep both installed.",
           "If you have customised `PROMPT_COMMAND` or `precmd` heavily, run `ftab doctor` to confirm both hooks still load.",
         ],
         code: "ftab doctor",

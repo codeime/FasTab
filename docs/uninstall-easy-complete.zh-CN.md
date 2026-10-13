@@ -1,6 +1,6 @@
 # 卸载 Easy Complete
 
-Fastab 是另一个产品。`ftab uninstall` 和 `scripts/uninstall.sh` 都不会卸
+FasTab 是另一个产品。`ftab uninstall` 和 `scripts/uninstall.sh` 都不会卸
 Easy Complete、Fig 或 Amazon Q。
 
 只有在你想把 Easy Complete **卸干净**时才需要这篇。两个应用可以并排装在磁盘上
@@ -8,7 +8,7 @@ Easy Complete、Fig 或 Amazon Q。
 补全包装：已经在 `ecterm` 里时 `Q_TERM` 已设置，`ftab init` 会让路。
 
 不要删 `~/.fig`、Amazon Q 的 LaunchAgent，也不要整文件删 fish 的
-`00_fig_pre.fish` / `99_fig_post.fish`——Fig、Amazon Q 和 Fastab 共用这两个
+`00_fig_pre.fish` / `99_fig_post.fish`——Fig、Amazon Q 和 FasTab 共用这两个
 文件名。只剥 Easy Complete 的行。
 
 ## 1. 官方卸载（`ec` 还能跑时）
@@ -28,7 +28,7 @@ ec uninstall
 
 ## 2. 扫残留
 
-第 1 步之后可以再跑一遍；Fastab 已经装上了也安全——这些路径只属于 Easy Complete。
+第 1 步之后可以再跑一遍；FasTab 已经装上了也安全——这些路径只属于 Easy Complete。
 
 ```bash
 pkill -x easy-complete 2>/dev/null || true
@@ -101,10 +101,10 @@ fi
 再到**系统设置**里看一眼：
 
 - 通用 → 登录项：去掉 **Easy Complete**
-- 键盘 → 输入法：如果还列着 **Easy Complete**，删掉。Fastab 不会帮你清
+- 键盘 → 输入法：如果还列着 **Easy Complete**，删掉。FasTab 不会帮你清
   `dev.emmmm.easy-complete.inputmethod`。只有第 1 步里 `ec` 还能跑
   `integrations uninstall input-method` 时才会清掉输入法列表里的那一行。
-- 隐私与安全 → 设备控制和数据访问（macOS 26 及更早叫辅助功能）——Fastab
+- 隐私与安全 → 设备控制和数据访问（macOS 26 及更早叫辅助功能）——FasTab
   要自己再授一次（`app.fastab`）。Easy Complete 的勾选不算。
 
 ## 3. 确认干净
@@ -131,13 +131,13 @@ grep -nE 'ec init|easy-complete' \
   ~/.ssh/config 2>/dev/null || true
 ```
 
-## 4. 再装 Fastab
+## 4. 再装 FasTab
 
 Easy Complete 卸完后**新开一个终端**。旧的 `ecterm` 标签里还带着 `Q_TERM`，
-Fastab 不会再包装它。
+FasTab 不会再包装它。
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Fastab.app"
 ```
 
-启动 Fastab，在 Fastab 设置里授予辅助功能，然后在新窗口里 `exec $SHELL`。
+启动 FasTab，在 FasTab 设置里授予辅助功能，然后在新窗口里 `exec $SHELL`。

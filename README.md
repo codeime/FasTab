@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="./assets/logo.png" alt="Fastab" width="140px">
+  <img src="./assets/logo.png" alt="FasTab" width="140px">
 </p>
 
-<h1 align="center">Fastab (Native)</h1>
+<h1 align="center">FasTab (Native)</h1>
 
 <p align="center">
   <b>IDE-style inline autocomplete for your macOS terminal — native GPUI, not a WebView.</b><br/>
@@ -22,7 +22,7 @@
   <b>English</b> · <a href="./README.zh-CN.md">简体中文</a>
 </p>
 
-**Fastab (Native)** is a macOS terminal autocomplete app — IDE-style inline
+**FasTab (Native)** is a macOS terminal autocomplete app — IDE-style inline
 completions for your shell, rendered in a native GPUI overlay that follows your
 cursor. The popup and the settings window are real native views, not WKWebView.
 Completions run in a local Rust engine. It is a local-first completion engine
@@ -35,7 +35,7 @@ your commands never leave your Mac. **This fork has all telemetry off and collec
 nothing.** See the [Privacy page](https://fastab.app/privacy-policy).
 
 <p align="center">
-  <img src="./.github/media/screenshot.png" alt="Fastab autocomplete in action">
+  <img src="./.github/media/screenshot.png" alt="FasTab autocomplete in action">
 </p>
 
 > **Platform:** macOS only. The published DMG is Apple Silicon / ARM64 only.
@@ -80,15 +80,15 @@ Then:
    xattr -dr com.apple.quarantine "/Applications/Fastab.app"
    ```
 
-4. Launch **Fastab** from `/Applications`.
-5. Open Fastab Settings and click **Grant Accessibility**.
+4. Launch **FasTab** from `/Applications`.
+5. Open FasTab Settings and click **Grant Accessibility**.
 6. Reload your shell:
 
    ```bash
    exec $SHELL
    ```
 
-On first launch, Fastab sets up the bundled CLI binaries, shell integration,
+On first launch, FasTab sets up the bundled CLI binaries, shell integration,
 and login startup entries. The input method is optional — install it from Settings →
 Behavior, or with `ftab integrations install input-method`, for Ghostty, Kitty,
 WezTerm, Zed, Alacritty, and Otty. To verify the installation, run:
@@ -115,7 +115,7 @@ The source installer will:
 3. Symlink the `ftab` and `fterm` CLIs into `~/.local/bin`, keeping `fastabterm` as a compatibility alias for existing shell integrations.
 4. Let you enable **Launch at Login** from Settings (a system Login Item on macOS 13+, with a LaunchAgent fallback on macOS 12).
 5. Set up shell integration. `./scripts/install.sh` also registers the optional input method (DMG first launch does not).
-6. Leave Accessibility for you to grant from Fastab Settings (required — see below).
+6. Leave Accessibility for you to grant from FasTab Settings (required — see below).
 
 When it finishes, reload your shell:
 
@@ -125,8 +125,8 @@ exec $SHELL
 
 ### Grant Accessibility permission
 
-Fastab positions the completion popup relative to your focused terminal
-window, which requires the macOS **Accessibility** permission. Open Fastab
+FasTab positions the completion popup relative to your focused terminal
+window, which requires the macOS **Accessibility** permission. Open FasTab
 Settings and click **Grant Accessibility**. That opens:
 
 > System Settings → Privacy & Security → Device Control and Data Access
@@ -134,12 +134,12 @@ Settings and click **Grant Accessibility**. That opens:
 > On macOS 26 and earlier the same list is named **Accessibility**. Grant still
 > opens it.
 
-and floats a card you can drag **Fastab** from into the list. The app never
+and floats a card you can drag **FasTab** from into the list. The app never
 opens that pane on its own.
 
-Fastab is a **separate product** from Easy Complete. Both can be installed
+FasTab is a **separate product** from Easy Complete. Both can be installed
 at the same time (`app.fastab` vs `dev.emmmm.easy-complete`). Grant
-Accessibility to Fastab itself — Easy Complete's checkbox does not cover
+Accessibility to FasTab itself — Easy Complete's checkbox does not cover
 this binary. Do not run both completion desktops in the same terminal
 session (that would nest PTYs).
 
@@ -152,9 +152,9 @@ ftab debug prompt-accessibility
 
 ### Coming from Easy Complete
 
-Fastab will not uninstall Easy Complete. To switch cleanly, follow
+FasTab will not uninstall Easy Complete. To switch cleanly, follow
 [Uninstall Easy Complete](./docs/uninstall-easy-complete.md) first, then
-install Fastab and open a **new** terminal. An old `ecterm` tab still has
+install FasTab and open a **new** terminal. An old `ecterm` tab still has
 `Q_TERM` set, so `ftab init` stands down.
 
 ---
@@ -170,7 +170,7 @@ suggestions appear inline as you type.
 | `⇥` (Tab) / `→` | Accept the highlighted suggestion |
 | `Esc`           | Dismiss the popup                 |
 
-The native settings window is available from the **Fastab menu bar icon**
+The native settings window is available from the **FasTab menu bar icon**
 (system tray).
 
 Useful CLI commands:
@@ -200,7 +200,7 @@ Settings → Behavior, or with `ftab integrations install input-method`.
 ```
 
 This removes the app bundle, CLI symlinks, LaunchAgent, input method, shell
-integration, and all application data. It surgically removes only Fastab's own
+integration, and all application data. It surgically removes only FasTab's own
 input source from the system preferences (your other keyboard layouts and input
 methods are left untouched). Easy Complete, Fig, and Amazon Q stay installed.
 
@@ -210,7 +210,7 @@ To remove Easy Complete, see [Uninstall Easy Complete](./docs/uninstall-easy-com
 
 ## 🧩 How it works
 
-Fastab runs as three cooperating native processes that talk over Unix domain
+FasTab runs as three cooperating native processes that talk over Unix domain
 sockets (Protobuf messages):
 
 | Binary          | Crate         | Role                                                                                                                             |
@@ -291,7 +291,7 @@ Process memory: `./scripts/memory-usage.sh` (`--watch 5`, `--peak`, `--csv mem.c
 
 ## 📜 License
 
-Licensed under the MIT License. Fastab is a separate product forked from
+Licensed under the MIT License. FasTab is a separate product forked from
 Easy Complete, based on the Amazon Q Developer CLI and Fig; those copyright
 notices stay in
 [LICENSE](./LICENSE). Third-party terms are collected in

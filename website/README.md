@@ -1,6 +1,6 @@
-# Fastab — Landing Page
+# FasTab — Landing Page
 
-Marketing site for [Fastab](https://github.com/codeime/easy-complete), built from the
+Marketing site for [FasTab](https://github.com/codeime/easy-complete), built from the
 Claude Design source (`Fastab.dc.html`).
 
 **Stack:** TanStack Start + React + TypeScript + Tailwind CSS v4, deployed on Cloudflare

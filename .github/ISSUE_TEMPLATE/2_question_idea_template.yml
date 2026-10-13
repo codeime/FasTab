@@ -1,5 +1,5 @@
 name: "Question or idea"
-description: "Ask about Fastab or suggest an improvement / 提问或提出改进建议"
+description: "Ask about FasTab or suggest an improvement / 提问或提出改进建议"
 title: "question: "
 body:
   - type: dropdown

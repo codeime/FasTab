@@ -1,5 +1,5 @@
 name: "Feature request"
-description: "Suggest an improvement to Fastab / 为 Fastab 提出改进建议"
+description: "Suggest an improvement to FasTab / 为 FasTab 提出改进建议"
 
 title: "feat: "
 labels: ["enhancement"]
@@ -15,10 +15,10 @@ body:
   attributes:
     label: "What problem would this solve?"
     description: |
-      Describe what you are trying to do and where Fastab gets in the way. Understanding
+      Describe what you are trying to do and where FasTab gets in the way. Understanding
       the underlying problem often leads to a better solution than the one first imagined.
 
-      请描述你想做什么、以及 Fastab 在哪里挡住了你。理解真实需求往往能找到比最初设想更好的方案。
+      请描述你想做什么、以及 FasTab 在哪里挡住了你。理解真实需求往往能找到比最初设想更好的方案。
   validations:
     required: true
 

@@ -123,7 +123,7 @@ export const terminalSupport: TerminalSupport[] = [
     name: "Otty",
     slug: "otty",
     integration: "input-method",
-    note: "Optional input method from Settings → Behavior, or `ftab integrations install input-method`. Fastab leaves Otty's own shell-integration block at the end of your rc file alone.",
+    note: "Optional input method from Settings → Behavior, or `ftab integrations install input-method`. FasTab leaves Otty's own shell-integration block at the end of your rc file alone.",
     isNew: true,
   },
   {
@@ -198,34 +198,34 @@ export interface Faq {
 
 export const faqs: Faq[] = [
   {
-    question: "What is Fastab?",
+    question: "What is FasTab?",
     answer:
-      "Fastab is a macOS terminal autocomplete app that shows IDE-style inline suggestions for command-line tools.",
+      "FasTab is a macOS terminal autocomplete app that shows IDE-style inline suggestions for command-line tools.",
   },
   {
-    question: "Does Fastab run locally?",
+    question: "Does FasTab run locally?",
     answer:
       "Yes. Autocomplete runs fully on-device — no account, no cloud calls, no AI requests, and your commands never leave your Mac.",
   },
   {
-    question: "What data does Fastab collect?",
+    question: "What data does FasTab collect?",
     answer:
-      "This fork has all telemetry off. Fastab collects nothing — no commands, no completions, no usage counts.",
+      "This fork has all telemetry off. FasTab collects nothing — no commands, no completions, no usage counts.",
   },
   {
-    question: "Which terminals does Fastab support?",
+    question: "Which terminals does FasTab support?",
     answer:
-      "Fastab supports Ghostty, Otty, Kitty, WezTerm, Alacritty, Zed, iTerm2, Apple Terminal, VS Code, ChatGPT (Codex), and JetBrains IDE terminals.",
+      "FasTab supports Ghostty, Otty, Kitty, WezTerm, Alacritty, Zed, iTerm2, Apple Terminal, VS Code, ChatGPT (Codex), and JetBrains IDE terminals.",
   },
   {
-    question: "How do I install Fastab?",
+    question: "How do I install FasTab?",
     answer:
       "Download the ARM64 DMG from GitHub Releases, then follow the Install section on the homepage.",
   },
   {
     question: "Do I need to uninstall Easy Complete first?",
     answer:
-      "Only if you want Easy Complete gone. Fastab will not uninstall it. Both can sit on disk, but they must not wrap the same terminal. See docs/uninstall-easy-complete.md on GitHub.",
+      "Only if you want Easy Complete gone. FasTab will not uninstall it. Both can sit on disk, but they must not wrap the same terminal. See docs/uninstall-easy-complete.md on GitHub.",
   },
 ];
 
@@ -268,7 +268,7 @@ export const docSections: DocSection[] = [
     id: "terminals",
     title: "Terminal support",
     summary:
-      "Every terminal reads your command through the same shell integration — they differ in how Fastab finds the caret to position the overlay.",
+      "Every terminal reads your command through the same shell integration — they differ in how FasTab finds the caret to position the overlay.",
     links: [
       {
         href: "/terminals/ghostty",
@@ -280,7 +280,7 @@ export const docSections: DocSection[] = [
         href: "/terminals/otty",
         label: "Otty autocomplete",
         description:
-          "Input-method tracking, plus how Fastab coexists with Otty's own shell-integration block.",
+          "Input-method tracking, plus how FasTab coexists with Otty's own shell-integration block.",
       },
       {
         href: "/terminals/kitty",

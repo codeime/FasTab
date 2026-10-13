@@ -1,5 +1,5 @@
 name: "Bug report"
-description: "Report something that is broken in Fastab / 报告 Fastab 的问题"
+description: "Report something that is broken in FasTab / 报告 FasTab 的问题"
 
 title: "bug: "
 labels: ["bug"]
@@ -30,7 +30,7 @@ body:
 - type: input
   id: "app-version"
   attributes:
-    label: "Fastab version"
+    label: "FasTab version"
     description: "Output of `ftab --version` / `ftab --version` 的输出"
     placeholder: "2.2.1"
   validations:
@@ -50,7 +50,7 @@ body:
   attributes:
     label: "Terminal"
     description: |
-      Fastab tracks the cursor differently per terminal — through the input method, the
+      FasTab tracks the cursor differently per terminal — through the input method, the
       accessibility API, or the pseudoterminal — so this usually decides where a bug lives.
 
       不同终端的光标追踪方式不同（输入法 / 辅助功能 API / 伪终端），这一项往往直接决定问题出在哪。

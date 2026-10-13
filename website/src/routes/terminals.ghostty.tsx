@@ -11,9 +11,9 @@ import {
 import { AX_SETTINGS_PANE_EN, AX_SETTINGS_PANE_EN_LEGACY } from "../data.ts";
 import { SeoJsonLd, guideSchema, pageHead } from "../seo.tsx";
 
-const TITLE = "Ghostty Autocomplete on macOS — Fastab";
+const TITLE = "Ghostty Autocomplete on macOS — FasTab";
 const DESCRIPTION =
-  "Add IDE-style autocomplete to Ghostty on macOS with Fastab. Learn how the shell integration and bundled input method keep suggestions aligned.";
+  "Add IDE-style autocomplete to Ghostty on macOS with FasTab. Learn how the shell integration and bundled input method keep suggestions aligned.";
 const ALTERNATES = [
   { locale: "en" as const, path: "/terminals/ghostty" },
   { locale: "zh-CN" as const, path: "/zh/terminals/ghostty" },
@@ -44,7 +44,7 @@ function GhosttyPage() {
       <GuidePage
         eyebrow="Ghostty autocomplete"
         title="IDE-style completions that follow your Ghostty cursor."
-        intro="Fastab combines shell state with a bundled macOS input method so its native suggestion window stays aligned inside Ghostty."
+        intro="FasTab combines shell state with a bundled macOS input method so its native suggestion window stays aligned inside Ghostty."
       >
         <h2 className={GUIDE_HEADING}>What gets installed</h2>
         <GuideList>
@@ -79,7 +79,7 @@ function GhosttyPage() {
               href="/install"
               className="text-(--accent) underline underline-offset-4"
             >
-              Install Fastab
+              Install FasTab
             </a>{" "}
             and grant Accessibility permission.
           </li>
@@ -101,7 +101,7 @@ ftab doctor`}</pre>
         </p>
         <pre className={GUIDE_CODE}>ftab integrations install input-method</pre>
         <p className={GUIDE_PARAGRAPH}>
-          Also confirm that Fastab remains enabled under{" "}
+          Also confirm that FasTab remains enabled under{" "}
           {AX_SETTINGS_PANE_EN} ({AX_SETTINGS_PANE_EN_LEGACY}).
         </p>
 

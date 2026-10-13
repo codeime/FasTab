@@ -4,12 +4,12 @@ import { GITHUB_URL } from "../data.ts";
 import { SeoJsonLd, guideSchema, pageHead } from "../seo.tsx";
 
 const PRIVACY_DESCRIPTION =
-  "This Fastab fork has all telemetry off and collects nothing. The settings below no longer apply.";
+  "This FasTab fork has all telemetry off and collects nothing. The settings below no longer apply.";
 
 export const Route = createFileRoute("/privacy-policy")({
   head: () =>
     pageHead({
-      title: "Privacy Policy — Fastab",
+      title: "Privacy Policy — FasTab",
       description: PRIVACY_DESCRIPTION,
       path: "/privacy-policy",
     }),
@@ -25,7 +25,7 @@ function PrivacyPage() {
     <div className="min-h-screen bg-(--canvas) text-(--ink)">
       <SeoJsonLd
         data={guideSchema({
-          title: "Privacy Policy — Fastab",
+          title: "Privacy Policy — FasTab",
           description: PRIVACY_DESCRIPTION,
           path: "/privacy-policy",
           crumbLabel: "Privacy Policy",
@@ -39,7 +39,7 @@ function PrivacyPage() {
           className="mb-10 font-mono text-xs text-(--muted)"
         >
           <a href="/" className="transition-colors hover:text-(--accent)">
-            Fastab
+            FasTab
           </a>
           <span className="px-2">/</span>
           <a href="/#install" className="transition-colors hover:text-(--accent)">

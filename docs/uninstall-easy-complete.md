@@ -1,6 +1,6 @@
 # Uninstall Easy Complete
 
-Fastab is a separate product. `ftab uninstall` and `scripts/uninstall.sh` never
+FasTab is a separate product. `ftab uninstall` and `scripts/uninstall.sh` never
 remove Easy Complete, Fig, or Amazon Q.
 
 You only need this guide if you want Easy Complete **gone**. Both apps can sit
@@ -9,7 +9,7 @@ the same terminal session: `ftab init` stands down when `Q_TERM` is already
 set (an `ecterm` session).
 
 Do not delete `~/.fig`, Amazon Q LaunchAgents, or fish `00_fig_pre.fish` /
-`99_fig_post.fish` wholesale — Fig, Amazon Q, and Fastab share those fish
+`99_fig_post.fish` wholesale — Fig, Amazon Q, and FasTab share those fish
 filenames. Only strip Easy Complete lines.
 
 ## 1. Official uninstall (if `ec` still runs)
@@ -29,7 +29,7 @@ terminal that was already wrapped by `ecterm`.
 
 ## 2. Leftover sweep
 
-Safe to run after step 1, and safe if Fastab is already installed — these
+Safe to run after step 1, and safe if FasTab is already installed — these
 paths are Easy Complete only.
 
 ```bash
@@ -104,11 +104,11 @@ In **System Settings**:
 
 - General → Login Items — remove **Easy Complete**
 - Keyboard → Input Sources — remove **Easy Complete** if it is still listed.
-  Fastab will not drop `dev.emmmm.easy-complete.inputmethod`. Step 1 clears
+  FasTab will not drop `dev.emmmm.easy-complete.inputmethod`. Step 1 clears
   that row only while `ec` can still run `integrations uninstall input-method`.
 - Privacy & Security → Device Control and Data Access (Accessibility on
-  macOS 26 and earlier) — Fastab needs its own grant (`app.fastab`).
-  Easy Complete's checkbox does not cover Fastab.
+  macOS 26 and earlier) — FasTab needs its own grant (`app.fastab`).
+  Easy Complete's checkbox does not cover FasTab.
 
 ## 3. Confirm
 
@@ -134,14 +134,14 @@ grep -nE 'ec init|easy-complete' \
   ~/.ssh/config 2>/dev/null || true
 ```
 
-## 4. Then install Fastab
+## 4. Then install FasTab
 
 Open a **new** terminal after Easy Complete is gone. An old `ecterm` tab
-still has `Q_TERM` set and Fastab will not wrap it.
+still has `Q_TERM` set and FasTab will not wrap it.
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Fastab.app"
 ```
 
-Launch Fastab, grant Accessibility from Fastab Settings, then `exec $SHELL`
+Launch FasTab, grant Accessibility from FasTab Settings, then `exec $SHELL`
 in a new window.

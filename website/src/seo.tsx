@@ -8,8 +8,8 @@ const HREFLANG: Record<Locale, string> = {
   "zh-CN": "zh-Hans",
 };
 
-export const SITE_NAME = "Fastab";
-export const HOME_TITLE = "Fastab — macOS terminal autocomplete";
+export const SITE_NAME = "FasTab";
+export const HOME_TITLE = "FasTab — macOS terminal autocomplete";
 export const HOME_DESCRIPTION =
   "IDE-style suggestions as you type — git, docker, npm, cargo — in Ghostty, iTerm2, VS Code, Kitty, and more. Native GPUI overlay, fully on-device. This fork has all telemetry off.";
 
@@ -44,7 +44,7 @@ export function pageHead({
   title,
   description,
   path,
-  imageAlt = "Fastab terminal autocomplete preview",
+  imageAlt = "FasTab terminal autocomplete preview",
   robots = "index, follow",
   locale = "en",
   alternates,
@@ -81,8 +81,8 @@ export function pageHead({
           content: OG_LOCALE[alternate.locale],
         })),
       { property: "og:image", content: image },
-      { property: "og:image:width", content: "1200" },
-      { property: "og:image:height", content: "630" },
+      { property: "og:image:width", content: "1734" },
+      { property: "og:image:height", content: "907" },
       { property: "og:image:alt", content: imageAlt },
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:title", content: title },
@@ -203,7 +203,7 @@ export function guideSchema({
   const docsPath = locale === "en" ? "/docs" : "/zh/docs";
   const isDocsRoot = path === docsPath;
 
-  // Mirrors the visible trail: Fastab / Docs / <page>.
+  // Mirrors the visible trail: FasTab / Docs / <page>.
   const trail = [
     { name: SITE_NAME, item: absoluteUrl(locale === "en" ? "/" : "/zh") },
     ...(isDocsRoot

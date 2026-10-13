@@ -80,34 +80,34 @@ const reasonsZh: Reason[] = [
 
 const faqsZh: Faq[] = [
   {
-    question: "Fastab 是什么?",
+    question: "FasTab 是什么?",
     answer:
-      "Fastab 是一款 macOS 终端自动补全应用,为命令行工具提供 IDE 风格的行内建议",
+      "FasTab 是一款 macOS 终端自动补全应用,为命令行工具提供 IDE 风格的行内建议",
   },
   {
-    question: "Fastab 在本地运行吗?",
+    question: "FasTab 在本地运行吗?",
     answer:
       "是的。补全完全在本机完成——无账号、无云端请求、无 AI 调用,命令内容不会离开你的 Mac",
   },
   {
-    question: "Fastab 会收集哪些数据?",
+    question: "FasTab 会收集哪些数据?",
     answer:
-      "本 fork 关闭全部遥测。Fastab 不收集任何信息——没有命令内容、没有补全文本、没有使用计数。",
+      "本 fork 关闭全部遥测。FasTab 不收集任何信息——没有命令内容、没有补全文本、没有使用计数。",
   },
   {
-    question: "Fastab 支持哪些终端?",
+    question: "FasTab 支持哪些终端?",
     answer:
-      "Fastab 支持 Ghostty、Otty、Kitty、WezTerm、Alacritty、Zed、iTerm2、Apple Terminal、VS Code、ChatGPT(Codex)以及 JetBrains 系 IDE 终端。",
+      "FasTab 支持 Ghostty、Otty、Kitty、WezTerm、Alacritty、Zed、iTerm2、Apple Terminal、VS Code、ChatGPT(Codex)以及 JetBrains 系 IDE 终端。",
   },
   {
-    question: "如何安装 Fastab?",
+    question: "如何安装 FasTab?",
     answer:
       "从 GitHub Releases 下载 ARM64 DMG，然后按首页的安装步骤操作。",
   },
   {
-    question: "装 Fastab 前要先卸 Easy Complete 吗?",
+    question: "装 FasTab 前要先卸 Easy Complete 吗?",
     answer:
-      "只有想把 Easy Complete 卸干净时才需要。Fastab 不会替你卸。两个可以并排装，但不能包装同一个终端。步骤见 GitHub 上的 docs/uninstall-easy-complete.zh-CN.md。",
+      "只有想把 Easy Complete 卸干净时才需要。FasTab 不会替你卸。两个可以并排装，但不能包装同一个终端。步骤见 GitHub 上的 docs/uninstall-easy-complete.zh-CN.md。",
   },
 ];
 
@@ -131,7 +131,7 @@ const processesZh: Process[] = [
 
 const NOTE_ZH: Record<string, string> = {
   Ghostty: "可选输入法：设置 → 行为，或 `ftab integrations install input-method`",
-  Otty: "可选输入法：设置 → 行为，或 `ftab integrations install input-method`；并且 Fastab 会保留 Otty 自己写在 rc 文件末尾的集成块",
+  Otty: "可选输入法：设置 → 行为，或 `ftab integrations install input-method`；并且 FasTab 会保留 Otty 自己写在 rc 文件末尾的集成块",
   Kitty: "可选输入法：设置 → 行为，或 `ftab integrations install input-method`",
   WezTerm: "可选输入法：设置 → 行为，或 `ftab integrations install input-method`",
   Alacritty: "可选输入法：设置 → 行为，或 `ftab integrations install input-method`",
@@ -171,7 +171,7 @@ const docSectionsZh: DocSection[] = [
     id: "terminals",
     title: "终端支持",
     summary:
-      "所有终端都通过同一套 Shell 集成读取你输入的命令——区别在于 Fastab 用什么方式定位光标来摆放浮层",
+      "所有终端都通过同一套 Shell 集成读取你输入的命令——区别在于 FasTab 用什么方式定位光标来摆放浮层",
     links: [
       {
         href: "/zh/terminals/ghostty",
@@ -182,7 +182,7 @@ const docSectionsZh: DocSection[] = [
         href: "/terminals/otty",
         label: "Otty 自动补全(英文)",
         description:
-          "输入法光标跟踪,以及 Fastab 如何与 Otty 自己的 Shell 集成共存",
+          "输入法光标跟踪,以及 FasTab 如何与 Otty 自己的 Shell 集成共存",
       },
       {
         href: "/terminals/iterm2",
@@ -231,7 +231,7 @@ export const homeCopyZh: HomeCopy = {
   featuresHeading: "补全一条命令所需的一切，多余的一概没有",
   featuresSubheading: "只做一件事并做好——没有聊天、没有 AI 调用、没有云端补全",
 
-  whyLabel: "为什么选 Fastab",
+  whyLabel: "为什么选 FasTab",
   whyHeading: "刻意为之的取舍",
 
   terminalsLabel: "支持的终端",
@@ -258,13 +258,13 @@ export const homeCopyZh: HomeCopy = {
   docsLabel: "文档",
   docsHeading: "从下载到第一次补全",
   docsSubheading:
-    "安装 Fastab、确认你的终端是否受支持、为 Ghostty 配置光标跟踪,或修复 Shell 集成——都不用翻源码仓库",
+    "安装 FasTab、确认你的终端是否受支持、为 Ghostty 配置光标跟踪,或修复 Shell 集成——都不用翻源码仓库",
   docsCta: "文档与安装 →",
 
   ctaHeading: "别再背参数了",
   ctaSubheading: "让终端替你记住",
   ctaFootnote: "需要 macOS 12+ · Apple Silicon(ARM64) · MIT",
-  ctaTagline: "Fastab · 本地终端自动补全",
+  ctaTagline: "FasTab · 本地终端自动补全",
   features: featuresZh,
   reasons: reasonsZh,
   faqs: faqsZh,
@@ -277,7 +277,7 @@ export const docsCopyZh: DocsCopy = {
   eyebrow: "文档",
   heading: "装好它,接上终端,让它一直好用",
   intro:
-    "Fastab 需要你做的事都在这一页:Native ARM64 DMG、一项 macOS 权限,以及一份支持列表,让你知道自己的终端走的是哪条路径",
+    "FasTab 需要你做的事都在这一页:Native ARM64 DMG、一项 macOS 权限,以及一份支持列表,让你知道自己的终端走的是哪条路径",
   quickStart: "快速开始",
   installGuideCta: "完整安装指南",
   downloadCta: "下载 DMG",
@@ -288,7 +288,7 @@ export const docsCopyZh: DocsCopy = {
   newBadge: "新增",
   terminalsCalloutLead: `v2.1.0 新增 —— ${NEW_TERMINAL_NAMES_ZH}。`,
   terminalsCalloutBody:
-    "Otty 获得输入法光标跟踪,并且 Fastab 现在能与 Otty 管理的 Shell rc 文件共存,而不再把自己的集成误报为损坏。ChatGPT(Codex)会话则通过 xterm.js 光标定位跟踪,与 VS Code 走同一条路径",
+    "Otty 获得输入法光标跟踪,并且 FasTab 现在能与 Otty 管理的 Shell rc 文件共存,而不再把自己的集成误报为损坏。ChatGPT(Codex)会话则通过 xterm.js 光标定位跟踪,与 VS Code 走同一条路径",
   docSections: docSectionsZh,
   terminalSupport: terminalSupportZh,
 };

@@ -10,9 +10,9 @@ import {
 import { DOWNLOAD_URL } from "../download.ts";
 import { SeoJsonLd, guideSchema, pageHead } from "../seo.tsx";
 
-const TITLE = "开源、本地运行的 macOS Fig 替代方案 — Fastab";
+const TITLE = "开源、本地运行的 macOS Fig 替代方案 — FasTab";
 const DESCRIPTION =
-  "Fastab 是免费、开源、完全本地运行的 Fig 风格终端自动补全工具，支持 Apple Silicon Mac 上的 zsh、bash 和 fish。";
+  "FasTab 是免费、开源、完全本地运行的 Fig 风格终端自动补全工具，支持 Apple Silicon Mac 上的 zsh、bash 和 fish。";
 const ALTERNATES = [
   { locale: "en" as const, path: "/fig-alternative" },
   { locale: "zh-CN" as const, path: "/zh/fig-alternative" },
@@ -45,12 +45,12 @@ function ZhFigAlternativePage() {
       <GuidePage
         eyebrow="Fig 替代方案"
         title="保留自动补全体验，去掉外围助手功能。"
-        intro="Fastab 是一款专注、开源的终端补全工具，适合喜欢 Fig 风格建议，又希望使用完全本地 macOS 自动补全的人。"
+        intro="FasTab 是一款专注、开源的终端补全工具，适合喜欢 Fig 风格建议，又希望使用完全本地 macOS 自动补全的人。"
         locale="zh-CN"
         hrefs={{ en: "/fig-alternative", "zh-CN": "/zh/fig-alternative" }}
       >
         <GuideCallout>
-          Fastab fork 自{" "}
+          FasTab fork 自{" "}
           <a href="https://github.com/chen86860/easy-complete">Easy Complete</a>
           ，基于{" "}
           <a href="https://github.com/aws/amazon-q-developer-cli">
@@ -60,7 +60,7 @@ function ZhFigAlternativePage() {
           。感谢 Easy Complete、Amazon 与 Fig 的贡献者。
         </GuideCallout>
 
-        <h2 className={GUIDE_HEADING}>Fastab 保留了什么</h2>
+        <h2 className={GUIDE_HEADING}>FasTab 保留了什么</h2>
         <GuideList>
           <li>针对选项、子命令、参数和路径的 IDE 风格建议。</li>
           <li>显示在当前终端光标旁的原生建议窗口。</li>
@@ -70,7 +70,7 @@ function ZhFigAlternativePage() {
 
         <h2 className={GUIDE_HEADING}>刻意不包含什么</h2>
         <p className={GUIDE_PARAGRAPH}>
-          Fastab 不是聊天产品，也不是云端编程助手。补全完全在 Mac
+          FasTab 不是聊天产品，也不是云端编程助手。补全完全在 Mac
           本地生成，无需账号，也不会发起 AI 请求。本 fork 关闭全部遥测。
         </p>
 
@@ -79,7 +79,7 @@ function ZhFigAlternativePage() {
             <thead className="border-b border-(--border) bg-(--surface) font-mono text-xs uppercase tracking-wider text-(--muted)">
               <tr>
                 <th className="px-5 py-4">能力</th>
-                <th className="px-5 py-4">Fastab</th>
+                <th className="px-5 py-4">FasTab</th>
               </tr>
             </thead>
             <tbody className="text-(--muted)">
@@ -109,7 +109,7 @@ function ZhFigAlternativePage() {
         <h2 className={GUIDE_HEADING}>适合哪些人</h2>
         <p className={GUIDE_PARAGRAPH}>
           如果你需要结构化命令建议，偏好本地软件，使用 Apple Silicon
-          Mac，且不想把终端聊天助手与自动补全捆绑在一起，Fastab
+          Mac，且不想把终端聊天助手与自动补全捆绑在一起，FasTab
           会很合适。
         </p>
         <p>
@@ -117,7 +117,7 @@ function ZhFigAlternativePage() {
             href={DOWNLOAD_URL}
             className="inline-flex rounded-md bg-(--accent) px-5 py-3 font-semibold text-(--accent-fg) transition-opacity hover:opacity-90"
           >
-            下载 Fastab
+            下载 FasTab
           </a>
         </p>
 
@@ -126,7 +126,7 @@ function ZhFigAlternativePage() {
           links={[
             {
               href: "/zh/install",
-              label: "安装 Fastab",
+              label: "安装 FasTab",
               description: "在 macOS 上安装并运行 ARM64 版本。",
             },
             {

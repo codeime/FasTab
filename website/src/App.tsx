@@ -42,7 +42,7 @@ const PAGE: Record<
     stepDownload: "Download the DMG and drag Fastab.app into /Applications.",
     stepQuarantine: "Clear Gatekeeper quarantine (required while unsigned):",
     stepLaunch:
-      "Open Fastab from Applications, then Grant Accessibility in Settings. Fastab can sit beside Easy Complete — grant Fastab itself; do not run both completion apps in the same terminal.",
+      "Open FasTab from Applications, then Grant Accessibility in Settings. FasTab can sit beside Easy Complete — grant FasTab itself; do not run both completion apps in the same terminal.",
     stepAccess: "Accessibility pane:",
     stepReload: "Reload your shell:",
     stepDoctor: "Check the install:",
@@ -52,7 +52,7 @@ const PAGE: Record<
       "Ghostty, Otty, Kitty, WezTerm, Zed, Alacritty: Settings → Behavior, or ftab integrations install input-method.",
     helpCli: "If ftab is missing, add ~/.local/bin to PATH.",
     helpEc:
-      "Coming from Easy Complete? Fastab will not uninstall it. Open a new terminal after removing ecterm.",
+      "Coming from Easy Complete? FasTab will not uninstall it. Open a new terminal after removing ecterm.",
     helpEcLink: "Uninstall Easy Complete",
     helpEcHref: `${GITHUB_URL}/blob/main/docs/uninstall-easy-complete.md`,
   },
@@ -61,7 +61,7 @@ const PAGE: Record<
     installLead: "macOS 12+ · Apple Silicon。未签名构建需要先清一次隔离属性。",
     stepDownload: "下载 DMG，把 Fastab.app 拖进 /Applications。",
     stepQuarantine: "清除 Gatekeeper 隔离（未签名时必须做一次）：",
-    stepLaunch: "从应用程序打开 Fastab，在设置里授予辅助功能。可以和 Easy Complete 并排安装；请单独给 Fastab 授权，不要在同一终端里同时跑两套补全。",
+    stepLaunch: "从应用程序打开 FasTab，在设置里授予辅助功能。可以和 Easy Complete 并排安装；请单独给 FasTab 授权，不要在同一终端里同时跑两套补全。",
     stepAccess: "辅助功能位置：",
     stepReload: "重载 Shell：",
     stepDoctor: "检查安装：",
@@ -71,7 +71,7 @@ const PAGE: Record<
       "Ghostty、Otty、Kitty、WezTerm、Zed、Alacritty：设置 → 行为，或 ftab integrations install input-method。",
     helpCli: "找不到 ftab 时，把 ~/.local/bin 加进 PATH。",
     helpEc:
-      "从 Easy Complete 迁过来？Fastab 不会替你卸。卸掉 ecterm 之后请新开终端。",
+      "从 Easy Complete 迁过来？FasTab 不会替你卸。卸掉 ecterm 之后请新开终端。",
     helpEcLink: "卸载 Easy Complete",
     helpEcHref: `${GITHUB_URL}/blob/main/docs/uninstall-easy-complete.zh-CN.md`,
   },

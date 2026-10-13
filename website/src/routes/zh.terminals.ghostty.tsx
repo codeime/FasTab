@@ -11,9 +11,9 @@ import {
 import { AX_SETTINGS_PANE_ZH, AX_SETTINGS_PANE_ZH_LEGACY } from "../data.ts";
 import { SeoJsonLd, guideSchema, pageHead } from "../seo.tsx";
 
-const TITLE = "在 macOS 上为 Ghostty 启用自动补全 — Fastab";
+const TITLE = "在 macOS 上为 Ghostty 启用自动补全 — FasTab";
 const DESCRIPTION =
-  "使用 Fastab 为 macOS 上的 Ghostty 添加 IDE 风格终端自动补全，了解 Shell 集成与随附输入法如何让建议窗口准确跟随光标。";
+  "使用 FasTab 为 macOS 上的 Ghostty 添加 IDE 风格终端自动补全，了解 Shell 集成与随附输入法如何让建议窗口准确跟随光标。";
 const ALTERNATES = [
   { locale: "en" as const, path: "/terminals/ghostty" },
   { locale: "zh-CN" as const, path: "/zh/terminals/ghostty" },
@@ -46,7 +46,7 @@ function ZhGhosttyPage() {
       <GuidePage
         eyebrow="Ghostty 自动补全"
         title="让 IDE 风格补全准确跟随 Ghostty 光标。"
-        intro="Fastab 将 Shell 状态与随附的 macOS 输入法结合，让原生建议窗口在 Ghostty 中始终对准当前光标。"
+        intro="FasTab 将 Shell 状态与随附的 macOS 输入法结合，让原生建议窗口在 Ghostty 中始终对准当前光标。"
         locale="zh-CN"
         hrefs={{
           en: "/terminals/ghostty",
@@ -76,7 +76,7 @@ function ZhGhosttyPage() {
               href="/zh/install"
               className="text-(--accent) underline underline-offset-4"
             >
-              安装 Fastab
+              安装 FasTab
             </a>
             ，并授予辅助功能权限。
           </li>
@@ -94,7 +94,7 @@ function ZhGhosttyPage() {
         </p>
         <pre className={GUIDE_CODE}>ftab integrations install input-method</pre>
         <p className={GUIDE_PARAGRAPH}>
-          还要确认「{AX_SETTINGS_PANE_ZH}」中仍然启用了 Fastab（
+          还要确认「{AX_SETTINGS_PANE_ZH}」中仍然启用了 FasTab（
           {AX_SETTINGS_PANE_ZH_LEGACY}）。
         </p>
 
