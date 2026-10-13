@@ -2627,7 +2627,20 @@ mod tests {
         assert_eq!(retired.next_word_bytes, active.next_word_bytes);
         assert!(Arc::ptr_eq(&lines, &engine.frecency.command_lines()));
         let rebuilt = engine.complete(request).unwrap();
-        assert_eq!(rebuilt, first);
+        assert_eq!(
+            rebuilt.suggestions, first.suggestions,
+            "all row metadata and ordering survive retirement"
+        );
+        assert_eq!(rebuilt.public_ai_context, first.public_ai_context);
+        assert_eq!(rebuilt.fuzzy, first.fuzzy);
+        assert_eq!(rebuilt.search_term, first.search_term);
+        assert_eq!(rebuilt.match_term, first.match_term);
+        assert_eq!(
+            rebuilt.current_arg.as_ref().map(|arg| (&arg.name, &arg.description)),
+            first.current_arg.as_ref().map(|arg| (&arg.name, &arg.description))
+        );
+        assert_eq!(rebuilt.pending_generators, first.pending_generators);
+        assert_eq!(rebuilt.debounce_ms, first.debounce_ms);
         assert_eq!(engine.diagnostics().history.index_count, 1);
     }
 

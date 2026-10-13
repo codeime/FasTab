@@ -138,7 +138,7 @@ fn pending_generator_finishes(cx: &mut gpui::TestAppContext, only_show_on_tab: b
     assert_eq!(waited_ms, DEBOUNCE_MS);
     cx.update(|cx| overlay.apply_debounced_complete(debounce_generation, waited_ms, cx));
 
-    let (generation, second, second_session, second_cwd) = completion_event(cx, &engine, &events);
+    let (_generation, second, second_session, _second_cwd) = completion_event(cx, &engine, &events);
     assert_eq!(second_session, session);
     assert!(!second.pending_generators, "the follow-up must complete the generator");
     assert_eq!(
