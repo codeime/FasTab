@@ -141,7 +141,7 @@ impl DesktopHost {
                 host.ipc_local_connections = crate::local_ipc::active_connections();
                 #[cfg(target_os = "macos")]
                 {
-                    host.host_ax_events = self.platform_state.inner().pending_ax_events();
+                    host.host_ax_events = crate::platform::PlatformStateImpl::pending_ax_events();
                 }
                 {
                     let sessions = self.figterm_state.inner.lock();

@@ -236,6 +236,9 @@ impl Event {
     }
 }
 
+// Admission needs the owned allocation's capacity and charges borrowed text
+// zero bytes; a &str would erase both ownership and spare-capacity information.
+#[allow(clippy::ptr_arg)]
 fn cow_capacity(value: &Cow<'static, str>) -> usize {
     match value {
         Cow::Borrowed(_) => 0,

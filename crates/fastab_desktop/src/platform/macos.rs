@@ -441,7 +441,7 @@ fn apply_autocomplete_window_level(_window_map: &FigIdMap, terminal_level: Optio
 }
 
 impl PlatformStateImpl {
-    pub(crate) fn pending_ax_events(&self) -> usize {
+    pub(crate) fn pending_ax_events() -> usize {
         UNMANAGED
             .window_server
             .read()

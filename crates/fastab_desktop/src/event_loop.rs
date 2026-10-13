@@ -277,7 +277,7 @@ impl EventLoopProxy {
             Ok::<_, tokio::sync::AcquireError>((slot, payload))
         })
         .await
-        .map_err(|_| EventAdmissionError::Closed)?;
+        .map_err(|_err| EventAdmissionError::Closed)?;
         self.budget.async_events.fetch_add(1, Ordering::Relaxed);
         self.budget.async_bytes.fetch_add(bytes, Ordering::Relaxed);
         Ok(EventAdmission {
@@ -299,7 +299,7 @@ impl EventLoopProxy {
         *pending = Weak::new();
         self.tx
             .send(QueuedEvent { event, admission })
-            .map_err(|_| EventAdmissionError::Closed)
+            .map_err(|_err| EventAdmissionError::Closed)
     }
 
     pub(crate) async fn send_overlay_input_async(&self, input: OverlayInput) -> Result<(), EventAdmissionError> {
@@ -321,7 +321,7 @@ impl EventLoopProxy {
         }
         let admission = self.admit(input.payload_bytes()).await?;
         self.enqueue_input(input, admission)
-            .map_err(|_| EventAdmissionError::Closed)
+            .map_err(|_err| EventAdmissionError::Closed)
     }
 
     /// Post an event to the GPUI host.
