@@ -217,3 +217,19 @@ GPT-6 Astra ultra 已复核 M1/M2、generator 去重、NextWords/历史索引、
 4. 同负载安装版冷启动、连续使用、空闲 10/60 秒和长时间放置的 `phys_footprint`、heap、owner 与恢复延迟对照。原安装版的 28.4 MiB 不属于此次 diff 的收益。
 
 **明确保留：**native 同步 host/AX 等来源尚无统一硬上限；reader backing 未增加进程级聚合诊断；O7 watcher 仍按原条件等待事件风暴证据。没有用截断唯一候选、缩短 10 秒空闲期限、清空稳定 FontId 或强制 allocator relief 来掩盖这些边界。
+
+## 9. 提交后复核：事件顺序回归修复
+
+上轮 `38918d1b` 的远端 Rust / JavaScript CI 已通过，包含 workspace 测试、资源生命周期回放和 dist 构建。随后对照实施前的 `e5717811` 复核，确认以下三处是本轮新增回归；第 8 节记录的是此前源码审查时的结论，不能替代这次发现。
+
+| 引入提交 | 回归 | 本次修复 |
+| --- | --- | --- |
+| `7fd63f2b` | key settlement 和 Remote Insert 同时就绪时，公平选择可能先写 Insert，越过暂存的普通输入 | 生产 selector 将 sync deadline、连接状态和按键结算放在普通 I/O 之前；普通 I/O 之间继续公平选择，handler 仍在 selector 外执行 |
+| `7fd63f2b` | child exit 和 PTY 数据同时就绪时，可能先退出而丢失尾部输出 | child exit 放在普通 I/O 之后，恢复旧实现对已就绪 PTY 输出的优先级；这不是新增完整的 EOF 排空协议 |
+| `4b389d76` | 输入等待 admission 时，同步焦点事件先进入 FIFO；恢复后的旧输入借用新窗口 caret 重新显示 | 输入在 hook 入口取得顺序号，跨预算与 legacy 通知等待保留；host 仅在原有身份校验接受真实焦点变化后推进失效边界。旧非空输入不再恢复，旧空输入只结束对应会话；新输入与普通 caret 保留 |
+
+回归用例直接覆盖生产 selector、真实 outbox / socket / InsertText / PTY 输出，以及满 count / bytes 队列、已入队但未处理的焦点事件、同文新输入去重和旧空输入的会话隔离。焦点失效也包含经身份校验的 `TerminalCaret { invalidate_input: true }`；过期 focus 与普通 caret 不推进失效边界。
+
+主代理与 GPT-6 Astra 独立复核最终 diff 后，未发现未解决的高置信阻断问题；直接 `rustfmt --check` 与 `git diff --check` 通过。移除了派发路径提取后不再使用的内部 `GpuiOverlayBuffer`，避免为测试保留生产死代码。
+
+本次工作区修复需重新通过确切提交的远端 CI；上轮绿色结果不覆盖这些新增修改。本地不构建、不执行项目测试。安装版的切窗、输入顺序及实际物理内存收益仍需分别验收。
