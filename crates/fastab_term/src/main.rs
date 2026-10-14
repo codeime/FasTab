@@ -1101,7 +1101,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                         if insertion_retry.active() {
                             insertion_retry.wait().await;
                         } else {
-                            std::future::pending().await
+                            std::future::pending::<()>().await;
                         }
                     },
                 ),
