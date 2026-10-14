@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.0.8
+
+- change: use FasTab as the app's display name while preserving bundle identifiers, installation paths and command names for existing installations.
+- change: bound asynchronous desktop and terminal event admission, connection lifetimes and incoming IPC frames; release oversized receive buffers and retired session text.
+- fix: enforce synchronized terminal output size and time limits, allocate its buffer on demand and release oversized capacity after replay.
+- change: reduce generator, history, environment and suggestion-rendering allocations; retire derived history indexes after the idle grace while preserving completion content and ranking.
+- change: coalesce pending input-method caret updates into one slot and cancel superseded completion debounce tasks.
+- fix: preserve complete PTY insertion writes, paste bytes and escape prefixes across read boundaries; prioritize ready key settlement before concurrent remote insertion and process ready PTY output before child exit.
+- fix: reject delayed input from an earlier focus context, preserve fresh same-text input and prevent an old session's empty input from hiding a newer session's suggestions.
+
 ## v0.0.7
 
 - change: defer hidden completion, caret queries, history materialization and hook catalog parsing until needed; release hidden suggestion payloads after the idle grace.
