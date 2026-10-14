@@ -83,6 +83,43 @@ enum MainLoopReady {
     ChildExited,
 }
 
+/// Preserve settlement barriers before ordinary I/O and already-ready I/O
+/// before child exit. Only readiness futures belong here; handlers run after
+/// this returns so a timer cannot cancel a partial PTY or stdout write.
+async fn select_main_loop_ready(
+    sync_timeout: impl std::future::Future<Output = ()>,
+    state_changed: impl std::future::Future,
+    key_changed: impl std::future::Future<Output = ()>,
+    ordinary_io: (
+        impl std::future::Future<Output = std::result::Result<MainLoopEvent, flume::RecvError>>,
+        impl std::future::Future<Output = std::result::Result<term::InputEventResult, flume::RecvError>>,
+        impl std::future::Future<Output = std::io::Result<usize>>,
+        impl std::future::Future<Output = std::result::Result<RemoteIncoming, flume::RecvError>>,
+        impl std::future::Future<Output = std::result::Result<LocalIncoming, flume::RecvError>>,
+        impl std::future::Future<Output = ()>,
+    ),
+    child_exited: impl std::future::Future,
+) -> MainLoopReady {
+    let (control, input, pty, remote, local, retry) = ordinary_io;
+    select! {
+        biased;
+        _ = sync_timeout => MainLoopReady::SyncTimeout,
+        _ = state_changed => MainLoopReady::RemoteStateChanged,
+        _ = key_changed => MainLoopReady::KeyDeliveryChanged,
+        ready = async {
+            select! {
+                result = control => MainLoopReady::Control(result),
+                result = input => MainLoopReady::Input(result),
+                result = pty => MainLoopReady::Pty(result),
+                result = remote => MainLoopReady::Remote(result),
+                result = local => MainLoopReady::Local(result),
+                _ = retry => MainLoopReady::InsertionRetry,
+            }
+        } => ready,
+        _ = child_exited => MainLoopReady::ChildExited,
+    }
+}
+
 /// Replay settled failed intercepted keys, then flush deferred ordinary PTY
 /// input and deferred Inserts once no intercepted key is still awaiting write
 /// settlement. Never blocks the main loop on in-flight key delivery.
@@ -1050,25 +1087,27 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 
             insertion_retry.update(INSERTION_LOCK.lock().unwrap().as_ref().map(|lock| lock.at));
             let sync_deadline = processor.sync_timeout().copied();
-            let ready = select! {
-                biased;
-                _ = wait_for_pty_sync_timeout(sync_deadline) => MainLoopReady::SyncTimeout,
-                // Choose ready I/O fairly, but never race/cancel a handler's
-                // partially completed PTY or stdout write against the timer.
-                ready = async {
-                    select! {
-                        _ = remote_state_changes.changed() => MainLoopReady::RemoteStateChanged,
-                        _ = remote_sender.key_delivery_changed() => MainLoopReady::KeyDeliveryChanged,
-                        result = main_loop_rx.recv_async() => MainLoopReady::Control(result),
-                        result = input_rx.recv_async() => MainLoopReady::Input(result),
-                        result = master.read(&mut write_buffer) => MainLoopReady::Pty(result),
-                        result = remote_receiver.recv_async() => MainLoopReady::Remote(result),
-                        result = incoming_receiver.recv_async() => MainLoopReady::Local(result),
-                        _ = insertion_retry.wait(), if insertion_retry.active() => MainLoopReady::InsertionRetry,
-                        _ = &mut child_rx => MainLoopReady::ChildExited,
-                    }
-                } => ready,
-            };
+            let ready = select_main_loop_ready(
+                wait_for_pty_sync_timeout(sync_deadline),
+                remote_state_changes.changed(),
+                remote_sender.key_delivery_changed(),
+                (
+                    main_loop_rx.recv_async(),
+                    input_rx.recv_async(),
+                    master.read(&mut write_buffer),
+                    remote_receiver.recv_async(),
+                    incoming_receiver.recv_async(),
+                    async {
+                        if insertion_retry.active() {
+                            insertion_retry.wait().await;
+                        } else {
+                            std::future::pending().await
+                        }
+                    },
+                ),
+                &mut child_rx,
+            )
+            .await;
             let select_result: Result<()> = match ready {
                 MainLoopReady::SyncTimeout => {
                     let mut control = MainLoopControl {
@@ -2031,6 +2070,232 @@ mod tests {
             modes.push(false);
             assert_eq!(output.immediate_modes, modes);
             assert!(output.csi_u_set);
+        }
+
+        #[tokio::test]
+        async fn ready_sync_state_and_key_settlement_precede_ordinary_io() {
+            let sender = RemoteSender::test_ready();
+            let mut changes = sender.subscribe();
+            let generation = sender.phase().ready_generation().unwrap();
+            sender
+                .for_generation(generation)
+                .try_send_key(
+                    hook_to_message(fastab_proto::remote_hooks::new_intercepted_key_hook(
+                        None,
+                        "navigateDown",
+                        "x",
+                    )),
+                    bytes::Bytes::from_static(b"x"),
+                )
+                .unwrap();
+            let frame = sender.test_hold_frame().await;
+            sender.test_retire();
+            drop(frame);
+            let (control, controls) = flume::bounded(1);
+            control.send(MainLoopEvent::UnlockInterception).unwrap();
+            for step in 0..4 {
+                let ready = select_main_loop_ready(
+                    wait_for_pty_sync_timeout((step == 0).then(|| std::time::Instant::now() - Duration::from_secs(1))),
+                    changes.changed(),
+                    sender.key_delivery_changed(),
+                    (
+                        controls.recv_async(),
+                        std::future::pending(),
+                        std::future::pending(),
+                        std::future::pending(),
+                        std::future::pending(),
+                        std::future::pending(),
+                    ),
+                    std::future::pending::<()>(),
+                )
+                .await;
+                assert!(matches!(
+                    (step, ready),
+                    (0, MainLoopReady::SyncTimeout)
+                        | (1, MainLoopReady::RemoteStateChanged)
+                        | (2, MainLoopReady::KeyDeliveryChanged)
+                        | (3, MainLoopReady::Control(Ok(MainLoopEvent::UnlockInterception)))
+                ));
+            }
+        }
+
+        #[tokio::test]
+        async fn ready_key_settlement_flushes_ordinary_bytes_before_remote_insert() {
+            for _ in 0..32 {
+                use fastab_proto::figterm::InsertTextRequest;
+                use fastab_proto::remote::{Clientbound, clientbound};
+
+                let sender = RemoteSender::test_ready();
+                let mut changes = sender.subscribe();
+                let generation = sender.phase().ready_generation().unwrap();
+                sender
+                    .for_generation(generation)
+                    .try_send_key(
+                        hook_to_message(fastab_proto::remote_hooks::new_intercepted_key_hook(
+                            None,
+                            "navigateDown",
+                            "x",
+                        )),
+                        bytes::Bytes::from_static(b"x"),
+                    )
+                    .unwrap();
+                let mut frame = sender.test_hold_frame().await;
+                frame.write_to(&mut tokio::io::sink()).await.unwrap();
+                drop(frame);
+                let (remote, remotes) = flume::bounded(1);
+                remote
+                    .send(RemoteIncoming {
+                        generation,
+                        message: Clientbound {
+                            packet: Some(clientbound::Packet::Request(clientbound::Request {
+                                request: Some(clientbound::request::Request::InsertText(InsertTextRequest {
+                                    insertion: Some("completion".into()),
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            })),
+                        },
+                        permit: crate::ipc::incoming::IncomingBudget::new(1, 1024)
+                            .admit(1024)
+                            .await
+                            .unwrap(),
+                    })
+                    .unwrap();
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                let mut master: Box<dyn AsyncMasterPty + Send + Sync> = Box::new(SocketMaster(socket));
+                let mut buffer = [0; 16];
+                let mut deferred = BytesMut::from(b"ordinary".as_slice());
+                let mut inserts = VecDeque::new();
+                let mut interceptor = KeyInterceptor::new();
+                let events = LocalEvents::default();
+                let term = parser_term(&sender, &events, false);
+                let (control, _controls) = flume::bounded(1);
+                for step in 0..2 {
+                    let ready = select_main_loop_ready(
+                        wait_for_pty_sync_timeout(None),
+                        changes.changed(),
+                        sender.key_delivery_changed(),
+                        (
+                            std::future::pending(),
+                            std::future::pending(),
+                            master.read(&mut buffer),
+                            remotes.recv_async(),
+                            std::future::pending(),
+                            std::future::pending(),
+                        ),
+                        std::future::pending::<()>(),
+                    )
+                    .await;
+                    match (step, ready) {
+                        (0, MainLoopReady::KeyDeliveryChanged) => {
+                            reconcile_remote_state(&sender, &mut interceptor);
+                            flush_settled_pty_input(
+                                &sender,
+                                master.as_mut(),
+                                &mut deferred,
+                                &mut inserts,
+                                &mut interceptor,
+                                false,
+                            )
+                            .await
+                            .unwrap();
+                        },
+                        (1, MainLoopReady::Remote(Ok(incoming))) => {
+                            process_remote_message(
+                                incoming.message,
+                                control.clone(),
+                                sender.for_generation(incoming.generation),
+                                incoming.permit,
+                                &term,
+                                &mut master,
+                                &mut interceptor,
+                            )
+                            .await
+                            .unwrap();
+                        },
+                        _ => panic!("settlement must precede the already-ready InsertText"),
+                    }
+                }
+                let mut output = [0; 18];
+                tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut output))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&output, b"ordinarycompletion");
+                assert!(deferred.is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn ready_pty_tail_is_forwarded_before_ready_child_exit() {
+            for _ in 0..32 {
+                let sender = RemoteSender::test_disconnected();
+                let events = LocalEvents::default();
+                let mut term = parser_term(&sender, &events, false);
+                let mut processor = Processor::new();
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                let tail = b"last output before exit";
+                peer.write_all(tail).await.unwrap();
+                // Prove kernel readiness before marking the child exited; this
+                // regression concerns ready output, not a new EOF drain protocol.
+                socket.readable().await.unwrap();
+                let mut master = SocketMaster(socket);
+                let (child, mut child_exit) = oneshot::channel();
+                child.send(()).unwrap();
+                let (mut stdout, mut captured) = UnixStream::pair().unwrap();
+                let mut terminal = ModeTerminal::default();
+                let mut csi_u = CsiUState::default();
+                let mut deferred = BytesMut::new();
+                let mut inserts = VecDeque::new();
+                let mut interceptor = KeyInterceptor::new();
+                let mut buffer = [0; 8];
+                let mut forwarded = 0;
+                loop {
+                    let ready = select_main_loop_ready(
+                        wait_for_pty_sync_timeout(None),
+                        std::future::pending::<()>(),
+                        sender.key_delivery_changed(),
+                        (
+                            std::future::pending(),
+                            std::future::pending(),
+                            master.read(&mut buffer),
+                            std::future::pending(),
+                            std::future::pending(),
+                            std::future::pending(),
+                        ),
+                        &mut child_exit,
+                    )
+                    .await;
+                    match ready {
+                        MainLoopReady::Pty(Ok(size)) if size > 0 => {
+                            let mut control = MainLoopControl {
+                                remote_sender: &sender,
+                                master: &mut master,
+                                deferred_pty_input: &mut deferred,
+                                deferred_inserts: &mut inserts,
+                                key_interceptor: &mut interceptor,
+                                terminal: &mut terminal,
+                                stdout: &mut stdout,
+                                csi_u: &mut csi_u,
+                                bracketed_paste: false,
+                            };
+                            process_pty_bytes(&buffer[..size], &mut processor, &mut term, &events, &mut control)
+                                .await
+                                .unwrap();
+                            forwarded += size;
+                        },
+                        MainLoopReady::ChildExited => break,
+                        _ => panic!("only buffered PTY bytes or child exit should be ready"),
+                    }
+                }
+                assert_eq!(forwarded, tail.len());
+                let mut output = vec![0; tail.len()];
+                tokio::time::timeout(Duration::from_secs(2), captured.read_exact(&mut output))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(output, tail);
+            }
         }
 
         #[tokio::test]
