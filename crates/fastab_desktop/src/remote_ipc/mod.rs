@@ -48,6 +48,9 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         session_id: Uuid,
         figterm_state: &Arc<FigtermState>,
     ) -> Result<Option<clientbound::response::Response>> {
+        // Stamp the input before any bounded legacy notification can wait.
+        // A later accepted native focus must still supersede this input.
+        let input_sequence = self.proxy.begin_overlay_input();
         let _old_metrics = figterm_state.with_update(session_id, |session| {
             session.edit_buffer.update(&hook.text, hook.cursor);
             session
@@ -134,12 +137,15 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
             })
             .unwrap_or_default();
         self.proxy
-            .send_overlay_input_async(crate::event_loop::OverlayInput {
-                buffer: hook.text.clone(),
-                cwd,
-                cursor: hook.cursor.max(0) as u32,
-                session_id,
-            })
+            .send_overlay_input_with_sequence(
+                crate::event_loop::OverlayInput {
+                    buffer: hook.text.clone(),
+                    cwd,
+                    cursor: hook.cursor.max(0) as u32,
+                    session_id,
+                },
+                input_sequence,
+            )
             .await?;
 
         Ok(None)
@@ -346,6 +352,69 @@ mod tests {
             cursor: text.len() as i64,
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn legacy_notification_admission_keeps_the_edit_buffers_original_focus_order() {
+        use fastab_remote_ipc::RemoteHookHandler as _;
+
+        let state = Arc::new(FigtermState::new());
+        let (proxy, events) = crate::event_loop::channel();
+        // Fill the real ingress until a producer has to wait, without a
+        // second copy of its count/byte limit in this socket-hook fixture.
+        let mut admitted = 0;
+        loop {
+            let mut send = Box::pin(proxy.send_event_async(Event::ReloadAccessibility));
+            match futures::poll!(send.as_mut()) {
+                std::task::Poll::Ready(result) => {
+                    result.unwrap();
+                    admitted += 1;
+                },
+                std::task::Poll::Pending => break,
+            }
+        }
+        let notifications = Arc::new(WebviewNotificationsState::default());
+        let subscriptions = crate::webview::notification::WebviewNotificationWindowState::default();
+        subscriptions.insert(NotificationType::NotifyOnEditbuffferChange, 1);
+        notifications.subscriptions.insert(crate::DASHBOARD_ID, subscriptions);
+        let mut hook = RemoteHook {
+            notifications_state: notifications,
+            proxy: proxy.clone(),
+        };
+        let edit = EditBufferHook {
+            text: "git s".into(),
+            cursor: 5,
+            ..Default::default()
+        };
+        let mut pending = Box::pin(hook.edit_buffer(&edit, Uuid::nil(), &state));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        proxy
+            .send_event(Event::PlatformBoundEvent(
+                crate::platform::PlatformBoundEvent::ExternalWindowFocusChanged {
+                    #[cfg(target_os = "macos")]
+                    app: macos_utils::window_server::ApplicationSpecifier {
+                        pid: 1,
+                        bundle_id: "test.terminal".into(),
+                    },
+                    window: None,
+                },
+            ))
+            .unwrap();
+        for _ in 0..admitted {
+            events.recv_queued().await.unwrap().dispatch(|_, _| {});
+        }
+        pending.await.unwrap();
+        assert_eq!(events.len(), 3, "focus, legacy notification, then overlay input");
+        events.recv_queued().await.unwrap().dispatch(|event, sequence| {
+            assert!(matches!(event, Event::PlatformBoundEvent(_)));
+            proxy.accept_input_focus(sequence);
+        });
+        assert!(matches!(next_event(&events).await, Event::WindowEvent { .. }));
+        let Event::GpuiOverlayInput(input) = next_event(&events).await else {
+            panic!("expected input");
+        };
+        assert!(proxy.take_overlay_input(&input).is_none());
+        assert_eq!(proxy.diagnostics().async_events, 0);
     }
 
     #[tokio::test]

@@ -3247,6 +3247,118 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn delayed_input_cannot_restore_the_old_owner_after_host_accepts_focus(cx: &mut gpui::TestAppContext) {
+        use crate::event_loop::OverlayInput;
+        use crate::gpui_host::{dispatch_overlay_input, invalidate_overlay_input_focus};
+
+        let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+        let specs = tempfile::tempdir().unwrap();
+        let engine = EngineClient::spawn(specs.path().to_path_buf()).unwrap();
+        let (proxy, events) = crate::event_loop::channel();
+        let sessions = Arc::new(FigtermState::new());
+        let platform = Arc::new(PlatformState::new(proxy.clone()));
+        let mut overlay = cx.update(|cx| {
+            let mut overlay =
+                OverlayController::start(cx, engine, proxy.clone(), sessions.clone(), platform.clone()).unwrap();
+            overlay.enabled = true;
+            overlay
+        });
+        let old_session = Uuid::new_v4();
+        let fresh_session = Uuid::new_v4();
+        let input = |text: &str, session_id| OverlayInput {
+            buffer: text.into(),
+            cwd: String::new(),
+            cursor: text.len() as u32,
+            session_id,
+        };
+        cx.update(|cx| {
+            overlay.complete_buffer("git ".into(), String::new(), 4, old_session, sessions.clone(), cx);
+        });
+        // The initial hide notifies the AI observer before this fixture's
+        // ingress sequence begins. Account for that real host event explicitly.
+        for event in events.try_iter() {
+            assert!(matches!(event, Event::JevContextChanged));
+        }
+        let old_input = proxy.begin_overlay_input();
+        let old_empty = proxy.begin_overlay_input();
+        proxy
+            .send_event(Event::PlatformBoundEvent(
+                crate::platform::PlatformBoundEvent::ExternalWindowFocusChanged {
+                    #[cfg(target_os = "macos")]
+                    app: macos_utils::window_server::ApplicationSpecifier {
+                        pid: 1,
+                        bundle_id: "test.terminal".into(),
+                    },
+                    window: None,
+                },
+            ))
+            .unwrap();
+        futures::executor::block_on(async {
+            proxy
+                .send_overlay_input_with_sequence(input("git s", old_session), old_input)
+                .await
+                .unwrap();
+            proxy
+                .send_overlay_input_async(input("tool ", fresh_session))
+                .await
+                .unwrap();
+            proxy
+                .send_overlay_input_with_sequence(input("", old_session), old_empty)
+                .await
+                .unwrap();
+        });
+        // Exercise the host's post-validation focus handler; native identity
+        // discovery itself requires a real frontmost terminal, not a test app.
+        futures::executor::block_on(events.recv_queued())
+            .unwrap()
+            .dispatch(|_, sequence| {
+                cx.update(|cx| invalidate_overlay_input_focus(&proxy, &mut overlay, sequence, cx));
+            });
+        futures::executor::block_on(events.recv_queued())
+            .unwrap()
+            .dispatch(|event, _| {
+                let Event::GpuiOverlayInput(input) = event else {
+                    panic!("old input")
+                };
+                cx.update(|cx| {
+                    assert!(!dispatch_overlay_input(&proxy, &mut overlay, &input, &sessions, cx));
+                    overlay.apply_position(WindowPosition::Centered, &platform, cx);
+                    assert!(overlay.last_input.lock().unwrap().is_none());
+                    assert!(matches!(overlay.completion_display, CompletionDisplayState::Idle));
+                    assert!(!overlay.state.read(cx).visible);
+                });
+            });
+        futures::executor::block_on(events.recv_queued())
+            .unwrap()
+            .dispatch(|event, _| {
+                let Event::GpuiOverlayInput(input) = event else {
+                    panic!("fresh input")
+                };
+                cx.update(|cx| {
+                    assert!(dispatch_overlay_input(&proxy, &mut overlay, &input, &sessions, cx));
+                    assert_eq!(overlay.current_session(), Some(fresh_session));
+                    assert_eq!(overlay.last_input.lock().unwrap().as_ref().unwrap().buffer, "tool ");
+                });
+            });
+        futures::executor::block_on(events.recv_queued())
+            .unwrap()
+            .dispatch(|event, _| {
+                let Event::GpuiOverlayInput(input) = event else {
+                    panic!("old empty input")
+                };
+                cx.update(|cx| {
+                    assert!(!dispatch_overlay_input(&proxy, &mut overlay, &input, &sessions, cx));
+                    assert_eq!(overlay.current_session(), Some(fresh_session));
+                    assert_eq!(overlay.last_input.lock().unwrap().as_ref().unwrap().buffer, "tool ");
+                    assert!(matches!(
+                        overlay.completion_display,
+                        CompletionDisplayState::WaitingForCaret
+                    ));
+                });
+            });
+    }
+
+    #[gpui::test]
     fn replaced_and_hidden_debounce_tasks_do_not_post_stale_events(cx: &mut gpui::TestAppContext) {
         let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
         let specs = tempfile::tempdir().unwrap();

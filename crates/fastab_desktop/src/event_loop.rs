@@ -5,7 +5,7 @@
 //! so the rest of the crate can keep calling `send_event`.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use tao::platform::macos::ActivationPolicy;
@@ -42,6 +42,9 @@ const ASYNC_EVENT_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug)]
 struct EventBudget {
     closed: AtomicBool,
+    next_sequence: AtomicU64,
+    last_barrier_sequence: AtomicU64,
+    accepted_focus_sequence: AtomicU64,
     slots: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     async_events: AtomicUsize,
@@ -66,6 +69,9 @@ impl EventBudget {
     fn new(slots: usize, bytes: usize) -> Self {
         Self {
             closed: AtomicBool::new(false),
+            next_sequence: AtomicU64::new(1),
+            last_barrier_sequence: AtomicU64::new(0),
+            accepted_focus_sequence: AtomicU64::new(0),
             slots: Arc::new(Semaphore::new(slots)),
             bytes: Arc::new(Semaphore::new(bytes)),
             async_events: AtomicUsize::new(0),
@@ -132,16 +138,18 @@ impl Drop for EventAdmission {
 pub(crate) struct QueuedEvent {
     event: Event,
     admission: EventAdmission,
+    sequence: InputSequence,
 }
 
 impl QueuedEvent {
-    pub(crate) fn dispatch<R>(self, dispatch: impl FnOnce(Event) -> R) -> R {
+    pub(crate) fn dispatch<R>(self, dispatch: impl FnOnce(Event, InputSequence) -> R) -> R {
         let Self {
             event,
             admission: _admission,
+            sequence,
         } = self;
         // Keep ownership charged through dispatch, not just while in flume.
-        dispatch(event)
+        dispatch(event, sequence)
     }
 }
 
@@ -158,24 +166,22 @@ impl EventLoopReceiver {
 
     #[cfg(test)]
     pub(crate) async fn recv_async(&self) -> Result<Event, flume::RecvError> {
-        self.recv_queued()
-            .await
-            .map(|event| event.dispatch(std::convert::identity))
+        self.recv_queued().await.map(|event| event.dispatch(|event, _| event))
     }
 
     #[cfg(test)]
     pub(crate) fn recv(&self) -> Result<Event, flume::RecvError> {
-        self.rx.recv().map(|event| event.dispatch(std::convert::identity))
+        self.rx.recv().map(|event| event.dispatch(|event, _| event))
     }
 
     #[cfg(test)]
     pub(crate) fn try_recv(&self) -> Result<Event, flume::TryRecvError> {
-        self.rx.try_recv().map(|event| event.dispatch(std::convert::identity))
+        self.rx.try_recv().map(|event| event.dispatch(|event, _| event))
     }
 
     #[cfg(test)]
     pub(crate) fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
-        self.rx.try_iter().map(|event| event.dispatch(std::convert::identity))
+        self.rx.try_iter().map(|event| event.dispatch(|event, _| event))
     }
 
     #[cfg(test)]
@@ -215,17 +221,31 @@ pub(crate) struct OverlayInput {
     pub session_id: uuid::Uuid,
 }
 
+/// Logical ingress order, allocated under the same lock as synchronous enqueue.
+/// An input keeps its ticket across admission and legacy notification waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct InputSequence(u64);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OverlayInputDispatch {
+    Complete(OverlayInput),
+    EndInput(uuid::Uuid),
+}
+
 /// Once taken by the host, an input is no longer eligible for queue deduplication.
 #[derive(Debug)]
-pub struct QueuedOverlayInput(Mutex<Option<OverlayInput>>);
+pub struct QueuedOverlayInput {
+    input: Mutex<Option<OverlayInput>>,
+    sequence: InputSequence,
+}
 
 impl QueuedOverlayInput {
     pub(crate) fn take(&self) -> Option<OverlayInput> {
-        self.0.lock().unwrap_or_else(|err| err.into_inner()).take()
+        self.input.lock().unwrap_or_else(|err| err.into_inner()).take()
     }
 
     pub(crate) fn payload_bytes(&self) -> usize {
-        self.0
+        self.input
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .as_ref()
@@ -234,6 +254,44 @@ impl QueuedOverlayInput {
 }
 
 impl EventLoopProxy {
+    pub(crate) fn begin_overlay_input(&self) -> InputSequence {
+        let _pending = self.pending_input.lock().unwrap_or_else(|err| err.into_inner());
+        self.next_sequence()
+    }
+
+    // Call only while holding pending_input, so a synchronous focus cannot
+    // enqueue between assigning an input's order and starting its wait.
+    fn next_sequence(&self) -> InputSequence {
+        InputSequence(self.budget.next_sequence.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Called only after the host's native focus/identity checks succeeded.
+    /// Caret updates and rejected stale native events must not advance this.
+    pub(crate) fn accept_input_focus(&self, sequence: InputSequence) {
+        self.budget
+            .accepted_focus_sequence
+            .fetch_max(sequence.0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_overlay_input(&self, queued: &QueuedOverlayInput) -> Option<OverlayInputDispatch> {
+        let input = queued.take()?;
+        if queued.sequence.0 < self.budget.accepted_focus_sequence.load(Ordering::Relaxed) {
+            // Preserve an old session's EndInput without selecting that
+            // session again or dismissing the newly focused session's rows.
+            return input
+                .buffer
+                .trim()
+                .is_empty()
+                .then_some(OverlayInputDispatch::EndInput(input.session_id));
+        }
+        Some(OverlayInputDispatch::Complete(input))
+    }
+
+    fn duplicates_pending_input(&self, previous: &QueuedOverlayInput, input: &OverlayInput) -> bool {
+        previous.sequence.0 > self.budget.last_barrier_sequence.load(Ordering::Relaxed)
+            && previous.input.lock().unwrap_or_else(|err| err.into_inner()).as_ref() == Some(input)
+    }
+
     pub(crate) fn diagnostics(&self) -> EventQueueDiagnostics {
         EventQueueDiagnostics {
             async_events: self.budget.async_events.load(Ordering::Relaxed),
@@ -296,13 +354,29 @@ impl EventLoopProxy {
         if self.budget.closed.load(Ordering::Acquire) {
             return Err(EventAdmissionError::Closed);
         }
+        let sequence = self.next_sequence();
+        self.budget.last_barrier_sequence.store(sequence.0, Ordering::Relaxed);
         *pending = Weak::new();
         self.tx
-            .send(QueuedEvent { event, admission })
+            .send(QueuedEvent {
+                event,
+                admission,
+                sequence,
+            })
             .map_err(|_err| EventAdmissionError::Closed)
     }
 
+    #[cfg(test)]
     pub(crate) async fn send_overlay_input_async(&self, input: OverlayInput) -> Result<(), EventAdmissionError> {
+        let sequence = self.begin_overlay_input();
+        self.send_overlay_input_with_sequence(input, sequence).await
+    }
+
+    pub(crate) async fn send_overlay_input_with_sequence(
+        &self,
+        input: OverlayInput,
+        sequence: InputSequence,
+    ) -> Result<(), EventAdmissionError> {
         // Preserve admission of identical pending input even when the budget
         // is full. Recheck after the await because any intervening event is a
         // barrier and the previous input may have been consumed meanwhile.
@@ -312,15 +386,15 @@ impl EventLoopProxy {
                 return Err(EventAdmissionError::Closed);
             }
             if !input.buffer.trim().is_empty()
-                && pending.upgrade().is_some_and(|previous| {
-                    previous.0.lock().unwrap_or_else(|err| err.into_inner()).as_ref() == Some(&input)
-                })
+                && pending
+                    .upgrade()
+                    .is_some_and(|previous| self.duplicates_pending_input(&previous, &input))
             {
                 return Ok(());
             }
         }
         let admission = self.admit(input.payload_bytes()).await?;
-        self.enqueue_input(input, admission)
+        self.enqueue_input(input, admission, sequence)
             .map_err(|_err| EventAdmissionError::Closed)
     }
 
@@ -332,20 +406,32 @@ impl EventLoopProxy {
         if self.budget.closed.load(Ordering::Acquire) {
             return Err(EventLoopClosed);
         }
+        let sequence = self.next_sequence();
+        self.budget.last_barrier_sequence.store(sequence.0, Ordering::Relaxed);
         *pending = Weak::new();
         let admission = self.synchronous_admission(event.ingress_payload_bytes());
         self.tx
-            .send(QueuedEvent { event, admission })
+            .send(QueuedEvent {
+                event,
+                admission,
+                sequence,
+            })
             .map_err(|_err| EventLoopClosed)
     }
 
     #[cfg(test)]
     pub(crate) fn send_overlay_input(&self, input: OverlayInput) -> Result<(), EventLoopClosed> {
+        let sequence = self.begin_overlay_input();
         let admission = self.synchronous_admission(input.payload_bytes());
-        self.enqueue_input(input, admission)
+        self.enqueue_input(input, admission, sequence)
     }
 
-    fn enqueue_input(&self, input: OverlayInput, admission: EventAdmission) -> Result<(), EventLoopClosed> {
+    fn enqueue_input(
+        &self,
+        input: OverlayInput,
+        admission: EventAdmission,
+        sequence: InputSequence,
+    ) -> Result<(), EventLoopClosed> {
         let mut pending = self.pending_input.lock().unwrap_or_else(|err| err.into_inner());
         if self.budget.closed.load(Ordering::Acquire) || self.tx.is_disconnected() {
             return Err(EventLoopClosed);
@@ -354,17 +440,21 @@ impl EventLoopProxy {
         // intermediate typing is needed to distinguish paste/history recall.
         if !input.buffer.trim().is_empty() {
             if let Some(previous) = pending.upgrade() {
-                if previous.0.lock().unwrap_or_else(|err| err.into_inner()).as_ref() == Some(&input) {
+                if self.duplicates_pending_input(&previous, &input) {
                     return Ok(());
                 }
             }
         }
-        let queued = Arc::new(QueuedOverlayInput(Mutex::new(Some(input))));
+        let queued = Arc::new(QueuedOverlayInput {
+            input: Mutex::new(Some(input)),
+            sequence,
+        });
         *pending = Arc::downgrade(&queued);
         self.tx
             .send(QueuedEvent {
                 event: Event::GpuiOverlayInput(queued),
                 admission,
+                sequence,
             })
             .map_err(|_err| EventLoopClosed)
     }
@@ -426,6 +516,16 @@ mod tests {
         }
     }
 
+    fn owned_payload_event(capacity: usize) -> Event {
+        Event::WindowEvent {
+            window_id: crate::AUTOCOMPLETE_ID,
+            window_event: crate::event::WindowEvent::Emit {
+                event_name: crate::event::EmitEventName::Notification,
+                payload: String::with_capacity(capacity).into(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn ingress_holds_admission_through_dispatch_without_blocking_sync_controls() {
         let (proxy, rx) = channel();
@@ -443,7 +543,7 @@ mod tests {
             futures::poll!(pending.as_mut()).is_pending(),
             "dequeue is still in flight"
         );
-        event.dispatch(|_| {
+        event.dispatch(|_, _| {
             proxy.send_event(Event::ReloadAccessibility).unwrap();
             assert_eq!(proxy.diagnostics().async_events, ASYNC_EVENT_LIMIT);
             assert_eq!(proxy.diagnostics().sync_events, 1);
@@ -463,12 +563,7 @@ mod tests {
     #[tokio::test]
     async fn ingress_bytes_cancelled_waiters_and_host_shutdown_release_ownership() {
         let (proxy, rx) = channel();
-        let event = || Event::GpuiOverlayBuffer {
-            buffer: String::with_capacity(ASYNC_EVENT_BYTES / 2 + 1),
-            cwd: String::new(),
-            cursor: 0,
-            session_id: uuid::Uuid::nil(),
-        };
+        let event = || owned_payload_event(ASYNC_EVENT_BYTES / 2 + 1);
         proxy.send_event_async(event()).await.unwrap();
         let mut cancelled = Box::pin(proxy.send_event_async(event()));
         assert!(
@@ -512,6 +607,138 @@ mod tests {
             }
         }
         assert_eq!(proxy.diagnostics().async_payload_bytes, 0);
+    }
+
+    fn focus_event() -> Event {
+        Event::PlatformBoundEvent(crate::platform::PlatformBoundEvent::ExternalWindowFocusChanged {
+            #[cfg(target_os = "macos")]
+            app: macos_utils::window_server::ApplicationSpecifier {
+                pid: 1,
+                bundle_id: "test.terminal".into(),
+            },
+            window: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn input_waiting_on_count_or_bytes_cannot_cross_an_accepted_focus() {
+        for byte_bound in [false, true] {
+            let (proxy, rx) = channel();
+            let admitted = if byte_bound {
+                let event = owned_payload_event(ASYNC_EVENT_BYTES - std::mem::size_of::<Event>());
+                assert_eq!(event.ingress_payload_bytes(), ASYNC_EVENT_BYTES);
+                proxy.send_event_async(event).await.unwrap();
+                1
+            } else {
+                for _ in 0..ASYNC_EVENT_LIMIT {
+                    proxy.send_event_async(Event::ReloadAccessibility).await.unwrap();
+                }
+                ASYNC_EVENT_LIMIT
+            };
+            let mut old = Box::pin(proxy.send_overlay_input_async(input("git ")));
+            assert!(futures::poll!(old.as_mut()).is_pending());
+            proxy.send_event(focus_event()).unwrap();
+            for _ in 0..admitted {
+                rx.recv_queued().await.unwrap().dispatch(|_, _| {});
+            }
+            // Admission resumes while the focus is still queued, not yet
+            // accepted by the host. Checking only after await would miss it.
+            old.await.unwrap();
+            proxy.send_overlay_input_async(input("git ")).await.unwrap();
+            proxy.send_overlay_input_async(input("git c")).await.unwrap();
+            assert_eq!(
+                rx.len(),
+                4,
+                "fresh same-text input must not deduplicate into the old ticket"
+            );
+            rx.recv_queued().await.unwrap().dispatch(|event, sequence| {
+                assert!(matches!(event, Event::PlatformBoundEvent(_)));
+                proxy.accept_input_focus(sequence);
+            });
+            for expected in [None, Some("git "), Some("git c")] {
+                rx.recv_queued().await.unwrap().dispatch(|event, _| {
+                    let Event::GpuiOverlayInput(queued) = event else {
+                        panic!("expected input");
+                    };
+                    let expected = expected.map(|text| OverlayInputDispatch::Complete(input(text)));
+                    assert_eq!(proxy.take_overlay_input(&queued), expected);
+                });
+            }
+            assert_eq!(proxy.diagnostics().async_events, 0);
+            assert_eq!(proxy.diagnostics().async_payload_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn caret_and_rejected_native_focus_do_not_discard_a_waiting_input() {
+        let (proxy, rx) = channel();
+        for _ in 0..ASYNC_EVENT_LIMIT {
+            proxy.send_event_async(Event::ReloadAccessibility).await.unwrap();
+        }
+        let mut pending = Box::pin(proxy.send_overlay_input_async(input("git status")));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        proxy.send_event(focus_event()).unwrap();
+        proxy
+            .send_event(Event::WindowEvent {
+                window_id: crate::AUTOCOMPLETE_ID,
+                window_event: crate::event::WindowEvent::CaretPositionHook(crate::event::WindowPosition::Centered),
+            })
+            .unwrap();
+        for _ in 0..ASYNC_EVENT_LIMIT {
+            rx.recv_queued().await.unwrap().dispatch(|_, _| {});
+        }
+        pending.await.unwrap();
+        // The host rejected the stale focus identity; neither it nor the
+        // ordinary caret path calls accept_input_focus.
+        assert!(matches!(rx.recv().unwrap(), Event::PlatformBoundEvent(_)));
+        assert!(matches!(rx.recv().unwrap(), Event::WindowEvent { .. }));
+        let Event::GpuiOverlayInput(queued) = rx.recv().unwrap() else {
+            panic!("expected input");
+        };
+        assert_eq!(
+            proxy.take_overlay_input(&queued),
+            Some(OverlayInputDispatch::Complete(input("git status")))
+        );
+    }
+
+    #[tokio::test]
+    async fn input_ticket_before_legacy_wait_preserves_old_end_input_without_selecting_it() {
+        let (proxy, rx) = channel();
+        let old_empty = proxy.begin_overlay_input();
+        proxy.send_event(focus_event()).unwrap();
+        let mut fresh = input("tool ");
+        fresh.session_id = uuid::Uuid::new_v4();
+        proxy.send_overlay_input_async(fresh).await.unwrap();
+        proxy
+            .send_overlay_input_with_sequence(input(" "), old_empty)
+            .await
+            .unwrap();
+        proxy
+            .send_event_async(Event::GpuiOverlayEndInput {
+                session_id: uuid::Uuid::nil(),
+            })
+            .await
+            .unwrap();
+        rx.recv_queued()
+            .await
+            .unwrap()
+            .dispatch(|_, sequence| proxy.accept_input_focus(sequence));
+        let Event::GpuiOverlayInput(fresh) = rx.recv().unwrap() else {
+            panic!("fresh input")
+        };
+        assert!(matches!(
+            proxy.take_overlay_input(&fresh),
+            Some(OverlayInputDispatch::Complete(_))
+        ));
+        let Event::GpuiOverlayInput(empty) = rx.recv().unwrap() else {
+            panic!("empty input")
+        };
+        assert_eq!(
+            proxy.take_overlay_input(&empty),
+            Some(OverlayInputDispatch::EndInput(uuid::Uuid::nil()))
+        );
+        assert!(matches!(rx.recv().unwrap(), Event::GpuiOverlayEndInput { .. }));
+        assert_eq!(proxy.diagnostics().async_events, 0);
     }
 
     #[tokio::test]

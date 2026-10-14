@@ -58,12 +58,6 @@ pub enum Event {
 
     /// Headless engine input for the GPUI overlay.
     GpuiOverlayInput(std::sync::Arc<crate::event_loop::QueuedOverlayInput>),
-    GpuiOverlayBuffer {
-        buffer: String,
-        cwd: String,
-        cursor: u32,
-        session_id: uuid::Uuid,
-    },
     /// The shell executed its input. Background sessions must not end the
     /// active terminal's request or hide its overlay.
     GpuiOverlayEndInput {
@@ -135,7 +129,6 @@ impl Event {
                 window_event,
             } => cow_capacity(&window_id.0).saturating_add(window_event.payload_bytes()),
             Self::WindowEventAll { window_event } => window_event.payload_bytes(),
-            Self::GpuiOverlayBuffer { buffer, cwd, .. } => buffer.capacity().saturating_add(cwd.capacity()),
             Self::AutocompleteAction { action, .. } | Self::MenuClicked(action) => action.capacity(),
             Self::GpuiOverlayComplete {
                 result: Ok(result),

@@ -16,6 +16,7 @@ use tracing::{debug, error, info, trace};
 use tray_icon::TrayIcon;
 
 use crate::event::{Event, ShowMessageNotification, WindowEvent};
+use crate::event_loop::{InputSequence, OverlayInputDispatch, QueuedOverlayInput};
 use crate::overlay::OverlayController;
 use crate::platform::{PlatformBoundEvent, PlatformState};
 use crate::tray::{self, get_context_menu, get_icon};
@@ -35,6 +36,48 @@ fn accept_local_caret_position(position: crate::event::WindowPosition, prefers_a
                 ..
             }
         )
+}
+
+/// The caller must first validate the native focus event against the current
+/// application/window/element. Merely receiving a caret or stale focus is not
+/// sufficient to invalidate an input that is waiting for queue admission.
+pub(crate) fn invalidate_overlay_input_focus(
+    proxy: &EventLoopProxy,
+    overlay: &mut OverlayController,
+    sequence: InputSequence,
+    cx: &mut App,
+) {
+    proxy.accept_input_focus(sequence);
+    overlay.invalidate_caret_for_focus_change(cx);
+}
+
+/// Returns whether this input may refresh the current terminal's caret.
+pub(crate) fn dispatch_overlay_input(
+    proxy: &EventLoopProxy,
+    overlay: &mut OverlayController,
+    input: &QueuedOverlayInput,
+    figterm_state: &Arc<FigtermState>,
+    cx: &mut App,
+) -> bool {
+    match proxy.take_overlay_input(input) {
+        Some(OverlayInputDispatch::Complete(input)) => {
+            let needs_caret = !input.buffer.trim().is_empty();
+            overlay.complete_buffer(
+                input.buffer,
+                input.cwd,
+                input.cursor,
+                input.session_id,
+                figterm_state.clone(),
+                cx,
+            );
+            needs_caret
+        },
+        Some(OverlayInputDispatch::EndInput(session_id)) => {
+            overlay.end_input(session_id, cx);
+            false
+        },
+        None => false,
+    }
 }
 
 pub struct DesktopHost {
@@ -59,7 +102,7 @@ pub struct DesktopHost {
 }
 
 impl DesktopHost {
-    pub fn dispatch(&mut self, event: Event, cx: &mut App) {
+    pub(crate) fn dispatch(&mut self, event: Event, sequence: InputSequence, cx: &mut App) {
         match event {
             Event::GpuiOverlayVisibleRows {
                 generation,
@@ -78,7 +121,7 @@ impl DesktopHost {
             Event::WindowEvent {
                 window_id,
                 window_event,
-            } => self.dispatch_window_event(window_id, window_event, cx),
+            } => self.dispatch_window_event(window_id, window_event, sequence, cx),
             Event::WindowEventAll { window_event } => {
                 if matches!(window_event, WindowEvent::SetTheme(_)) {
                     self.overlay.apply_theme(cx);
@@ -200,7 +243,7 @@ impl DesktopHost {
                     {
                         return;
                     }
-                    self.overlay.invalidate_caret_for_focus_change(cx);
+                    invalidate_overlay_input_focus(&self.proxy, &mut self.overlay, sequence, cx);
                 }
                 #[cfg(target_os = "macos")]
                 if let crate::platform::PlatformBoundEvent::FocusedElementChanged { app, element } = &native_event {
@@ -220,7 +263,7 @@ impl DesktopHost {
                         {
                             return;
                         }
-                        self.overlay.invalidate_caret_for_focus_change(cx);
+                        invalidate_overlay_input_focus(&self.proxy, &mut self.overlay, sequence, cx);
                     }
                 }
                 if let Err(err) = self.platform_state.handle(
@@ -257,32 +300,15 @@ impl DesktopHost {
                 });
             },
             Event::GpuiOverlayInput(input) => {
-                if let Some(input) = input.take() {
-                    let needs_caret = !input.buffer.trim().is_empty();
-                    self.dispatch(
-                        Event::GpuiOverlayBuffer {
-                            buffer: input.buffer,
-                            cwd: input.cwd,
-                            cursor: input.cursor,
-                            session_id: input.session_id,
-                        },
-                        cx,
-                    );
+                if dispatch_overlay_input(&self.proxy, &mut self.overlay, &input, &self.figterm_state, cx) {
                     // Establish the input/session before querying AX/IME. Both
                     // halves occupy one queue slot and cannot interleave.
-                    if needs_caret {
-                        self.dispatch(Event::PlatformBoundEvent(PlatformBoundEvent::EditBufferChanged), cx);
-                    }
+                    self.dispatch(
+                        Event::PlatformBoundEvent(PlatformBoundEvent::EditBufferChanged),
+                        sequence,
+                        cx,
+                    );
                 }
-            },
-            Event::GpuiOverlayBuffer {
-                buffer,
-                cwd,
-                cursor,
-                session_id,
-            } => {
-                self.overlay
-                    .complete_buffer(buffer, cwd, cursor, session_id, self.figterm_state.clone(), cx);
             },
             Event::GpuiOverlayLoading { generation } => {
                 self.overlay.show_loading(generation, cx);
@@ -328,7 +354,13 @@ impl DesktopHost {
         }
     }
 
-    fn dispatch_window_event(&mut self, window_id: WindowId, window_event: WindowEvent, cx: &mut App) {
+    fn dispatch_window_event(
+        &mut self,
+        window_id: WindowId,
+        window_event: WindowEvent,
+        sequence: InputSequence,
+        cx: &mut App,
+    ) {
         match window_id {
             id if id == DASHBOARD_ID => self.dispatch_settings_event(window_event, cx),
             id if id == crate::webview::AUTOCOMPLETE_ID => match window_event {
@@ -377,7 +409,7 @@ impl DesktopHost {
                         return;
                     }
                     if invalidate_input {
-                        self.overlay.invalidate_caret_for_focus_change(cx);
+                        invalidate_overlay_input_focus(&self.proxy, &mut self.overlay, sequence, cx);
                     } else if let Some(position) = position {
                         self.overlay.apply_position(position, &self.platform_state, cx);
                     } else {
@@ -467,9 +499,9 @@ pub fn run(host: Entity<DesktopHost>, event_rx: crate::event_loop::EventLoopRece
         let executor = cx.background_executor().clone();
         let mut dispatched = 0;
         while let Ok(event) = event_rx.recv_queued().await {
-            let result = event.dispatch(|event| {
+            let result = event.dispatch(|event, sequence| {
                 cx.update(|cx| {
-                    host.update(cx, |host, cx| host.dispatch(event, cx));
+                    host.update(cx, |host, cx| host.dispatch(event, sequence, cx));
                 })
             });
             if let Err(err) = result {
