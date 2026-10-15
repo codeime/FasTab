@@ -1,4 +1,5 @@
 use collections::HashMap;
+use core_foundation::base::{CFType, TCFType};
 use std::ffi::{CStr, c_void};
 
 use objc::{msg_send, runtime::Object, sel, sel_impl};
@@ -52,8 +53,19 @@ impl PlatformKeyboardMapper for MacKeyboardMapper {
 
 impl MacKeyboardLayout {
     pub(crate) fn new() -> Self {
+        // Carbon's Copy result is +1. Keep it alive only while copying the
+        // borrowed properties, including if their UTF-8 conversion unwinds.
         unsafe {
-            let current_keyboard = TISCopyCurrentKeyboardLayoutInputSource();
+            with_copied_input_source(
+                TISCopyCurrentKeyboardLayoutInputSource(),
+                Self::from_input_source,
+            )
+        }
+    }
+
+    fn from_input_source(current_keyboard: &CFType) -> Self {
+        unsafe {
+            let current_keyboard = current_keyboard.as_CFTypeRef() as *mut Object;
 
             let id: *mut Object = TISGetInputSourceProperty(
                 current_keyboard,
@@ -71,6 +83,77 @@ impl MacKeyboardLayout {
 
             Self { id, name }
         }
+    }
+}
+
+/// Borrow a copied input source while its create-rule owner remains in scope.
+///
+/// # Safety
+/// `source` must be a non-null Carbon input source carrying one owned reference
+/// transferred by its caller, such as a TISCopy function's result.
+unsafe fn with_copied_input_source<T>(source: *mut Object, read: impl FnOnce(&CFType) -> T) -> T {
+    // SAFETY: the caller transfers the Copy result's +1; the callback only
+    // borrows it, and CFType releases it on return or unwinding.
+    let source = unsafe { CFType::wrap_under_create_rule(source.cast()) };
+    read(&source)
+}
+
+#[cfg(feature = "test-support")]
+#[allow(missing_docs)]
+pub(crate) mod fastab_resource_fixtures {
+    use super::*;
+
+    pub fn copied_input_source_is_released_after_metadata_reads_and_failures() {
+        use std::ffi::CString;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        objc::rc::autoreleasepool(|| {
+            for exit in 0..3 {
+                let source = unsafe { TISCopyCurrentKeyboardLayoutInputSource() };
+                assert!(!source.is_null(), "a current keyboard layout is required");
+                // Hold an independent observation reference so the real TIS
+                // object remains inspectable after the production owner drops.
+                let observer = unsafe { CFType::wrap_under_get_rule(source.cast()) };
+                let before = observer.retain_count();
+                match exit {
+                    0 => {
+                        let layout = unsafe {
+                            with_copied_input_source(source, MacKeyboardLayout::from_input_source)
+                        };
+                        assert!(!layout.id().is_empty());
+                        assert!(!layout.name().is_empty());
+                    }
+                    1 => {
+                        let result = unsafe {
+                            with_copied_input_source(source, |source| {
+                                let _layout = MacKeyboardLayout::from_input_source(source);
+                                Err::<(), _>("injected early metadata failure")
+                            })
+                        };
+                        assert!(result.is_err());
+                    }
+                    2 => {
+                        // A property decode can unwind at the existing to_str
+                        // unwrap. Inject that same conversion failure after real
+                        // metadata access, while the production source owner lives.
+                        let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+                        let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+                            with_copied_input_source(source, |source| {
+                                let _layout = MacKeyboardLayout::from_input_source(source);
+                                invalid_utf8.to_str().unwrap();
+                            })
+                        }));
+                        assert!(result.is_err());
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    observer.retain_count(),
+                    before - 1,
+                    "exit {exit} must release exactly the Copy result's reference"
+                );
+            }
+        });
     }
 }
 
