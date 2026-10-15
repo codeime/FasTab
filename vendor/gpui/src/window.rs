@@ -212,6 +212,14 @@ thread_local! {
     pub(crate) static ELEMENT_ARENA: RefCell<Arena> = RefCell::new(Arena::new(1024 * 1024));
 }
 
+/// Release only empty element backing, skipping an active borrow or TLS teardown.
+pub(crate) fn release_idle_element_arena() -> Option<usize> {
+    ELEMENT_ARENA
+        .try_with(|arena| arena.try_borrow_mut().ok()?.release_empty_storage())
+        .ok()
+        .flatten()
+}
+
 /// Returned when the element arena has been used and so must be cleared before the next draw.
 #[must_use]
 pub struct ArenaClearNeeded;

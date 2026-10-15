@@ -10,6 +10,8 @@ mod theme;
 
 #[cfg(test)]
 mod idle_cache_tests;
+#[cfg(test)]
+mod resource_ownership_tests;
 
 /// Install once per application to retire shared UI caches after the last
 /// window is destroyed. The overlay's existing hidden grace remains unchanged.

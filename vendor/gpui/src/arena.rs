@@ -99,12 +99,27 @@ impl Arena {
         self.chunks.len() * self.chunk_size.get()
     }
 
+    /// Retire unused backing allocations without clearing or invalidating live
+    /// elements. The returned capacity estimate is not physical memory usage.
+    pub(crate) fn release_empty_storage(&mut self) -> Option<usize> {
+        if !self.elements.is_empty() {
+            return None;
+        }
+        let bytes = self.capacity()
+            + self.chunks.capacity() * std::mem::size_of::<Chunk>()
+            + self.elements.capacity() * std::mem::size_of::<ArenaElement>();
+        self.chunks = Vec::new();
+        self.elements = Vec::new();
+        self.current_chunk_index = 0;
+        Some(bytes)
+    }
+
     pub fn clear(&mut self) {
         self.valid.set(false);
         self.valid = Rc::new(Cell::new(true));
         self.elements.clear();
-        for chunk_index in 0..=self.current_chunk_index {
-            self.chunks[chunk_index].reset();
+        for chunk in self.chunks.iter_mut().take(self.current_chunk_index + 1) {
+            chunk.reset();
         }
         self.current_chunk_index = 0;
     }
@@ -124,6 +139,9 @@ impl Arena {
         }
 
         let layout = alloc::Layout::new::<T>();
+        if self.chunks.is_empty() {
+            self.chunks.push(Chunk::new(self.chunk_size));
+        }
         let mut current_chunk = &mut self.chunks[self.current_chunk_index];
         let ptr = if let Some(ptr) = current_chunk.allocate(layout) {
             ptr.as_ptr()
@@ -285,5 +303,71 @@ mod tests {
 
         arena.clear();
         let _read_value = *value;
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[allow(missing_docs)]
+pub(crate) mod fastab_resource_fixtures {
+    use super::*;
+
+    pub fn retirement_refuses_live_elements_without_dropping_or_invalidating_them() {
+        struct DropCount(Rc<Cell<usize>>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let dropped = Rc::new(Cell::new(0));
+        let mut arena = Arena::new(64);
+        let live = arena.alloc(|| DropCount(dropped.clone()));
+        let capacity = arena.capacity();
+        assert_eq!(arena.release_empty_storage(), None);
+        assert_eq!(arena.capacity(), capacity);
+        assert!(Rc::ptr_eq(&live.0, &dropped));
+        assert_eq!(dropped.get(), 0);
+        arena.clear();
+        assert_eq!(dropped.get(), 1);
+        assert!(arena.release_empty_storage().is_some());
+        drop(arena);
+        assert_eq!(dropped.get(), 1);
+    }
+
+    pub fn retirement_releases_all_chunks_and_metadata_and_reallocates_lazily() {
+        let mut arena = Arena::new(64);
+        let first = arena.alloc(|| [1u8; 64]);
+        let second = arena.alloc(|| [2u8; 64]);
+        let third = arena.alloc(|| [3u8; 64]);
+        assert_eq!(first[0], 1);
+        assert_eq!(second[0], 2);
+        assert_eq!(third[0], 3);
+        let capacity = arena.capacity();
+        assert_eq!(capacity, 192);
+        assert_eq!(arena.release_empty_storage(), None);
+        arena.clear();
+        assert!(arena.release_empty_storage().unwrap() >= capacity);
+        assert_eq!(arena.capacity(), 0);
+        assert_eq!(arena.chunks.capacity(), 0);
+        assert_eq!(arena.elements.capacity(), 0);
+        assert_eq!(arena.release_empty_storage(), Some(0));
+        arena.clear();
+        arena.clear();
+        let fresh = arena.alloc(|| 17u64);
+        assert_eq!(*fresh, 17);
+        assert_eq!(arena.capacity(), 64);
+        arena.clear();
+        assert!(arena.release_empty_storage().is_some());
+        drop(arena);
+    }
+
+    pub fn retired_and_reallocated_storage_does_not_revive_an_old_box() {
+        let mut arena = Arena::new(64);
+        let stale = arena.alloc(|| 1u64);
+        arena.clear();
+        assert!(arena.release_empty_storage().is_some());
+        let fresh = arena.alloc(|| 2u64);
+        assert_eq!(*fresh, 2);
+        let _stale = *stale;
     }
 }

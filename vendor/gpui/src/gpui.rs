@@ -59,6 +59,19 @@ pub mod private {
     pub use serde_json;
 }
 
+// Keep ownership fixtures next to the private production paths they exercise,
+// while letting the workspace test harness run them with its locked graph.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod fastab_resource_fixtures {
+    pub use crate::app::fastab_resource_fixtures::*;
+    pub use crate::arena::fastab_resource_fixtures::*;
+    #[cfg(all(target_os = "macos", feature = "font-kit"))]
+    pub use crate::platform::fastab_font_fixtures::*;
+    #[cfg(target_os = "macos")]
+    pub use crate::platform::fastab_keyboard_fixtures::*;
+}
+
 mod seal {
     /// A mechanism for restricting implementations of a trait to only those in GPUI.
     /// See: <https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/>

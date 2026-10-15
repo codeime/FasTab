@@ -198,7 +198,16 @@ jobs:
         run: ./scripts/assert-no-runtime-js.sh
 
       - name: Test
-        run: cargo test --workspace --locked --no-fail-fast --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2
+        shell: bash
+        run: |
+          set -euo pipefail
+          resource_log="$(mktemp)"
+          trap 'rm -f "$resource_log"' EXIT
+          cargo test --workspace --locked --no-fail-fast --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 2>&1 | tee "$resource_log"
+          # GPUI is not a workspace member. Its private ownership fixtures run
+          # through fastab_gpui's test-support dependency, without needing a GPU.
+          # Fail if feature/cfg drift silently removes any of the ten regressions.
+          test "$(grep -Ec '^test resource_ownership_tests::.* \.\.\. ok$' "$resource_log")" -eq 10
 
       - name: Replay completion resource lifecycle in one process
         run: cargo run --locked -p fastab_engine --example resource-replay -- --self-check

@@ -542,6 +542,9 @@ pub struct IdleCacheRelease {
     pub assets: usize,
     /// Derived text caches released without invalidating font identities.
     pub text: TextCacheRelease,
+    /// Empty element arena backing released on this thread, in estimated bytes.
+    /// Live elements or an outstanding arena borrow prevent its retirement.
+    pub element_arena_bytes: usize,
 }
 
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
@@ -823,14 +826,14 @@ impl App {
         invalidator: WindowInvalidator,
         entities: &FxHashSet<EntityId>,
     ) {
-        let mut tracked_entities =
-            std::mem::take(self.tracked_entities.entry(window_handle.id).or_default());
-        for entity in tracked_entities.iter() {
-            self.window_invalidators_by_entity
-                .entry(*entity)
-                .and_modify(|windows| {
-                    windows.remove(&window_handle.id);
-                });
+        let mut tracked_entities = self
+            .tracked_entities
+            .remove(&window_handle.id)
+            .unwrap_or_default();
+        // Keep unchanged buckets allocated while rendering; only retire
+        // dependencies that this window no longer reads.
+        for entity in tracked_entities.difference(entities) {
+            self.remove_entity_window_invalidator(*entity, window_handle.id);
         }
         for entity in entities.iter() {
             self.window_invalidators_by_entity
@@ -840,8 +843,26 @@ impl App {
         }
         tracked_entities.clear();
         tracked_entities.extend(entities.iter().copied());
-        self.tracked_entities
-            .insert(window_handle.id, tracked_entities);
+        if !tracked_entities.is_empty() {
+            self.tracked_entities
+                .insert(window_handle.id, tracked_entities);
+        }
+    }
+
+    fn remove_window_entity_tracking(&mut self, window_id: WindowId) {
+        let tracked = self.tracked_entities.remove(&window_id).unwrap_or_default();
+        for entity in &tracked {
+            self.remove_entity_window_invalidator(*entity, window_id);
+        }
+    }
+
+    fn remove_entity_window_invalidator(&mut self, entity: EntityId, window: WindowId) {
+        if let Some(windows) = self.window_invalidators_by_entity.get_mut(&entity) {
+            windows.remove(&window);
+            if windows.is_empty() {
+                self.window_invalidators_by_entity.remove(&entity);
+            }
+        }
     }
 
     pub(crate) fn new_observer(&mut self, key: EntityId, value: Handler) -> Subscription {
@@ -1278,6 +1299,16 @@ impl App {
             }
 
             for (entity_id, mut entity) in dropped {
+                if let Some(windows) = self.window_invalidators_by_entity.remove(&entity_id) {
+                    for window_id in windows.keys() {
+                        if let Some(entities) = self.tracked_entities.get_mut(window_id) {
+                            entities.remove(&entity_id);
+                            if entities.is_empty() {
+                                self.tracked_entities.remove(window_id);
+                            }
+                        }
+                    }
+                }
                 self.observers.remove(&entity_id);
                 self.event_listeners.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
@@ -1386,6 +1417,7 @@ impl App {
             if window.removed {
                 cx.window_handles.remove(&id);
                 cx.windows.remove(id);
+                cx.remove_window_entity_tracking(id);
 
                 cx.window_closed_observers.clone().retain(&(), |callback| {
                     callback(cx);
@@ -2027,9 +2059,13 @@ impl App {
         }
 
         let assets = mem::take(&mut self.loading_assets);
+        // The last window is gone; also retire the maps' high-water backing.
+        drop(mem::take(&mut self.tracked_entities));
+        drop(mem::take(&mut self.window_invalidators_by_entity));
         Some(IdleCacheRelease {
             assets: assets.len(),
             text: self.text_system.release_idle_caches(),
+            element_arena_bytes: crate::window::release_idle_element_arena().unwrap_or(0),
         })
     }
 
@@ -2065,11 +2101,10 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
-        let window_invalidators = mem::take(
-            self.window_invalidators_by_entity
-                .entry(entity_id)
-                .or_default(),
-        );
+        let window_invalidators = self
+            .window_invalidators_by_entity
+            .remove(&entity_id)
+            .unwrap_or_default();
 
         if window_invalidators.is_empty() {
             if self.pending_notifications.insert(entity_id) {
@@ -2080,10 +2115,9 @@ impl App {
             for invalidator in window_invalidators.values() {
                 invalidator.invalidate_view(entity_id, self);
             }
+            self.window_invalidators_by_entity
+                .insert(entity_id, window_invalidators);
         }
-
-        self.window_invalidators_by_entity
-            .insert(entity_id, window_invalidators);
     }
 
     /// Returns the name for this [`App`].
@@ -2451,6 +2485,210 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
         self.app.notify(lease.id);
         self.app.entities.end_lease(lease);
         self.app.finish_update();
+    }
+}
+
+// Exercised by the workspace's fastab_gpui test harness. This vendored crate
+// is not a workspace member and cannot run its own dev-dependency tests there.
+#[cfg(feature = "test-support")]
+#[allow(missing_docs)]
+pub(crate) mod fastab_resource_fixtures {
+    use std::{cell::Cell, rc::Rc};
+
+    use crate::{
+        AppContext, Context, Empty, IntoElement, Render, TestAppContext, WeakEntity, Window,
+    };
+
+    fn element_arena_capacity() -> usize {
+        crate::window::ELEMENT_ARENA.with_borrow(|arena| arena.capacity())
+    }
+
+    struct EntityReader {
+        source: Option<WeakEntity<usize>>,
+        last_read: Option<usize>,
+        renders: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Render for EntityReader {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            self.last_read = self
+                .source
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .map(|source| *source.read(cx));
+            Empty
+        }
+    }
+
+    impl Drop for EntityReader {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    pub fn closing_windows_and_retiring_reads_remove_only_their_entity_tracking(
+        cx: &mut TestAppContext,
+    ) {
+        let source = cx.new(|_| 7usize);
+        let source_id = source.entity_id();
+        let weak = source.downgrade();
+        let live_renders = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let live = cx.add_window(|_, _| EntityReader {
+            source: Some(weak.clone()),
+            last_read: None,
+            renders: live_renders.clone(),
+            drops: drops.clone(),
+        });
+        let live_id = live.window_id();
+        let live_invalidator = live
+            .update(cx, |_, window, _| window.invalidator.clone())
+            .unwrap();
+        assert_eq!(
+            live.read_with(cx, |view, _| view.last_read).unwrap(),
+            Some(7)
+        );
+
+        for cycle in 0..16 {
+            let closed_renders = Rc::new(Cell::new(0));
+            let closed = cx.add_window(|_, _| EntityReader {
+                source: Some(weak.clone()),
+                last_read: None,
+                renders: closed_renders.clone(),
+                drops: drops.clone(),
+            });
+            let closed_id = closed.window_id();
+            let closed_invalidator = closed
+                .update(cx, |_, window, _| window.invalidator.clone())
+                .unwrap();
+            cx.read(|cx| {
+                let windows = &cx.window_invalidators_by_entity[&source_id];
+                assert_eq!(windows.len(), 2);
+                assert!(windows.contains_key(&live_id));
+                assert!(windows.contains_key(&closed_id));
+            });
+            closed
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+            assert_eq!(drops.get(), cycle + 1);
+            let closed_render_count = closed_renders.get();
+            let live_render_count = live_renders.get();
+            cx.update(|cx| {
+                assert!(!cx.tracked_entities.contains_key(&closed_id));
+                let windows = &cx.window_invalidators_by_entity[&source_id];
+                assert_eq!(windows.len(), 1);
+                assert!(windows.contains_key(&live_id));
+                closed_invalidator.set_dirty(false);
+                live_invalidator.set_dirty(false);
+                cx.notify(source_id);
+                assert!(
+                    !closed_invalidator.is_dirty(),
+                    "notify must not revisit a closed window"
+                );
+                assert!(
+                    live_invalidator.is_dirty(),
+                    "the remaining reader must still be notified"
+                );
+            });
+            assert_eq!(closed_renders.get(), closed_render_count);
+            assert!(live_renders.get() > live_render_count);
+        }
+
+        live.update(cx, |view, window, _| {
+            view.source = None;
+            window.refresh();
+        })
+        .unwrap();
+        assert_eq!(live.read_with(cx, |view, _| view.last_read).unwrap(), None);
+        cx.read(|cx| assert!(!cx.window_invalidators_by_entity.contains_key(&source_id)));
+
+        live.update(cx, |view, window, _| {
+            view.source = Some(weak.clone());
+            window.refresh();
+        })
+        .unwrap();
+        cx.read(|cx| assert!(cx.window_invalidators_by_entity[&source_id].contains_key(&live_id)));
+        drop(source);
+        cx.update(|_| ());
+        assert!(weak.upgrade().is_none());
+        cx.read(|cx| {
+            assert!(!cx.window_invalidators_by_entity.contains_key(&source_id));
+            assert!(!cx.tracked_entities[&live_id].contains(&source_id));
+        });
+        live.update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        assert_eq!(drops.get(), 17);
+        cx.read(|cx| {
+            assert!(cx.window_invalidators_by_entity.is_empty());
+            assert!(cx.tracked_entities.is_empty());
+        });
+    }
+
+    pub fn idle_cache_release_skips_borrowed_arena_then_retires_and_rebuilds_on_draw(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| Empty);
+        let capacity = element_arena_capacity();
+        assert!(capacity > 0);
+        assert!(cx.update(|cx| cx.release_idle_caches()).is_none());
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        crate::window::ELEMENT_ARENA.with(|arena| {
+            let borrow = arena.borrow();
+            let released = cx.update(|cx| cx.release_idle_caches().unwrap());
+            assert_eq!(released.element_arena_bytes, 0);
+            assert_eq!(borrow.capacity(), capacity);
+        });
+        let released = cx.update(|cx| cx.release_idle_caches().unwrap());
+        assert!(released.element_arena_bytes >= capacity);
+        assert_eq!(element_arena_capacity(), 0);
+        assert_eq!(
+            cx.update(|cx| cx.release_idle_caches().unwrap())
+                .element_arena_bytes,
+            0
+        );
+        let reopened = cx.add_window(|_, _| Empty);
+        assert!(element_arena_capacity() > 0);
+        reopened
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        assert!(
+            cx.update(|cx| cx.release_idle_caches().unwrap())
+                .element_arena_bytes
+                > 0
+        );
+        assert_eq!(element_arena_capacity(), 0);
+    }
+
+    pub fn idle_app_cannot_retire_another_apps_live_element_on_the_same_thread(
+        cx: &mut TestAppContext,
+    ) {
+        let mut other = cx.new_app();
+        let other_window = other.add_window(|_, _| Empty);
+        let mut live = other.update(|_| Empty.into_any_element());
+        let capacity = element_arena_capacity();
+        let released = cx.update(|cx| cx.release_idle_caches().unwrap());
+        assert_eq!(released.element_arena_bytes, 0);
+        assert_eq!(element_arena_capacity(), capacity);
+        assert!(
+            live.downcast_mut::<Empty>().is_some(),
+            "the other App's element must remain usable"
+        );
+        drop(live);
+        crate::window::ArenaClearNeeded.clear();
+        other_window
+            .update(&mut other, |_, window, _| window.remove_window())
+            .unwrap();
+        assert!(
+            cx.update(|cx| cx.release_idle_caches().unwrap())
+                .element_arena_bytes
+                >= capacity
+        );
+        assert_eq!(element_arena_capacity(), 0);
+        other.quit();
     }
 }
 
