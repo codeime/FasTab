@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.0.9
+
+- fix: release copied keyboard input sources and CoreText font attribute arrays after native queries, preventing retained references from accumulating.
+- fix: keep font feature keys and values alive while constructing CoreText dictionaries.
+- fix: remove closed-window entity tracking while preserving other windows and reusing stable drawing dependencies.
+- change: release empty UI element arena storage after the last window closes, preserve live elements and allocate storage again only when needed.
+- fix: clear completion insertion predictions when the current input ends or focus changes, while preserving delayed insertion echoes during ordinary hiding.
+
 ## v0.0.8
 
 - change: use FasTab as the app's display name while preserving bundle identifiers, installation paths and command names for existing installations.
