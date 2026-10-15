@@ -233,3 +233,40 @@ GPT-6 Astra ultra 已复核 M1/M2、generator 去重、NextWords/历史索引、
 主代理与 GPT-6 Astra 独立复核最终 diff 后，未发现未解决的高置信阻断问题；直接 `rustfmt --check` 与 `git diff --check` 通过。移除了派发路径提取后不再使用的内部 `GpuiOverlayBuffer`，避免为测试保留生产死代码。
 
 本次工作区修复需重新通过确切提交的远端 CI；上轮绿色结果不覆盖这些新增修改。本地不构建、不执行项目测试。安装版的切窗、输入顺序及实际物理内存收益仍需分别验收。
+
+## 10. 0.0.8 运行版：原生引用与空闲 backing 复核（2026-10-15）
+
+### 现场证据与解释边界
+
+运行主进程 PID 12511 已存活约 24.5 小时，安装文件与映射中的主程序 UUID 均为 `337DFAB6-5F94-32C7-BF09-C96FC048CE6F`。连续采样的物理 footprint 为 39.0 → 39.6 → 39.7 → 39.7 MiB，峰值 75.2 MiB；期间请求数和终端会话数有变化，不是完全静止的负载。采样时 spec、hook、catalog、generator、worker pending、窗口与图标载荷均已退休；history 保留约 21.4 KiB，属于设计保留的原始历史与 NextWords，derived indexes 为零。
+
+原生工具给出的不同口径不能相加：
+
+- `heap` live allocations 约 14.7 MiB，两次相差 2,208 bytes；其中 non-object 约 8.1 MiB，尚无分配栈可归因。
+- `vmmap` 报 malloc dirty + swapped fragmentation 约 11.7 MiB；它不等于当前可立即归还的物理内存。
+- `leaks` 报 927 个 allocation / 36,928 bytes，包括 480 个 TSMInputSource / 15,360 bytes、系统 NSXPCConnection 环和少量数组。实际输入源对象数由 494 增至 510，与源码中缺失 Copy 引用释放一致，但没有逐对象分配栈，不能将每个现场对象都确定归给同一调用。
+- 未见 GPUIWindow、GPUIView、GPUIPanel、CAMetalLayer；AXUIElement 两次为 201，不支持此次仍是旧 AX 泄漏的结论。
+
+原始证据保存在本机 `/private/tmp/fastab-runtime-12511-{heap,vmmap,leaks}-20261015.txt` 以及同期 `fastab-runtime-engine-20261015-*.json`、`fastab-runtime-memory-20261015.csv`；这些是修复前快照，不是本次 diff 的收益证明。
+
+### 本次修复
+
+| 所有者 | 根因与修改 | 回归边界 |
+| --- | --- | --- |
+| Carbon 当前输入源 | `TISCopyCurrentKeyboardLayoutInputSource` 的 +1 未归还；现在立即交给 create-rule RAII owner，借用属性期间保持存活，字符串复制后释放 | 真实 TIS 对象的引用计数覆盖正常读取、提前返回和 UTF-8 解码展开；不改 IME 启停或输入源启用状态 |
+| CoreText 字体属性 | feature / fallback 数组 Create +1 遗失；feature 字典还使用已退出作用域的临时 CFString / CFNumber 裸指针，并再次手动 release | 改为 CFArray / CFDictionary / CFType RAII；验证空数组、非空 feature / fallback 的引用与内容，以及真实 native font descriptor 读回。保留已有 fallback 输出行为 |
+| GPUI 窗口 / 实体追踪 | 关闭窗口与 entity Drop 没有删双向索引，旧 invalidator 和集合继续被拥有；无依赖 notify 也创建空桶 | 关闭 / Drop 同时拆除两侧关系，最后窗口退出后释放表容量；每帧只删除离开的依赖，稳定依赖复用原桶，避免新增分配抖动。共享实体的其他窗口仍正常通知 |
+| GPUI 线程本地元素 arena | `clear` 析构元素但保留 1 MiB 首块、后续高水位分块和两个 Vec backing，直到线程退出 | 最后窗口实际销毁后的既有 idle hook 尝试释放空 backing；活元素或嵌套借用则跳过，不调用 clear、不推进 generation。回收后首次 alloc 懒建首块，已失效 ArenaBox 不会复活 |
+| Overlay 插入预测 | 插入后未收到 edit echo 就结束输入或失去焦点，`self_insertion` 仍持有最后一份完整预测字符串 | 仅当前会话 EndInput 与焦点失效清除；后台会话结束和普通 hide 保留标记，继续识别自身插入回显，避免误当 paste 隐藏 |
+
+`IdleCacheRelease.element_arena_bytes` 是释放的 backing 容量估算，沿用现有 debug 日志，不表示 footprint 同步下降。窗口空闲期限仍为原先的 10 秒。稳定 FontId / 原生字体表、正常输入中的活元素和必要的回显状态均保留。
+
+### 分配器调查与验证要求
+
+这次优先移除仍有 owner 的对象和 backing，不加入周期性的 `malloc_zone_pressure_relief`。当前证据不能证明 allocator 自身泄漏，也不能保证释放引用后全部页立即还给系统。Metal renderer 退休会释放其 buffer owner，图标、engine / outbox 的表壳有较小硬上限；字体 scratch 高水位和未归因的 non-object / fragmentation 仍需在同负载安装版上比较。
+
+回归 fixture 与真实私有路径放在同一 Rust 模块，仅由 `test-support` feature 编入；`fastab_gpui` 的 workspace 测试入口调用 keyboard、open_type、arena 与 app 的 10 个用例。普通 workspace 测试不运行 vendored GPUI 的单测，而直接 `cargo test -p gpui` 也会因非 workspace 包带 dev-dependencies 被拒绝（[Cargo 源码](https://raw.githubusercontent.com/rust-lang/cargo/master/src/ops/cargo_compile/mod.rs)）；因此不扩大 workspace 或修改依赖锁图，主 CI 检查这 10 个真实用例均实际通过。Overlay 回归由 desktop workspace 测试执行。本机仅允许直接 rustfmt 与 diff 检查，不构建、不执行这些测试。
+
+已完成主代理与 GPT-6 Astra ultra 的逐项及整体源码复核。review 中修正了每帧拆建稳定 tracking bucket 的分配回退、native font fixture 的 unsafe 调用、非 workspace 测试入口，以及隐藏 fixture 原定义的 missing_docs lint 范围；最终未发现未解决的高置信源码阻断。受影响 Rust 文件的直接 rustfmt 检查与 git diff 检查通过，这不是编译或执行回归通过。
+
+后续必须先取得此次确切提交的远端编译与回归结果，再对新安装版复测：输入源切换 / 键盘布局查询、Settings 与 Overlay 反复创建销毁、插入后立即执行或切窗、10 / 60 秒空闲后的 footprint / live heap / owner。重启旧运行进程只能建立冷启动基线，不能证明这份尚未安装的修复已生效。
