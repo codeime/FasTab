@@ -455,6 +455,7 @@ impl OverlayController {
             // Settings refreshes must not resubmit an ended buffer. The next
             // real input event will establish a new buffer for this session.
             self.forget_last_input();
+            self.take_self_insertion();
             self.dismiss(cx);
         }
     }
@@ -527,6 +528,7 @@ impl OverlayController {
     /// The next real buffer event establishes the newly focused session.
     pub fn invalidate_caret_for_focus_change(&mut self, cx: &mut App) {
         self.forget_last_input();
+        self.take_self_insertion();
         *self.last_position.lock().unwrap_or_else(|err| err.into_inner()) = None;
         self.dismiss(cx);
     }
@@ -3245,6 +3247,116 @@ fn screen_edges_containing(screens: &[(f64, f64, f64, f64)], x: f64, y: f64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn insertion_prediction_retires_with_input_but_survives_hidden_echo(cx: &mut gpui::TestAppContext) {
+        use fastab_remote_ipc::figterm::{EditBuffer, FigtermSession};
+
+        let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+        let specs = tempfile::tempdir().unwrap();
+        let engine = EngineClient::spawn(specs.path().to_path_buf()).unwrap();
+        let (proxy, _events) = crate::event_loop::channel();
+        let sessions = Arc::new(FigtermState::new());
+        let platform = Arc::new(PlatformState::new(proxy.clone()));
+        let session = Uuid::new_v4();
+        let (sender, mut commands) = fastab_remote_ipc::outbox::channel();
+        sessions.insert(FigtermSession {
+            id: session,
+            secret: String::new(),
+            sender,
+            dead_since: None,
+            edit_buffer: EditBuffer::default(),
+            last_receive: tokio::time::Instant::now(),
+            context: None,
+            flattened_env: Arc::new(Vec::new()),
+            terminal_cursor_coordinates: None,
+            current_session_metrics: None,
+            intercept: InterceptMode::Unlocked,
+            intercept_global: InterceptMode::Unlocked,
+        });
+        let mut overlay = cx.update(|cx| {
+            let mut overlay = OverlayController::start(cx, engine.clone(), proxy, sessions.clone(), platform).unwrap();
+            overlay.enabled = true;
+            overlay.state.update(cx, |state, _| state.only_show_on_tab = false);
+            overlay
+        });
+        let buffer = format!("tool {}", "x".repeat(64 * 1024));
+        let predicted = format!("{buffer}_accepted");
+        let mut insert = |overlay: &mut OverlayController, cx: &mut App| {
+            overlay.complete_buffer(
+                buffer.clone(),
+                String::new(),
+                buffer.len() as u32,
+                session,
+                sessions.clone(),
+                cx,
+            );
+            assert!(overlay.insert_text("_accepted", 0, false, &sessions, cx));
+            let mut inserts = Vec::new();
+            while let Some(frame) = commands.try_recv() {
+                let (_, message) = fastab_proto::FigMessage::parse(&mut frame.bytes()).unwrap();
+                let message = message.decode::<fastab_proto::remote::Clientbound>().unwrap();
+                if let Some(fastab_proto::remote::clientbound::Packet::Request(request)) = message.packet
+                    && let Some(fastab_proto::remote::clientbound::request::Request::InsertText(insert)) =
+                        request.request
+                {
+                    inserts.push(insert);
+                }
+            }
+            assert_eq!(inserts.len(), 1, "exercise a real admitted InsertText");
+            assert_eq!(inserts[0].insertion.as_deref(), Some("_accepted"));
+            assert_eq!(inserts[0].insertion_buffer.as_deref(), Some(buffer.as_str()));
+            assert_eq!(
+                overlay.self_insertion.lock().unwrap().as_deref(),
+                Some(predicted.as_str())
+            );
+        };
+
+        cx.update(|cx| {
+            insert(&mut overlay, cx);
+            overlay.hide(cx);
+            overlay.end_input(Uuid::new_v4(), cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(11));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            // A hidden window's grace does not end the terminal's input. Its
+            // delayed echo still needs the paste-heuristic exemption.
+            assert_eq!(
+                overlay.self_insertion.lock().unwrap().as_deref(),
+                Some(predicted.as_str())
+            );
+            overlay.complete_buffer(
+                predicted.clone(),
+                String::new(),
+                predicted.len() as u32,
+                session,
+                sessions.clone(),
+                cx,
+            );
+            assert!(overlay.self_insertion.lock().unwrap().is_none());
+            assert!(matches!(
+                overlay.completion_display,
+                CompletionDisplayState::WaitingForCaret
+            ));
+
+            insert(&mut overlay, cx);
+            overlay.end_input(session, cx);
+            assert!(overlay.self_insertion.lock().unwrap().is_none());
+            assert!(overlay.last_input.lock().unwrap().is_none());
+
+            insert(&mut overlay, cx);
+            overlay.invalidate_caret_for_focus_change(cx);
+            assert!(overlay.self_insertion.lock().unwrap().is_none());
+            assert!(overlay.last_input.lock().unwrap().is_none());
+        });
+        let diagnostics = futures::executor::block_on(engine.diagnostics()).unwrap();
+        assert_eq!(
+            diagnostics.requests.submitted, 0,
+            "this no-caret fixture must not run the engine"
+        );
+    }
 
     #[gpui::test]
     fn delayed_input_cannot_restore_the_old_owner_after_host_accepts_focus(cx: &mut gpui::TestAppContext) {
