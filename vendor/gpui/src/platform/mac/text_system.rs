@@ -1222,19 +1222,36 @@ pub(crate) mod fastab_resource_fixtures {
                 }
                 {
                     use core_foundation::url::CFURL;
-                    use core_text::font_descriptor::kCTFontURLAttribute;
+                    use core_text::font_descriptor::{
+                        kCTFontFamilyNameAttribute, kCTFontNameAttribute, kCTFontURLAttribute,
+                    };
                     let state = system.0.read();
                     let FontCandidateState::Deferred(descriptor) =
                         &state.font_candidates[candidates[0]].state
                     else {
                         unreachable!();
                     };
-                    let attributes = CFDictionary::from_CFType_pairs(&[(
-                        unsafe { CFString::wrap_under_get_rule(kCTFontURLAttribute) },
-                        CFURL::from_path(format!("/Library/Fonts/{family}.ttc"), false)
-                            .unwrap()
-                            .as_CFType(),
-                    )]);
+                    let postscript_name =
+                        lenient_font_attributes::postscript_name(descriptor).unwrap();
+                    let user_path =
+                        std::path::PathBuf::from(format!("/Library/Fonts/{family}.ttc"));
+                    // Matched descriptors can derive family metadata from their
+                    // URL. Preserve identity explicitly when replacing that URL
+                    // so the guard rejects the source, not missing attributes.
+                    let attributes = CFDictionary::from_CFType_pairs(&[
+                        (
+                            unsafe { CFString::wrap_under_get_rule(kCTFontFamilyNameAttribute) },
+                            CFString::new(family).as_CFType(),
+                        ),
+                        (
+                            unsafe { CFString::wrap_under_get_rule(kCTFontNameAttribute) },
+                            CFString::new(&postscript_name).as_CFType(),
+                        ),
+                        (
+                            unsafe { CFString::wrap_under_get_rule(kCTFontURLAttribute) },
+                            CFURL::from_path(&user_path, false).unwrap().as_CFType(),
+                        ),
+                    ]);
                     let user_font = descriptor
                         .create_copy_with_attributes(attributes.into_untyped())
                         .unwrap();
@@ -1244,7 +1261,11 @@ pub(crate) mod fastab_resource_fixtures {
                     );
                     assert_eq!(
                         lenient_font_attributes::postscript_name(&user_font),
-                        lenient_font_attributes::postscript_name(descriptor)
+                        Some(postscript_name)
+                    );
+                    assert_eq!(
+                        lenient_font_attributes::font_path(&user_font),
+                        Some(user_path)
                     );
                     assert!(
                         MacTextSystemState::deferred_system_candidate(family, user_font).is_none()
