@@ -207,10 +207,14 @@ jobs:
           # GPUI is not a workspace member. Its private ownership fixtures run
           # through fastab_gpui's test-support dependency, without needing a GPU.
           # Fail if feature/cfg drift silently removes a CPU-only regression.
-          test "$(grep -Ec '^test resource_ownership_tests::.* \.\.\. ok$' "$resource_log")" -eq 17
+          test "$(grep -Ec '^test resource_ownership_tests::.* \.\.\. ok$' "$resource_log")" -eq 21
           grep -Eq '^test resource_ownership_tests::native_menu_actions_retire_without_reusing_tags_or_disturbing_dock \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::native_menu_action_owners_release_on_replacement_and_retirement \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::native_font_families_keep_only_selected_faces_loaded \.\.\. ok$' "$resource_log"
+          grep -Eq '^test resource_ownership_tests::system_font_enumeration_stops_after_first_exact_match \.\.\. ok$' "$resource_log"
+          grep -Eq '^test resource_ownership_tests::deferred_font_candidates_preserve_matching_and_fallback_precedence \.\.\. ok$' "$resource_log"
+          grep -Eq '^test resource_ownership_tests::materialized_font_candidates_release_descriptors \.\.\. ok$' "$resource_log"
+          grep -Eq '^test resource_ownership_tests::failed_font_family_load_keeps_registered_state_unchanged \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::native_font_descriptors_keep_attributes_and_shaping \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::native_fallback_keeps_candidate_precedence_and_font_ids \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::generated_metal_shader_excludes_host_ffi \.\.\. ok$' "$resource_log"

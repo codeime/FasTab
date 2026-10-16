@@ -52,6 +52,30 @@ fn native_font_families_keep_only_selected_faces_loaded() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn system_font_enumeration_stops_after_first_exact_match() {
+    fixtures::system_font_enumeration_stops_after_first_exact_match();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn deferred_font_candidates_preserve_matching_and_fallback_precedence() {
+    fixtures::deferred_font_candidates_preserve_matching_and_fallback_precedence();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn materialized_font_candidates_release_descriptors() {
+    fixtures::materialized_font_candidates_release_descriptors();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_font_family_load_keeps_registered_state_unchanged() {
+    fixtures::failed_font_family_load_keeps_registered_state_unchanged();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn native_font_descriptors_keep_attributes_and_shaping() {
     fixtures::native_font_descriptors_preserve_attributes_and_shaping();
 }

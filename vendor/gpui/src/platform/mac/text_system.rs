@@ -8,8 +8,10 @@ use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::HashMap;
 use core_foundation::{
+    array::CFArray,
     attributed_string::CFMutableAttributedString,
     base::{CFRange, TCFType},
+    dictionary::CFDictionary,
     number::CFNumber,
     string::CFString,
 };
@@ -61,14 +63,25 @@ struct FontKey {
 }
 
 struct FontCandidate {
-    descriptor: CTFontDescriptor,
-    point_size: f64,
-    properties: Properties,
+    properties: Option<Properties>,
     postscript_name: String,
-    font_id: Option<FontId>,
+    state: FontCandidateState,
+    previous_source: Option<FontSource>,
 }
 
-#[derive(Clone, Copy)]
+enum FontCandidateState {
+    // A matched, file-backed system descriptor. No CTFont has been requested
+    // for this face yet, and its CSS properties are deliberately unknown.
+    Deferred(CTFontDescriptor),
+    Pending {
+        descriptor: CTFontDescriptor,
+        point_size: f64,
+    },
+    Loaded(FontId),
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FontSource {
     Candidate(usize),
     Loaded(FontId),
@@ -163,22 +176,15 @@ impl PlatformTextSystem for MacTextSystem {
                     lock.font_candidates_by_font_key[&font_key].as_ref()
                 };
 
-            let candidate_properties = candidates
-                .iter()
-                .map(|&candidate| lock.font_candidates[candidate].properties)
-                .collect::<SmallVec<[_; 4]>>();
-
-            let ix = font_kit::matching::find_best_match(
-                &candidate_properties,
-                &font_kit::properties::Properties {
+            let candidates = SmallVec::<[usize; 4]>::from_slice(candidates);
+            let font_id = lock.select_font(
+                &candidates,
+                &Properties {
                     style: font.style.into(),
                     weight: font.weight.into(),
                     stretch: Default::default(),
                 },
             )?;
-
-            let candidate = candidates[ix];
-            let font_id = lock.materialize_font(candidate);
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
@@ -248,110 +254,313 @@ impl MacTextSystemState {
     ) -> Result<SmallVec<[usize; 4]>> {
         let name = crate::text_system::font_name_with_fallbacks(name, ".AppleSystemUIFont");
 
-        let mut candidates = SmallVec::new();
-        let family = self
-            .memory_source
-            .select_family_by_name(name)
-            .or_else(|_| self.system_source.select_family_by_name(name))?;
-        for font in family.fonts() {
-            let mut font = font.load()?;
-
-            apply_features_and_fallbacks(&mut font, features, fallbacks)?;
-            // This block contains a precautionary fix to guard against loading fonts
-            // that might cause panics due to `.unwrap()`s up the chain.
-            {
-                // We use the 'm' character for text measurements in various spots
-                // (e.g., the editor). However, at time of writing some of those usages
-                // will panic if the font has no 'm' glyph.
-                //
-                // Therefore, we check up front that the font has the necessary glyph.
-                let has_m_glyph = font.glyph_for_char('m').is_some();
-
-                // HACK: The 'Segoe Fluent Icons' font does not have an 'm' glyph,
-                // but we need to be able to load it for rendering Windows icons in
-                // the Storybook (on macOS).
-                let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
-
-                if !has_m_glyph && !is_segoe_fluent_icons {
-                    // I spent far too long trying to track down why a font missing the 'm'
-                    // character wasn't loading. This log statement will hopefully save
-                    // someone else from suffering the same fate.
-                    log::warn!(
-                        "font '{}' has no 'm' character and was not loaded",
-                        font.full_name()
-                    );
-                    continue;
-                }
-            }
-
-            // We've seen a number of panics in production caused by calling font.properties()
-            // which unwraps a downcast to CFNumber. This is an attempt to avoid the panic,
-            // and to try and identify the incalcitrant font.
-            let traits = font.native_font().all_traits();
-            if unsafe {
-                !(traits
-                    .get(kCTFontSymbolicTrait)
-                    .downcast::<CFNumber>()
-                    .is_some()
-                    && traits
-                        .get(kCTFontWidthTrait)
-                        .downcast::<CFNumber>()
-                        .is_some()
-                    && traits
-                        .get(kCTFontWeightTrait)
-                        .downcast::<CFNumber>()
-                        .is_some()
-                    && traits
-                        .get(kCTFontSlantTrait)
-                        .downcast::<CFNumber>()
-                        .is_some())
-            } {
-                log::error!(
-                    "Failed to read traits for font {:?}",
-                    font.postscript_name().unwrap()
-                );
-                continue;
-            }
-
-            let candidate = self.font_candidates.len();
-            candidates.push(candidate);
-            let postscript_name = font.postscript_name().unwrap();
-            self.font_sources_by_postscript_name
-                .insert(postscript_name.clone(), FontSource::Candidate(candidate));
-            // CTFontCopyFontDescriptor preserves the normalized attributes
-            // needed to recreate this exact face, including features and the
-            // cascade list. Keep those and CSS properties, not every native
-            // font in the family, for the lifetime of the application.
-            let native = font.native_font();
-            self.font_candidates.push(FontCandidate {
-                descriptor: native.copy_descriptor(),
-                point_size: native.pt_size(),
-                properties: font.properties(),
-                postscript_name,
-                font_id: None,
-            });
+        if let Ok(family) = self.memory_source.select_family_by_name(name) {
+            return self.load_family_handles(family.fonts(), features, fallbacks);
         }
-        Ok(candidates)
+
+        // Only verified system font identities use deferred registration.
+        // Private UI aliases (.AppleSystemUIFont -> .SFNS-Regular), user fonts,
+        // and custom configuration retain the existing eager path.
+        if features.tag_value_list().is_empty()
+            && fallbacks.is_none()
+            && let Some(pending) = Self::deferred_system_family(name)?
+        {
+            return Ok(self.register_candidates(pending));
+        }
+        let family = self.system_source.select_family_by_name(name)?;
+        self.load_family_handles(family.fonts(), features, fallbacks)
     }
 
-    fn materialize_font(&mut self, candidate: usize) -> FontId {
-        let candidate = &mut self.font_candidates[candidate];
-        if let Some(font_id) = candidate.font_id {
-            return font_id;
+    fn deferred_system_family(name: &str) -> Result<Option<SmallVec<[FontCandidate; 4]>>> {
+        if !matches!(name, "Menlo" | "Helvetica") {
+            return Ok(None);
+        }
+        // Match font-kit's CoreTextSource query and collection ordering exactly;
+        // create_for_family uses a different query and mandatory attributes.
+        let attributes = CFDictionary::from_CFType_pairs(&[(
+            CFString::new("NSFontFamilyAttribute"),
+            CFString::new(name).as_CFType(),
+        )]);
+        let descriptor = core_text::font_descriptor::new_from_attributes(&attributes);
+        let collection =
+            core_text::font_collection::new_from_descriptors(&CFArray::from_CFTypes(&[descriptor]));
+        let descriptors = collection
+            .get_descriptors()
+            .filter(|descriptors| !descriptors.is_empty())
+            .ok_or(font_kit::error::SelectionError::NotFound)?;
+        let mut pending = SmallVec::new();
+        for descriptor in descriptors.iter() {
+            let Some(candidate) = Self::deferred_system_candidate(name, (*descriptor).clone())
+            else {
+                return Ok(None);
+            };
+            pending.push(candidate);
+        }
+        Ok(Some(pending))
+    }
+
+    fn deferred_system_candidate(
+        name: &str,
+        descriptor: CTFontDescriptor,
+    ) -> Option<FontCandidate> {
+        use core_text::font_descriptor::{kCTFontMatrixAttribute, kCTFontVariationAttribute};
+
+        // A family name alone is insufficient: a user-installed font can have
+        // the same family, and private/variable descriptors can normalize their
+        // PS names. Limit this optimization to these built-in static faces.
+        let (path, names): (&str, &[&str]) = match name {
+            "Menlo" => (
+                "/System/Library/Fonts/Menlo.ttc",
+                &[
+                    "Menlo-Regular",
+                    "Menlo-Italic",
+                    "Menlo-Bold",
+                    "Menlo-BoldItalic",
+                ],
+            ),
+            "Helvetica" => (
+                "/System/Library/Fonts/Helvetica.ttc",
+                &[
+                    "Helvetica",
+                    "Helvetica-Oblique",
+                    "Helvetica-Light",
+                    "Helvetica-LightOblique",
+                    "Helvetica-Bold",
+                    "Helvetica-BoldOblique",
+                ],
+            ),
+            _ => return None,
+        };
+        let postscript_name = lenient_font_attributes::postscript_name(&descriptor)?;
+        if !names.contains(&postscript_name.as_str())
+            || lenient_font_attributes::font_path(&descriptor)?.as_path()
+                != std::path::Path::new(path)
+        {
+            return None;
+        }
+        let attributes = descriptor.attributes();
+        if unsafe {
+            attributes.find(kCTFontVariationAttribute).is_some()
+                || attributes.find(kCTFontMatrixAttribute).is_some()
+        } {
+            return None;
+        }
+        Some(FontCandidate {
+            properties: None,
+            postscript_name,
+            state: FontCandidateState::Deferred(descriptor),
+            previous_source: None,
+        })
+    }
+
+    fn load_family_handles(
+        &mut self,
+        handles: &[Handle],
+        features: &FontFeatures,
+        fallbacks: Option<&FontFallbacks>,
+    ) -> Result<SmallVec<[usize; 4]>> {
+        // A later face can fail to load. Until the whole family succeeds, keep
+        // its candidates local so a retry cannot retain a partial family or
+        // change the PostScript fallback precedence of registered fonts.
+        let mut pending = SmallVec::<[FontCandidate; 4]>::new();
+        for handle in handles {
+            if let Some(candidate) = Self::prepare_font(handle.load()?, features, fallbacks)? {
+                pending.push(candidate);
+            }
+        }
+        Ok(self.register_candidates(pending))
+    }
+
+    fn prepare_font(
+        mut font: FontKitFont,
+        features: &FontFeatures,
+        fallbacks: Option<&FontFallbacks>,
+    ) -> Result<Option<FontCandidate>> {
+        apply_features_and_fallbacks(&mut font, features, fallbacks)?;
+        // This block contains a precautionary fix to guard against loading fonts
+        // that might cause panics due to `.unwrap()`s up the chain.
+        {
+            // We use the 'm' character for text measurements in various spots
+            // (e.g., the editor). However, at time of writing some of those usages
+            // will panic if the font has no 'm' glyph.
+            //
+            // Therefore, we check up front that the font has the necessary glyph.
+            let has_m_glyph = font.glyph_for_char('m').is_some();
+
+            // HACK: The 'Segoe Fluent Icons' font does not have an 'm' glyph,
+            // but we need to be able to load it for rendering Windows icons in
+            // the Storybook (on macOS).
+            let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
+
+            if !has_m_glyph && !is_segoe_fluent_icons {
+                // I spent far too long trying to track down why a font missing the 'm'
+                // character wasn't loading. This log statement will hopefully save
+                // someone else from suffering the same fate.
+                log::warn!(
+                    "font '{}' has no 'm' character and was not loaded",
+                    font.full_name()
+                );
+                return Ok(None);
+            }
         }
 
-        let native =
-            core_text::font::new_from_descriptor(&candidate.descriptor, candidate.point_size);
+        // We've seen a number of panics in production caused by calling font.properties()
+        // which unwraps a downcast to CFNumber. This is an attempt to avoid the panic,
+        // and to try and identify the incalcitrant font.
+        let traits = font.native_font().all_traits();
+        if unsafe {
+            !(traits
+                .get(kCTFontSymbolicTrait)
+                .downcast::<CFNumber>()
+                .is_some()
+                && traits
+                    .get(kCTFontWidthTrait)
+                    .downcast::<CFNumber>()
+                    .is_some()
+                && traits
+                    .get(kCTFontWeightTrait)
+                    .downcast::<CFNumber>()
+                    .is_some()
+                && traits
+                    .get(kCTFontSlantTrait)
+                    .downcast::<CFNumber>()
+                    .is_some())
+        } {
+            log::error!(
+                "Failed to read traits for font {:?}",
+                font.postscript_name().unwrap()
+            );
+            return Ok(None);
+        }
+
+        let postscript_name = font.postscript_name().unwrap();
+        // CTFontCopyFontDescriptor preserves the normalized attributes
+        // needed to recreate this exact face, including features and the
+        // cascade list. Keep those and CSS properties, not every native
+        // font in the family, until this candidate is materialized.
+        let native = font.native_font();
+        Ok(Some(FontCandidate {
+            properties: Some(font.properties()),
+            postscript_name,
+            state: FontCandidateState::Pending {
+                descriptor: native.copy_descriptor(),
+                point_size: native.pt_size(),
+            },
+            previous_source: None,
+        }))
+    }
+
+    fn register_candidates(
+        &mut self,
+        pending: SmallVec<[FontCandidate; 4]>,
+    ) -> SmallVec<[usize; 4]> {
+        let mut candidates = SmallVec::new();
+        for mut candidate in pending {
+            let index = self.font_candidates.len();
+            candidate.previous_source = self.font_sources_by_postscript_name.insert(
+                candidate.postscript_name.clone(),
+                FontSource::Candidate(index),
+            );
+            self.font_candidates.push(candidate);
+            candidates.push(index);
+        }
+        candidates
+    }
+
+    fn prepare_candidate(&mut self, index: usize) -> Result<bool> {
+        let descriptor = match &self.font_candidates[index].state {
+            FontCandidateState::Deferred(descriptor) => descriptor.clone(),
+            FontCandidateState::Rejected => return Ok(false),
+            _ => return Ok(true),
+        };
+        // Use the same size, configuration, glyph query, and native trait
+        // conversion as CoreTextSource + load_family_handles. Descriptor traits
+        // and character coverage are not substitutes for those checks.
+        let native = core_text::font::new_from_descriptor(&descriptor, 16.);
+        let font = unsafe { FontKitFont::from_native_font(&native) };
+        let resolved = Self::prepare_font(font, &FontFeatures::default(), None)?;
+        let candidate = &mut self.font_candidates[index];
+        if let Some(resolved) = resolved {
+            // Fail without committing an unexpected identity. In particular,
+            // never silently relabel a native font or change a newer family's
+            // PostScript precedence after this candidate was registered.
+            anyhow::ensure!(
+                resolved.postscript_name == candidate.postscript_name,
+                "system font identity changed from {} to {}",
+                candidate.postscript_name,
+                resolved.postscript_name,
+            );
+            candidate.properties = resolved.properties;
+            candidate.state = resolved.state;
+            Ok(true)
+        } else {
+            candidate.state = FontCandidateState::Rejected;
+            // A deferred face is only a provisional fallback source. Removing
+            // an ineligible later face restores the previous registered source;
+            // links through it remain usable by still-later candidates.
+            if self
+                .font_sources_by_postscript_name
+                .get(&candidate.postscript_name)
+                == Some(&FontSource::Candidate(index))
+            {
+                if let Some(previous) = candidate.previous_source {
+                    self.font_sources_by_postscript_name
+                        .insert(candidate.postscript_name.clone(), previous);
+                } else {
+                    self.font_sources_by_postscript_name
+                        .remove(&candidate.postscript_name);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    fn select_font(&mut self, candidates: &[usize], query: &Properties) -> Result<FontId> {
+        let mut eligible = SmallVec::<[usize; 4]>::new();
+        let mut properties = SmallVec::<[Properties; 4]>::new();
+        for &candidate in candidates {
+            if self.prepare_candidate(candidate)? {
+                let actual = self.font_candidates[candidate].properties.unwrap();
+                // CSS matching prefers exact stretch, then exact style, then
+                // exact weight, and finally the earliest family index. A later
+                // face cannot beat this full match. Without one, inspect every
+                // face and let the unchanged font-kit matcher decide.
+                if actual == *query {
+                    return self.materialize_font(candidate);
+                }
+                eligible.push(candidate);
+                properties.push(actual);
+            }
+        }
+        let selected = font_kit::matching::find_best_match(&properties, query)?;
+        self.materialize_font(eligible[selected])
+    }
+
+    fn materialize_font(&mut self, candidate: usize) -> Result<FontId> {
+        if !self.prepare_candidate(candidate)? {
+            return Err(font_kit::error::SelectionError::NotFound.into());
+        }
+        let candidate = &mut self.font_candidates[candidate];
+        let native = match &candidate.state {
+            FontCandidateState::Loaded(font_id) => return Ok(*font_id),
+            FontCandidateState::Pending {
+                descriptor,
+                point_size,
+            } => core_text::font::new_from_descriptor(descriptor, *point_size),
+            FontCandidateState::Deferred(_) | FontCandidateState::Rejected => unreachable!(),
+        };
         let font_id = FontId(self.fonts.len());
         // The native font was created above and remains alive for this call.
         self.fonts
             .push(unsafe { FontKitFont::from_native_font(&native) });
         self.postscript_names_by_font_id
             .insert(font_id, candidate.postscript_name.clone());
-        candidate.font_id = Some(font_id);
+        // The stable font table now owns the live font. Retire the candidate's
+        // reconstruction descriptor; this candidate will only use its ID again.
+        candidate.state = FontCandidateState::Loaded(font_id);
         // Only loading a family changes PostScript fallback precedence. Using
         // an older candidate must not override a more recently loaded family.
-        font_id
+        Ok(font_id)
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
@@ -364,26 +573,41 @@ impl MacTextSystemState {
 
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
         let postscript_name = requested_font.postscript_name();
-        match self
+        let mut source = self
             .font_sources_by_postscript_name
             .get(&postscript_name)
-            .copied()
-        {
-            Some(FontSource::Candidate(candidate)) => self.materialize_font(candidate),
-            Some(FontSource::Loaded(font_id)) => font_id,
-            None => {
-                let font_id = FontId(self.fonts.len());
-                self.font_sources_by_postscript_name
-                    .insert(postscript_name.clone(), FontSource::Loaded(font_id));
-                self.postscript_names_by_font_id
-                    .insert(font_id, postscript_name);
-                self.fonts
-                    .push(font_kit::font::Font::from_core_graphics_font(
-                        requested_font.copy_to_CGFont(),
-                    ));
-                font_id
+            .copied();
+        while let Some(current) = source {
+            match current {
+                FontSource::Candidate(candidate) => {
+                    match self.materialize_font(candidate) {
+                        Ok(font_id) => return font_id,
+                        Err(error) => {
+                            if !matches!(
+                                self.font_candidates[candidate].state,
+                                FontCandidateState::Rejected
+                            ) {
+                                log::error!(
+                                    "Failed to load fallback font {postscript_name}: {error}"
+                                );
+                            }
+                        }
+                    }
+                    source = self.font_candidates[candidate].previous_source;
+                }
+                FontSource::Loaded(font_id) => return font_id,
             }
         }
+        let font_id = FontId(self.fonts.len());
+        self.font_sources_by_postscript_name
+            .insert(postscript_name.clone(), FontSource::Loaded(font_id));
+        self.postscript_names_by_font_id
+            .insert(font_id, postscript_name);
+        self.fonts
+            .push(font_kit::font::Font::from_core_graphics_font(
+                requested_font.copy_to_CGFont(),
+            ));
+        font_id
     }
 
     fn is_emoji(&self, font_id: FontId) -> bool {
@@ -737,39 +961,39 @@ impl From<FontStyle> for FontkitStyle {
 // This is the same version as `core_text` has without `expect` calls.
 mod lenient_font_attributes {
     use core_foundation::{
-        base::{CFRetain, CFType, TCFType},
+        base::{CFType, TCFType},
         string::{CFString, CFStringRef},
+        url::CFURL,
     };
     use core_text::font_descriptor::{
         CTFontDescriptor, CTFontDescriptorCopyAttribute, kCTFontFamilyNameAttribute,
+        kCTFontNameAttribute, kCTFontURLAttribute,
     };
 
     pub fn family_name(descriptor: &CTFontDescriptor) -> Option<String> {
-        unsafe { get_string_attribute(descriptor, kCTFontFamilyNameAttribute) }
+        unsafe { string_attribute(descriptor, kCTFontFamilyNameAttribute) }
     }
 
-    fn get_string_attribute(
-        descriptor: &CTFontDescriptor,
-        attribute: CFStringRef,
-    ) -> Option<String> {
-        unsafe {
-            let value = CTFontDescriptorCopyAttribute(descriptor.as_concrete_TypeRef(), attribute);
-            if value.is_null() {
-                return None;
-            }
-
-            let value = CFType::wrap_under_create_rule(value);
-            assert!(value.instance_of::<CFString>());
-            let s = wrap_under_get_rule(value.as_CFTypeRef() as CFStringRef);
-            Some(s.to_string())
-        }
+    pub fn postscript_name(descriptor: &CTFontDescriptor) -> Option<String> {
+        unsafe { string_attribute(descriptor, kCTFontNameAttribute) }
     }
 
-    unsafe fn wrap_under_get_rule(reference: CFStringRef) -> CFString {
+    pub fn font_path(descriptor: &CTFontDescriptor) -> Option<std::path::PathBuf> {
+        unsafe { attribute(descriptor, kCTFontURLAttribute) }
+            .and_then(|value| value.downcast::<CFURL>())
+            .and_then(|url| url.to_path())
+    }
+
+    fn string_attribute(descriptor: &CTFontDescriptor, key: CFStringRef) -> Option<String> {
+        attribute(descriptor, key)?
+            .downcast::<CFString>()
+            .map(|value| value.to_string())
+    }
+
+    fn attribute(descriptor: &CTFontDescriptor, key: CFStringRef) -> Option<CFType> {
         unsafe {
-            assert!(!reference.is_null(), "Attempted to create a NULL object.");
-            let reference = CFRetain(reference as *const ::std::os::raw::c_void) as CFStringRef;
-            TCFType::wrap_under_create_rule(reference)
+            let value = CTFontDescriptorCopyAttribute(descriptor.as_concrete_TypeRef(), key);
+            (!value.is_null()).then(|| CFType::wrap_under_create_rule(value))
         }
     }
 }
@@ -911,7 +1135,7 @@ pub(crate) mod fastab_resource_fixtures {
                 assert!(lazy.0.read().fonts.is_empty());
                 assert_eq!(candidates.len(), eager.0.read().fonts.len());
                 for (index, candidate) in candidates.into_iter().enumerate() {
-                    let id = lazy.0.write().materialize_font(candidate);
+                    let id = lazy.0.write().materialize_font(candidate).unwrap();
                     {
                         let expected = &eager.0.read().fonts[index];
                         let actual = &lazy.0.read().fonts[id.0];
@@ -974,6 +1198,333 @@ pub(crate) mod fastab_resource_fixtures {
         });
     }
 
+    pub fn system_font_enumeration_stops_after_first_exact_match() {
+        objc::rc::autoreleasepool(|| {
+            for family in ["Menlo", "Helvetica"] {
+                let request = crate::font(family);
+                let system = MacTextSystem::new();
+                let candidates = system
+                    .0
+                    .write()
+                    .load_family(family, &request.features, None)
+                    .unwrap();
+                {
+                    let state = system.0.read();
+                    assert!(state.fonts.is_empty());
+                    assert!(candidates.len() > 1);
+                    assert!(candidates.iter().all(|&index| {
+                        state.font_candidates[index].properties.is_none()
+                            && matches!(
+                                state.font_candidates[index].state,
+                                FontCandidateState::Deferred(_)
+                            )
+                    }));
+                }
+                {
+                    use core_foundation::url::CFURL;
+                    use core_text::font_descriptor::kCTFontURLAttribute;
+                    let state = system.0.read();
+                    let FontCandidateState::Deferred(descriptor) =
+                        &state.font_candidates[candidates[0]].state
+                    else {
+                        unreachable!();
+                    };
+                    let attributes = CFDictionary::from_CFType_pairs(&[(
+                        unsafe { CFString::wrap_under_get_rule(kCTFontURLAttribute) },
+                        CFURL::from_path(format!("/Library/Fonts/{family}.ttc"), false)
+                            .unwrap()
+                            .as_CFType(),
+                    )]);
+                    let user_font = descriptor
+                        .create_copy_with_attributes(attributes.into_untyped())
+                        .unwrap();
+                    assert_eq!(
+                        lenient_font_attributes::family_name(&user_font).as_deref(),
+                        Some(family)
+                    );
+                    assert_eq!(
+                        lenient_font_attributes::postscript_name(&user_font),
+                        lenient_font_attributes::postscript_name(descriptor)
+                    );
+                    assert!(
+                        MacTextSystemState::deferred_system_candidate(family, user_font).is_none()
+                    );
+                }
+                // Independent eager CoreTextSource reference, including every
+                // native face. Enumeration above retained only raw descriptors.
+                let eager = eager_family(&request);
+                assert_eq!(candidates.len(), eager.len());
+                let query = Properties::new();
+                let first_exact = eager
+                    .iter()
+                    .position(|font| font.properties() == query)
+                    .unwrap();
+                assert!(
+                    first_exact + 1 < eager.len(),
+                    "{family} must leave uninitialized faces"
+                );
+                let id = system.0.write().select_font(&candidates, &query).unwrap();
+                {
+                    let state = system.0.read();
+                    assert_eq!(state.fonts.len(), 1);
+                    assert_eq!(
+                        state.fonts[id.0].postscript_name(),
+                        eager[first_exact].postscript_name()
+                    );
+                    for (position, &index) in candidates.iter().enumerate() {
+                        assert_eq!(
+                            state.font_candidates[index].postscript_name,
+                            eager[position].postscript_name().unwrap()
+                        );
+                        assert_eq!(
+                            matches!(
+                                state.font_candidates[index].state,
+                                FontCandidateState::Deferred(_)
+                            ),
+                            position > first_exact
+                        );
+                    }
+                }
+                assert_eq!(
+                    system.0.write().select_font(&candidates, &query).unwrap(),
+                    id
+                );
+                let eager_system = eager_text_system(eager.clone());
+                let text = "office ffi 中文 😀 a\u{feff}b";
+                let expected = eager_system.layout_line(
+                    text,
+                    px(17.),
+                    &[FontRun {
+                        font_id: FontId(first_exact),
+                        len: text.len(),
+                    }],
+                );
+                let actual = system.layout_line(
+                    text,
+                    px(17.),
+                    &[FontRun {
+                        font_id: id,
+                        len: text.len(),
+                    }],
+                );
+                assert_same_layout(&expected, &actual, &eager_system.0.read(), &system.0.read());
+
+                // A non-exact request must inspect the complete family before
+                // invoking the same CSS matcher, including stretch preferences.
+                let properties = eager
+                    .iter()
+                    .map(FontKitFont::properties)
+                    .collect::<Vec<_>>();
+                for style in [
+                    FontkitStyle::Normal,
+                    FontkitStyle::Italic,
+                    FontkitStyle::Oblique,
+                ] {
+                    for stretch in [0.75, 1.0, 1.25] {
+                        let query = Properties {
+                            style,
+                            weight: FontkitWeight(456.75),
+                            stretch: font_kit::properties::Stretch(stretch),
+                        };
+                        assert!(!properties.contains(&query));
+                        let expected =
+                            font_kit::matching::find_best_match(&properties, &query).unwrap();
+                        let actual = system.0.write().select_font(&candidates, &query).unwrap();
+                        let state = system.0.read();
+                        assert_eq!(
+                            state.fonts[actual.0].postscript_name(),
+                            eager[expected].postscript_name()
+                        );
+                        assert!(candidates.iter().all(|&index| !matches!(
+                            state.font_candidates[index].state,
+                            FontCandidateState::Deferred(_)
+                        )));
+                    }
+                }
+                system.release_idle_caches();
+                assert_eq!(
+                    system
+                        .0
+                        .write()
+                        .select_font(&candidates, &Properties::new())
+                        .unwrap(),
+                    id
+                );
+            }
+
+            // This alias has different descriptor and native PostScript names.
+            // It must retain the eager registration behavior, as must explicit
+            // feature/cascade configuration even on otherwise eligible families.
+            for (family, features, fallbacks) in [
+                (".SystemUIFont", FontFeatures::default(), None),
+                ("Menlo", FontFeatures::disable_ligatures(), None),
+                (
+                    "Helvetica",
+                    FontFeatures::default(),
+                    Some(FontFallbacks::from_fonts(vec!["Menlo".into()])),
+                ),
+            ] {
+                let system = MacTextSystem::new();
+                let candidates = system
+                    .0
+                    .write()
+                    .load_family(family, &features, fallbacks.as_ref())
+                    .unwrap();
+                assert!(!candidates.is_empty());
+                let state = system.0.read();
+                assert!(candidates.iter().all(|&index| matches!(
+                    state.font_candidates[index].state,
+                    FontCandidateState::Pending { .. }
+                )));
+            }
+
+            // A same-family MemSource entry must still shadow system fonts,
+            // even for the default configuration eligible for deferred loading.
+            let native = core_text::font::new_from_name("Helvetica", 16.).unwrap();
+            let memory_font = FontKitFont::from_core_graphics_font(native.copy_to_CGFont());
+            let system = MacTextSystem::new();
+            system
+                .0
+                .write()
+                .memory_source
+                .add_fonts([Handle::from_native(&memory_font)].into_iter())
+                .unwrap();
+            let id = system
+                .font_id(&crate::font(memory_font.family_name()))
+                .unwrap();
+            let state = system.0.read();
+            assert_eq!(state.font_candidates.len(), 1);
+            assert!(
+                matches!(state.font_candidates[0].state, FontCandidateState::Loaded(loaded) if loaded == id)
+            );
+            assert_eq!(
+                state.fonts[id.0].postscript_name(),
+                memory_font.postscript_name()
+            );
+            assert_eq!(state.fonts[id.0].properties(), memory_font.properties());
+        });
+    }
+
+    pub fn deferred_font_candidates_preserve_matching_and_fallback_precedence() {
+        use core_foundation::{
+            base::kCFAllocatorDefault,
+            characterset::{CFCharacterSet, CFCharacterSetCreateWithCharactersInString},
+        };
+        use core_text::font_descriptor::kCTFontCharacterSetAttribute;
+
+        objc::rc::autoreleasepool(|| {
+            let native = core_text::font::new_from_name("Helvetica", 16.).unwrap();
+            let descriptor = native.copy_descriptor();
+            let empty = unsafe {
+                CFCharacterSet::wrap_under_create_rule(CFCharacterSetCreateWithCharactersInString(
+                    kCFAllocatorDefault,
+                    CFString::new("").as_concrete_TypeRef(),
+                ))
+            };
+            // CoreText documents that this attribute restricts the actual
+            // character set. This is a real native font with the same PS name
+            // and no 'm', not a mocked eligibility failure or altered CSS trait.
+            let attributes = CFDictionary::from_CFType_pairs(&[(
+                unsafe { CFString::wrap_under_get_rule(kCTFontCharacterSetAttribute) },
+                empty.as_CFType(),
+            )]);
+            let restricted = descriptor
+                .create_copy_with_attributes(attributes.into_untyped())
+                .unwrap();
+            let restricted_native = core_text::font::new_from_descriptor(&restricted, 16.);
+            let mut restricted_font = unsafe { FontKitFont::from_native_font(&restricted_native) };
+            apply_features_and_fallbacks(&mut restricted_font, &FontFeatures::default(), None)
+                .unwrap();
+            assert_eq!(
+                restricted_font.postscript_name().unwrap(),
+                native.postscript_name()
+            );
+            assert_eq!(restricted_font.glyph_for_char('m'), None);
+            assert!(
+                MacTextSystemState::prepare_font(restricted_font, &FontFeatures::default(), None)
+                    .unwrap()
+                    .is_none()
+            );
+
+            let deferred = |descriptor: CTFontDescriptor| FontCandidate {
+                properties: None,
+                postscript_name: native.postscript_name(),
+                state: FontCandidateState::Deferred(descriptor),
+                previous_source: None,
+            };
+            let system = MacTextSystem::new();
+            let mut state = system.0.write();
+            let older = state
+                .load_family("Helvetica", &FontFeatures::disable_ligatures(), None)
+                .unwrap();
+            let name = native.postscript_name();
+            let old_candidate = *older
+                .iter()
+                .find(|&&index| state.font_candidates[index].postscript_name == name)
+                .unwrap();
+            let old_id = state.materialize_font(old_candidate).unwrap();
+            let previous = state.font_sources_by_postscript_name[&name];
+            let rejected = state.register_candidates(SmallVec::from_vec(vec![
+                deferred(restricted.clone()),
+                deferred(restricted.clone()),
+            ]));
+            assert_eq!(state.id_for_native_font(native.clone()), old_id);
+            assert_eq!(state.font_sources_by_postscript_name[&name], previous);
+            assert_eq!(state.fonts.len(), 1);
+            assert!(rejected.iter().all(|&index| matches!(
+                state.font_candidates[index].state,
+                FontCandidateState::Rejected
+            )));
+            assert_eq!(state.id_for_native_font(native.clone()), old_id);
+
+            // Rejection during CSS selection must also continue in original
+            // order; rejecting an older node must not disturb the newer head.
+            let retry = state.register_candidates(SmallVec::from_vec(vec![
+                deferred(restricted),
+                deferred(descriptor),
+            ]));
+            let newest = FontSource::Candidate(retry[1]);
+            let selected = state.select_font(&retry, &Properties::new()).unwrap();
+            assert!(matches!(
+                state.font_candidates[retry[0]].state,
+                FontCandidateState::Rejected
+            ));
+            assert_eq!(state.font_sources_by_postscript_name[&name], newest);
+            assert_ne!(selected, old_id);
+            assert_eq!(state.fonts.len(), 2);
+            assert_eq!(state.id_for_native_font(native.clone()), selected);
+            assert_eq!(state.materialize_font(old_candidate).unwrap(), old_id);
+            assert_eq!(state.id_for_native_font(native), selected);
+
+            // Private aliases are excluded at the family gate. Exercise the
+            // second identity guard with CoreText's real normalization too:
+            // no native ID, CSS properties, or PS source is partially changed.
+            let alias = core_text::font_descriptor::new_from_postscript_name(&CFString::new(
+                ".AppleSystemUIFont",
+            ));
+            let index = state.register_candidates(SmallVec::from_vec(vec![FontCandidate {
+                properties: None,
+                postscript_name: ".AppleSystemUIFont".into(),
+                state: FontCandidateState::Deferred(alias),
+                previous_source: None,
+            }]))[0];
+            let font_count = state.fonts.len();
+            let sources = state.font_sources_by_postscript_name.clone();
+            let names = state.postscript_names_by_font_id.clone();
+            for _ in 0..2 {
+                assert!(state.prepare_candidate(index).is_err());
+                assert!(state.font_candidates[index].properties.is_none());
+                assert!(matches!(
+                    state.font_candidates[index].state,
+                    FontCandidateState::Deferred(_)
+                ));
+                assert_eq!(state.fonts.len(), font_count);
+                assert_eq!(state.font_sources_by_postscript_name, sources);
+                assert_eq!(state.postscript_names_by_font_id, names);
+            }
+        });
+    }
+
     pub fn native_fallback_preserves_candidate_precedence_and_font_ids() {
         objc::rc::autoreleasepool(|| {
             let system = MacTextSystem::new();
@@ -992,16 +1543,16 @@ pub(crate) mod fastab_resource_fixtures {
                 .rev()
                 .find(|&&candidate| state.font_candidates[candidate].postscript_name == name)
                 .unwrap();
-            let old_id = state.materialize_font(old_candidate);
+            let old_id = state.materialize_font(old_candidate).unwrap();
             let old_native = state.fonts[old_id.0].native_font();
             assert_eq!(state.fonts.len(), 1);
             // A shaped native font with this PS name must use the most recently
             // loaded family's configured candidate, even if it was never selected.
             let fallback_id = state.id_for_native_font(old_native.clone());
             assert_ne!(fallback_id, old_id);
-            assert_eq!(fallback_id, state.materialize_font(new_candidate));
+            assert_eq!(fallback_id, state.materialize_font(new_candidate).unwrap());
             assert_eq!(state.fonts.len(), 2);
-            assert_eq!(state.materialize_font(old_candidate), old_id);
+            assert_eq!(state.materialize_font(old_candidate).unwrap(), old_id);
             assert_eq!(state.id_for_native_font(old_native), fallback_id);
             assert_eq!(state.fonts.len(), 2);
 
@@ -1013,9 +1564,108 @@ pub(crate) mod fastab_resource_fixtures {
             drop(state);
             system.release_idle_caches();
             let mut state = system.0.write();
-            assert_eq!(state.materialize_font(old_candidate), old_id);
-            assert_eq!(state.materialize_font(new_candidate), fallback_id);
+            assert_eq!(state.materialize_font(old_candidate).unwrap(), old_id);
+            assert_eq!(state.materialize_font(new_candidate).unwrap(), fallback_id);
             assert_eq!(state.fonts.len(), 3);
+        });
+    }
+
+    pub fn materialized_font_candidates_release_descriptors() {
+        objc::rc::autoreleasepool(|| {
+            let system = MacTextSystem::new();
+            let mut state = system.0.write();
+            let candidates = state
+                .load_family("Helvetica", &FontFeatures::disable_ligatures(), None)
+                .unwrap();
+            assert!(candidates.len() > 1);
+            assert!(candidates.iter().all(|&candidate| matches!(
+                state.font_candidates[candidate].state,
+                FontCandidateState::Pending { .. },
+            )));
+            let selected = candidates[0];
+            let font_id = state.materialize_font(selected).unwrap();
+            // Loaded carries only the stable ID: no descriptor or point size
+            // remains in the candidate. CoreText may keep its own references,
+            // so native retain counts are not an application-owner assertion.
+            assert!(matches!(
+                state.font_candidates[selected].state,
+                FontCandidateState::Loaded(id) if id == font_id,
+            ));
+            assert!(candidates[1..].iter().all(|&candidate| matches!(
+                state.font_candidates[candidate].state,
+                FontCandidateState::Pending { .. },
+            )));
+            let native = state.fonts[font_id.0].native_font();
+            assert_eq!(state.materialize_font(selected).unwrap(), font_id);
+            assert_eq!(
+                state.fonts[font_id.0].native_font().as_concrete_TypeRef(),
+                native.as_concrete_TypeRef(),
+            );
+            drop(state);
+
+            let text = "office 中文 😀";
+            let runs = [FontRun {
+                font_id,
+                len: text.len(),
+            }];
+            let before = system.layout_line(text, px(16.), &runs);
+            system.release_idle_caches();
+            let after = system.layout_line(text, px(16.), &runs);
+            let mut state = system.0.write();
+            assert_same_layout(&before, &after, &state, &state);
+            assert_eq!(state.materialize_font(selected).unwrap(), font_id);
+            assert_eq!(
+                state.fonts[font_id.0].native_font().as_concrete_TypeRef(),
+                native.as_concrete_TypeRef(),
+            );
+        });
+    }
+
+    pub fn failed_font_family_load_keeps_registered_state_unchanged() {
+        objc::rc::autoreleasepool(|| {
+            let system = MacTextSystem::new();
+            let request = crate::font("Helvetica");
+            let font_id = system.font_id(&request).unwrap();
+            let text = "office 中文 😀";
+            let runs = [FontRun {
+                font_id,
+                len: text.len(),
+            }];
+            let before = system.layout_line(text, px(16.), &runs);
+            let family = SystemSource::new()
+                .select_family_by_name("Helvetica")
+                .unwrap();
+            let invalid = Handle::from_memory(Arc::new(Vec::new()), 0);
+            // Exercise font-kit's real parser error after one valid face. An
+            // empty font file fails parsing; no loader or failure is mocked.
+            assert!(invalid.load().is_err());
+            let handles = [family.fonts()[0].clone(), invalid];
+            {
+                let mut state = system.0.write();
+                let candidate_count = state.font_candidates.len();
+                let font_count = state.fonts.len();
+                let sources = state.font_sources_by_postscript_name.clone();
+                let keys = state.font_candidates_by_font_key.clone();
+                let selections = state.font_selections.clone();
+                let names = state.postscript_names_by_font_id.clone();
+                for _ in 0..3 {
+                    assert!(
+                        state
+                            .load_family_handles(&handles, &FontFeatures::disable_ligatures(), None,)
+                            .is_err()
+                    );
+                    assert_eq!(state.font_candidates.len(), candidate_count);
+                    assert_eq!(state.fonts.len(), font_count);
+                    assert_eq!(state.font_sources_by_postscript_name, sources);
+                    assert!(state.font_candidates_by_font_key == keys);
+                    assert_eq!(state.font_selections, selections);
+                    assert_eq!(state.postscript_names_by_font_id, names);
+                }
+            }
+            assert_eq!(system.font_id(&request).unwrap(), font_id);
+            let after = system.layout_line(text, px(16.), &runs);
+            let state = system.0.read();
+            assert_same_layout(&before, &after, &state, &state);
         });
     }
 
