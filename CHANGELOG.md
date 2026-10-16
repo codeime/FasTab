@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.0.10
+
+- fix: borrow the Metal device when creating CoreVideo texture caches, balancing native references across renderer lifetimes.
+- change: create video texture caches only when a frame contains surfaces, avoiding unused caches in ordinary settings and completion windows.
+- change: release native text-layout and child-layout scratch storage after the last window closes, preserving font identities and rebuilding buffers on demand.
+
 ## v0.0.9
 
 - fix: release copied keyboard input sources and CoreText font attribute arrays after native queries, preventing retained references from accumulating.
