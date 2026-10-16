@@ -42,6 +42,14 @@ Fastab changes `src/platform/mac/metal_renderer.rs`:
   rasterization that survives resize and reads back its MSAA-resolved pixel.
   This reduces unnecessary texture allocation and potential peak usage; it does
   not establish a reduction in the installed app's idle physical footprint.
+- CoreVideo texture-cache creation passes a borrowed `DeviceRef` through a
+  private raw FFI binding. The locked `core-video` 0.4.3 wrapper instead moves an
+  owned `metal::Device` into the non-consuming C argument, abandoning the cloned
+  device's release. The returned cache still follows the CoreFoundation Create
+  rule. Cache creation is now lazy on the first nonempty surface batch, so normal
+  Settings and autocomplete frames do not create an unused video cache. Once
+  created, it is reused and dropped with its renderer; submitted texture work
+  keeps the existing Metal command ownership.
 
 Fastab also changes `src/platform/mac/window.rs`:
 
@@ -107,6 +115,17 @@ Application cache reclamation in `src/app.rs` and `src/text_system.rs`:
   completion, and the actual deferred close hook with an intervening window open.
   The GPUI test platform uses its synthetic text backend; these tests do not
   establish CoreText rendering or installed-app memory savings.
+- The application child-layout ID buffer also retires after the last window.
+  The existing idle fixture builds its capacity through real Div child layouts,
+  verifies that another live window prevents retirement, and reopens to rebuild
+  it. `layout_id_buffer_bytes` reports backing capacity, not footprint savings.
+- `PlatformTextSystem::release_idle_caches` defaults to no work. The macOS
+  implementation takes the ZWNJ layout scratch under its existing write lock
+  and drops it outside the lock. All native fonts and FontIds remain registered;
+  live layouts own their glyph indices. `TextCacheRelease.platform_scratch_bytes`
+  reports only the discarded scratch capacity. A native CoreText fixture checks
+  mixed Unicode/fallback shaping, old layouts across retirement, stable font
+  identities, and lazy scratch rebuilding.
 
 The root `[patch.crates-io]` applies this copy to all GPUI consumers. Other
 `gpui_*` crates retain their registry dependencies. Font identities, rendering
@@ -116,8 +135,30 @@ This does not unregister private AppKit notification observers or promise that
 all native views and application-wide caches disappear on close. It separates
 their lifetime from the resources needed only by a live window.
 
+The new CoreVideo ownership and lazy-cache fixtures are exported through
+`test-support` to the existing `fastab_gpui` workspace test target, alongside
+the CPU-only ownership fixtures. CI requires 11 CPU-only cases to pass and both
+Metal cases to be collected as ignored. On a Metal-capable macOS validation host
+(not the local development machine, where builds remain prohibited), run:
+
+```sh
+cargo test --locked -p fastab_gpui resource_ownership_tests::metal_surface_cache_ -- --ignored --test-threads=1
+```
+
+The explicit `Native CoreVideo cache regression` workflow uses this workspace
+bridge on a registered `fastab-metal` runner and requires both named cases to
+pass. It does not run on push or claim coverage of the older vendor-only GPU
+fixtures below.
+
+These fixtures use a real device and CoreVideo cache, checking the borrowed
+argument at the FFI boundary, deterministic error handling, empty-batch laziness,
+cache reuse and its owned-reference release. They require hardware explicitly;
+missing Metal never silently turns a test into a pass. Their execution and a
+new installed build's footprint comparison remain separate acceptance steps.
+
 Run the hardware tests on a Metal-capable macOS host from a temporary verification
-copy of this repository. In that copy only, add `"vendor/gpui"` to the root
+copy of this repository for the older vendor-only fixtures described above.
+In that copy only, add `"vendor/gpui"` to the root
 `workspace.members`, then run:
 
 ```sh

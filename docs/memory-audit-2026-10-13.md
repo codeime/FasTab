@@ -270,3 +270,51 @@ GPT-6 Astra ultra 已复核 M1/M2、generator 去重、NextWords/历史索引、
 已完成主代理与 GPT-6 Astra ultra 的逐项及整体源码复核。review 中修正了每帧拆建稳定 tracking bucket 的分配回退、native font fixture 的 unsafe 调用、非 workspace 测试入口，以及隐藏 fixture 原定义的 missing_docs lint 范围；最终未发现未解决的高置信源码阻断。受影响 Rust 文件的直接 rustfmt 检查与 git diff 检查通过，这不是编译或执行回归通过。
 
 后续必须先取得此次确切提交的远端编译与回归结果，再对新安装版复测：输入源切换 / 键盘布局查询、Settings 与 Overlay 反复创建销毁、插入后立即执行或切窗、10 / 60 秒空闲后的 footprint / live heap / owner。重启旧运行进程只能建立冷启动基线，不能证明这份尚未安装的修复已生效。
+
+## 11. 首次授权与 Settings 关闭后的留存（2026-10-16）
+
+### 用户现场与三项结论
+
+本次保留用户手动重新安装、授权、打开并关闭设置后的进程 PID 91068，没有再开设置、自动化操作界面或重启。运行身份是 0.0.9、commit `f0134e31c87213a8775103d078cc7d9a43365125`、映射 UUID `ce373a5e9e6c3e9ea9ea9d8466e5de91`。三次 physical footprint 为 30.485 → 30.501 → 30.485 MiB，peak 77.1 MiB；live heap 为 12,315,136 → 12,300,752 bytes，未呈现持续增长。IME 约 8.6 MiB，单独计量。
+
+同版此前冷启动 PID 88449 的 footprint 是 15.782 MiB、live heap 约 4.64 MiB；两者相差约 14.7 MiB footprint，但这是不同进程、不同经历的基线，不能把差值全部归给某个对象。此前 CUA 操作引入了窗口共享指示器，本次纯手动现场没有该对象。
+
+1. **Metal 设备引用泄漏属实。** `CVMetalTextureCache::new(None, device.clone(), None)` 使用锁定的 `core-video` 0.4.3 包装；它把拥有引用的 `metal::Device` 移入 C 参数，而 SDK 的 `id<MTLDevice>` 参数只借用、不消费。Rust `Drop` 不会在 C 返回后执行，因此每次创建 renderer 遗失一个 retain。修复只建立这条路径的引用平衡；设备仍可能被 Metal / 系统缓存持有，不能保证释放整个设备或解释全部内存差值。
+2. **设置与权限窗口已释放。** 诊断窗口数为零；没有 GPUIWindow、GPUIView、GPUIPanel、CAMetalLayer、CoreVideo texture cache 或授权引导视图对象。引擎请求及初始化次数均为零。权限轮询使用弱窗口句柄，修复任务有期限，没有发现其持续持有设置 Entity。保留这些现有关闭语义，不增加定时销毁或轮询。
+3. **首次绘制仍会留下进程级和系统资源。** 字体注册表、一个已停止订阅的显示时钟、AppKit 缓存以及 allocator 高水位不能等同于未关闭窗口。现场 `CVDisplayLink` 仅一个 / 1,536 bytes；17 个 TSMInputSource 在两次 heap 间稳定。最大的 448 KiB 和另一块 112 KiB bitmap 逆向引用到系统 NSCursor / AppKit 全局缓存，合计 560 KiB；不是权限引导窗口存活。没有残留 1 MiB element arena 的迹象。
+
+`vmmap` 的 malloc dirty + swapped fragmentation 为 8,066 KiB；此前冷启动约 4,835 KiB。此统计不是可立即归还页数，不与 live heap 或 footprint 直接相加。`leaks` 的 20,288 bytes 主要是系统 NSXPCConnection 环和数组，也检测不到仍可达的设备 retain 失衡。IOSurface 三个映射合计 48 KiB 虚拟空间，resident / dirty 为零；autorelease pool 与 backing 约 22 KiB。这些证据不支持把十几 MiB 全部称作当前不可达泄漏。
+
+原始证据：本机 `/tmp/fastab-install-scene-91068-summary.json`、同前缀的 `build-identity.json`、`heap-{1,2}.txt`、`vmmap-1.txt`、`leaks-1.txt`、`trace-{448k,112k}.txt`、`footprint-{1,2,3}.txt`、`engine-{1,2,3}.json`。都是此次修改前的安装版快照。
+
+### 本次修复与安全边界
+
+| 项目 | 实施 | review / 回归边界 |
+| --- | --- | --- |
+| Metal Device +1 | 私有 raw FFI 使用借用的 `DeviceRef` 指针；Create 输出用 create-rule owner 接管，错误与空输出明确返回 | 对照锁定依赖和本机 SDK 核对 ABI/ownership；真实设备 fixture 检查调用边界没有多余 retain，涵盖成功与错误 |
+| 无用视频缓存 | 首个非空 surface batch 才创建 CoreVideo cache；普通设置/候选帧不创建 | 缓存只创建一次并随 renderer 释放；不改 Y/CbCr 纹理编码、Metal in-flight 所有权或 MSAA。真实硬件 fixture 覆盖空批次、复用与 cache +1 释放 |
+| CoreText 布局 scratch | 既有最后窗口关闭 hook 调用平台退休接口；写锁内取走 ZWNJ Vec，锁外释放 | 保留所有 FontId、字体表和旧 LineLayout；真实 CoreText fixture 校验 Unicode/fallback glyph 输出、身份、回收后重建。单一 FontRun 的普通设置文本通常不分配该 scratch，收益取决于分段文本规模 |
+| 子布局 ID scratch | 最后窗口关闭后取走 App 的 `layout_id_buffer` backing，重开按需分配 | 扩展现有真实 Div 布局 fixture；有其他窗口时不释放，最后窗口退出才释放，重复退休与重开都覆盖。没有现场容量证据，不宣称 MiB 收益 |
+
+两个 scratch 的诊断只报告容量字节（`platform_scratch_bytes`、`layout_id_buffer_bytes`），不报告为物理内存下降。释放继续使用既有的最后窗口关闭流程；overlay 隐藏 10 秒期限、设置关闭行为与权限流程不变。
+
+### 深入检查后保留的资源
+
+- **字体 family 全面懒加载暂不实施。** 当前 CSS weight/style 匹配会枚举全部候选 face；直接改用 CoreText 选择可能改变匹配结果，且 native fallback 的 FontId 去重依赖已注册字体快照。安全实施需单独验证 embedded / variable font、features / fallbacks 与旧布局身份，不以清空稳定表换取较低数字。
+- **DisplayLink 不直接释放。** 最后订阅退出已经停止时钟；CoreVideo Stop 不 join IO 线程，永久 registry 保持回调上下文有效，直接 free 会引入 use-after-free 风险。
+- **不新增 `malloc_zone_pressure_relief`。** 本机 SDK 定义其为 best-effort；还没有候选包同进程 A/B 的耗时、返回 bytes、footprint 与重开延迟证据。当前 fragmentation 不足以证明强制全 zone 回收值得进入生产热路径。
+- **不清理 AppKit 全局 cursor 缓存或改系统输入源。** 这些有明确系统 owner；没有观察到本轮重复增长。权限指南持有的 16-byte action target 是既有 process-lifetime 对象。
+
+### 验证与后续验收
+
+新增 native scratch 用例走现有 workspace 测试桥，普通 macOS CI 必须通过 11 个 ownership 用例；两项真实 Metal/CoreVideo 用例明确标记为需要 GPU 的 ignored 测试，CI 还检查它们确实被收集。Hosted runner 的 Metal 可用性尚未证明，不能把 ignored 说成执行通过。GPU 验证机使用：
+
+```sh
+cargo test --locked -p fastab_gpui resource_ownership_tests::metal_surface_cache_ -- --ignored --test-threads=1
+```
+
+本机不构建、不执行项目测试。远端须先完成这份确切修改的编译、Clippy 与普通回归，然后在 Metal 验证机执行上述两项，再对新安装版手动测量冷启动、授权/设置关闭、反复开关与 10/60 秒空闲。检查窗口/缓存 owner、footprint、live heap、重复操作趋势及重新显示延迟；不得把旧包现场、引用计数修复或容量归零直接当作新包物理内存收益。
+
+各项已由未参与该项实现的代理独立审阅，随后完成主代理与 GPT-6 Astra 的整体源码复核，未发现未解决的代码阻断问题。review 已补齐 Metal fixture 的 `macos-blade` feature 排除，修正文档中没有证据的“平台常驻持有设备”断言，并通过受影响 Rust 文件的直接 rustfmt 与 `git diff --check`。这些检查不代替编译、测试执行或新包内存验收。
+
+提交前复核还发现手动 Metal 工作流没有选中新 fixture，且原 `cargo test -p gpui` 受非 workspace dev-dependencies 限制。已改为 workspace 中的两个具名 CoreVideo cache 回归，并断言恰好 2 项通过；工作流命名同步收窄。该任务仅手动运行于已注册的 `fastab-metal` GPU runner，普通 push CI 仍是 11 项执行、2 项硬件用例 ignored。旧 vendor-only GPU 回归保留独立验证副本的说明，不把本次工作流描述为已覆盖它们。
