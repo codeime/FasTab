@@ -34,6 +34,24 @@ fn native_layout_scratch_retires_without_changing_fonts_or_layout() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_font_families_keep_only_selected_faces_loaded() {
+    fixtures::native_font_families_materialize_only_selected_faces();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_font_descriptors_keep_attributes_and_shaping() {
+    fixtures::native_font_descriptors_preserve_attributes_and_shaping();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_fallback_keeps_candidate_precedence_and_font_ids() {
+    fixtures::native_fallback_preserves_candidate_precedence_and_font_ids();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn generated_metal_shader_excludes_host_ffi() {
     fixtures::generated_shader_bindings_exclude_host_ffi();
 }
