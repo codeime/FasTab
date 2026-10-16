@@ -1,5 +1,6 @@
 // Modified by Fastab: retire idle instance buffers without recaching late GPU
-// completions, and allocate path textures only when needed by a scene.
+// completions, allocate path textures only when needed, and lazily create video
+// texture caches with a borrowed Metal device.
 // See FASTAB_PATCHES.md at the root of this vendored crate.
 
 use super::metal_atlas::MetalAtlas;
@@ -16,10 +17,15 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 
-use core_foundation::base::TCFType;
+use core_foundation::{
+    base::{CFAllocatorRef, TCFType, kCFAllocatorDefault},
+    dictionary::CFDictionaryRef,
+};
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::{CVMetalTextureCache, CVMetalTextureCacheRef},
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    r#return::{CVReturn, kCVReturnInvalidArgument, kCVReturnSuccess},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -41,6 +47,77 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+
+unsafe extern "C" {
+    // core-video 0.4.3 declares this borrowed argument as an owned Device.
+    // Moving a cloned Device into that C call abandons its Rust release.
+    #[link_name = "CVMetalTextureCacheCreate"]
+    fn create_metal_texture_cache_borrowed(
+        allocator: CFAllocatorRef,
+        cache_attributes: CFDictionaryRef,
+        device: *mut metal::MTLDevice,
+        texture_attributes: CFDictionaryRef,
+        cache_out: *mut CVMetalTextureCacheRef,
+    ) -> CVReturn;
+}
+
+fn create_surface_texture_cache(
+    device: &metal::DeviceRef,
+) -> Result<CVMetalTextureCache, CVReturn> {
+    // SAFETY: this is the SDK's non-consuming device argument and Create +1 output.
+    unsafe {
+        create_surface_texture_cache_with(device, |device, cache_out| {
+            create_metal_texture_cache_borrowed(
+                kCFAllocatorDefault,
+                ptr::null(),
+                device,
+                ptr::null(),
+                cache_out,
+            )
+        })
+    }
+}
+
+/// # Safety
+/// `create` must borrow the device and, on success, transfer either one valid
+/// CVMetalTextureCache reference or null through its output pointer. On failure
+/// it must not transfer an owned reference.
+unsafe fn create_surface_texture_cache_with(
+    device: &metal::DeviceRef,
+    create: impl FnOnce(*mut metal::MTLDevice, *mut CVMetalTextureCacheRef) -> CVReturn,
+) -> Result<CVMetalTextureCache, CVReturn> {
+    let mut cache = ptr::null_mut();
+    let status = create(device.as_ptr(), &mut cache);
+    if status != kCVReturnSuccess {
+        return Err(status);
+    }
+    if cache.is_null() {
+        return Err(kCVReturnInvalidArgument);
+    }
+    // The SDK borrows the device and transfers exactly the cacheOut +1.
+    Ok(unsafe { CVMetalTextureCache::wrap_under_create_rule(cache) })
+}
+
+#[derive(Default)]
+struct SurfaceTextureCache {
+    cache: Option<CVMetalTextureCache>,
+}
+
+impl SurfaceTextureCache {
+    fn for_batch(
+        &mut self,
+        device: &metal::DeviceRef,
+        surface_count: usize,
+    ) -> Result<Option<&CVMetalTextureCache>, CVReturn> {
+        if surface_count == 0 {
+            return Ok(None);
+        }
+        if self.cache.is_none() {
+            self.cache = Some(create_surface_texture_cache(device)?);
+        }
+        Ok(self.cache.as_ref())
+    }
+}
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -131,7 +208,7 @@ pub(crate) struct MetalRenderer {
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
-    core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    core_video_texture_cache: SurfaceTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -282,8 +359,6 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone()));
-        let core_video_texture_cache =
-            CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
         Self {
             device,
@@ -301,7 +376,7 @@ impl MetalRenderer {
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
-            core_video_texture_cache,
+            core_video_texture_cache: SurfaceTextureCache::default(),
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -1121,6 +1196,13 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
+        let Some(texture_cache) = self
+            .core_video_texture_cache
+            .for_batch(&self.device, surfaces.len())
+            .unwrap()
+        else {
+            return true;
+        };
         command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
@@ -1144,8 +1226,7 @@ impl MetalRenderer {
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             );
 
-            let y_texture = self
-                .core_video_texture_cache
+            let y_texture = texture_cache
                 .create_texture_from_image(
                     surface.image_buffer.as_concrete_TypeRef(),
                     None,
@@ -1155,8 +1236,7 @@ impl MetalRenderer {
                     0,
                 )
                 .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
+            let cb_cr_texture = texture_cache
                 .create_texture_from_image(
                     surface.image_buffer.as_concrete_TypeRef(),
                     None,
@@ -1409,6 +1489,100 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[cfg(feature = "test-support")]
+#[allow(missing_docs)]
+pub(crate) mod fastab_resource_fixtures {
+    use super::*;
+
+    static CACHE_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn device_retain_count(device: &metal::DeviceRef) -> usize {
+        unsafe { msg_send![device, retainCount] }
+    }
+
+    // Hardware fixtures: collect in the workspace harness as explicitly ignored
+    // tests, then run on a Metal-capable host. Never silently skip missing Metal.
+    pub fn surface_cache_creation_borrows_device_on_success_and_error() {
+        let _guard = CACHE_FIXTURE_LOCK.lock();
+        objc::rc::autoreleasepool(|| {
+            let device = metal::Device::system_default().expect("a Metal device is required");
+            let before = device_retain_count(&device);
+            // Inspect at the actual FFI boundary, before CoreVideo can acquire
+            // its own legitimate references or initialize driver caches.
+            let cache = unsafe {
+                create_surface_texture_cache_with(&device, |pointer, cache_out| {
+                    assert_eq!(pointer, device.as_ptr());
+                    assert_eq!(device_retain_count(&device), before);
+                    create_metal_texture_cache_borrowed(
+                        kCFAllocatorDefault,
+                        ptr::null(),
+                        pointer,
+                        ptr::null(),
+                        cache_out,
+                    )
+                })
+            }
+            .expect("the real CoreVideo cache must be created");
+            drop(cache);
+
+            let before_error = device_retain_count(&device);
+            let failure = core_video::r#return::kCVReturnError;
+            let result = unsafe {
+                create_surface_texture_cache_with(&device, |pointer, cache_out| {
+                    assert_eq!(pointer, device.as_ptr());
+                    assert_eq!(device_retain_count(&device), before_error);
+                    assert!((*cache_out).is_null());
+                    failure
+                })
+            };
+            assert_eq!(result.unwrap_err(), failure);
+            assert_eq!(device_retain_count(&device), before_error);
+
+            let result =
+                unsafe { create_surface_texture_cache_with(&device, |_, _| kCVReturnSuccess) };
+            assert_eq!(result.unwrap_err(), kCVReturnInvalidArgument);
+            assert_eq!(device_retain_count(&device), before_error);
+        });
+    }
+
+    pub fn surface_cache_initializes_lazily_reuses_and_releases_its_owner() {
+        let _guard = CACHE_FIXTURE_LOCK.lock();
+        objc::rc::autoreleasepool(|| {
+            let device = metal::Device::system_default().expect("a Metal device is required");
+            let before = device_retain_count(&device);
+            let mut slot = SurfaceTextureCache::default();
+            assert!(slot.cache.is_none());
+            for _ in 0..8 {
+                assert!(slot.for_batch(&device, 0).unwrap().is_none());
+                assert!(slot.cache.is_none());
+            }
+            assert_eq!(device_retain_count(&device), before);
+
+            let cache = slot.for_batch(&device, 1).unwrap().unwrap();
+            let observer = cache.clone();
+            let pointer = cache.as_concrete_TypeRef();
+            let owned_count = observer.retain_count();
+            for _ in 0..8 {
+                assert!(slot.for_batch(&device, 0).unwrap().is_none());
+                assert_eq!(
+                    slot.for_batch(&device, 2)
+                        .unwrap()
+                        .unwrap()
+                        .as_concrete_TypeRef(),
+                    pointer
+                );
+            }
+            assert_eq!(observer.retain_count(), owned_count);
+            drop(slot);
+            assert_eq!(
+                observer.retain_count(),
+                owned_count - 1,
+                "retiring the lazy cache must release its Create reference"
+            );
+        });
+    }
 }
 
 #[cfg(test)]

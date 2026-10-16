@@ -26,6 +26,20 @@ fn native_font_keeps_requested_features() {
     fixtures::native_font_keeps_requested_features_after_attribute_owners_drop();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a Metal-capable macOS host"]
+fn metal_surface_cache_borrows_the_device() {
+    fixtures::surface_cache_creation_borrows_device_on_success_and_error();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a Metal-capable macOS host"]
+fn metal_surface_cache_is_lazy_and_releases_its_owner() {
+    fixtures::surface_cache_initializes_lazily_reuses_and_releases_its_owner();
+}
+
 #[test]
 fn arena_retirement_preserves_live_elements() {
     fixtures::retirement_refuses_live_elements_without_dropping_or_invalidating_them();

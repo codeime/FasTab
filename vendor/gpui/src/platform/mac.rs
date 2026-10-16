@@ -51,6 +51,8 @@ pub(crate) use display_link::*;
 #[cfg(feature = "test-support")]
 pub(crate) use keyboard::fastab_resource_fixtures as fastab_keyboard_fixtures;
 pub(crate) use keyboard::*;
+#[cfg(all(feature = "test-support", not(feature = "macos-blade")))]
+pub(crate) use metal_renderer::fastab_resource_fixtures as fastab_metal_fixtures;
 #[cfg(all(feature = "test-support", feature = "font-kit"))]
 pub(crate) use open_type::fastab_resource_fixtures as fastab_font_fixtures;
 pub(crate) use platform::*;
