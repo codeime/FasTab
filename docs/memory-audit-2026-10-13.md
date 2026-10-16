@@ -364,3 +364,117 @@ cbindgen 的 `export.include` 是追加名单，并非导出白名单；扫描 r
 回归采用系统字体与 CoreGraphics-backed `MemSource`，覆盖三种 style、八个 weight、中英文本、emoji 和 ligature 的真实 CoreText 输出。属性比较包含 feature、cascade、matrix 和 variation；没有单独注入非默认变换矩阵或 variable axis，不能据此声称覆盖所有第三方未注册字体或所有可变字体实例。这些重建情形依赖 CoreText normalized descriptor 的公开契约，后续新包仍须用用户实际字体验证。
 
 提交前，生产代码与 fixture 已完成主代理及独立 GPT-6 Astra 源码复核，未发现未解决的阻断问题。受影响文件的直接 rustfmt 和 `git diff --check` 通过；没有本地编译或运行项目测试。编译与回归执行交由推送后的远端 CI 验证，新安装版的内存收益仍须单独验收。
+
+## 14. 0.0.11 手动关闭设置与重启对照（2026-10-16）
+
+两个进程均为 0.0.11、commit `98466abc63b99d065b012bdc0be418e87ca9104e`、UUID `CD70EE9B-8A05-3660-9609-D9504AD328E1`。用户安装后手动打开并关闭设置，随后手动退出重开。采样只读取进程，不操作原生窗口；两边补全请求及引擎初始化均为 0。
+
+| 场景 | physical footprint | live heap | malloc dirty+swap fragmentation |
+| --- | --- | --- | --- |
+| PID 19117，关闭设置后长时空闲 | 31.58 MiB；约一分钟后 31.55 MiB | 12,982,896 bytes（12.38 MiB） | 8,025 KiB（7.84 MiB） |
+| PID 19674，重启后未打开设置 | 15.63 MiB；约一分钟后 15.67 MiB | 稳定样本 4,733,056 bytes（4.51 MiB） | 稳定样本 4,994 KiB（4.88 MiB） |
+
+同版本的占用差约 15.9 MiB，活跃堆差约 7.87 MiB。指标不能相加，fragmentation 也不是保证能立即归还的空间。首个进程还包含安装和首次启动经历；此对照尚未隔离纯设置成本，也没有证明反复开关会持续增长。
+
+### 留存线索的源码复核
+
+- 两边 `gpui_windows=0`，heap 均未见 `GPUIWindow`、`GPUIView`、`CAMetalLayer`。设置关闭路径移除窗口并更新可见状态；最后窗口关闭后的延迟缓存退休会重新检查全部窗口槽。没有证实窗口本体或引擎缓存未释放。
+- 关闭设置后的样本有 `NSMenuBarReplicantWindow=8`、`NSMenuBarLocalDisplayWindow=2`、`CABackingStore=57`、`CALayer=24`、`IOSurface=11`；冷启动相应为 0、0、0、3、0。主菜单在 `gpui_host::start_application` 只安装一次，设置开关不重装；设置关闭恢复 Accessory 模式，策略相同不会重复调用 AppKit。锁定的 tray-icon / muda 通过 RAII 替换旧菜单。上述系统对象数量不能证明应用持有失衡，因此没有加入私有缓存清理、重复安装菜单或额外切换激活策略。
+- `NSCTFont` 为 26→5，`CGFont` 为 80→5，`TBaseFont` 为 67→1；热样本另有 48 个 `CTLine` / `CTRun` 和 display-list 字体资源。字体增量既包含应用字体表，也可能包含 AppKit 绘制缓存；没有反向引用证据能把它们全部归为 `FontCandidate`。
+- CoreText `copy_descriptor` / `new_from_descriptor` 使用 create-rule，描述符 RAII 会调用 `CFRelease`，未发现新的 Create/Copy 引用失衡。应用仍有一处可移除的多余持有：候选成功实例化后，后续路径直接返回已记录的 `FontId`，却仍保留不再使用的描述符和字号。
+- `load_family` 原来逐个修改候选表和 PostScript 映射；后续字体加载失败时，没有回滚前缀候选，整组 key 又未登记，重复失败会继续留下部分状态。普通 macOS 系统源返回 Native handles，内存源入库前也会验证字体；此异常路径不是本次正常设置场景已证实的根因。
+- `leaks` 在热样本报告 13,696 bytes，在冷启动报告 19,936 bytes，主体为 AppIntents / `linkd.autoShortcut` 的 NSXPC 循环，不能解释上述 MiB 级差额。热冷之间还有约 3.75 MiB 的未分类活跃分配，尚未定位全部 owner。
+
+### 本轮修复与验收边界
+
+仅调整已确认的字体候选所有权：候选分为待加载和已加载状态，成功实例化后释放该候选多余的描述符，继续保留稳定 `FontId`；整组候选先在局部收集，全部成功后再登记候选表和 PostScript 映射。未加载候选仍保留重建所需的描述符，已加载字体及其 FontId 不在空闲时失效，CSS 匹配顺序和后加载 family 的回退优先级保持不变。
+
+两个 workspace 回归入口覆盖描述符退休后的复用/排版，以及真实 font-kit 无效字体解析导致的中途失败和重复失败。本节两项回归曾将工作区 CI 的 CPU ownership 门槛从 15 提高到 17，并逐名检查新入口；最终按内容提交时先落菜单两项（15→17），再合并本节与第 16 节的四项字体回归（17→21），原来的 2 个 Metal 硬件用例仍单独保留。本轮不在本地编译或运行项目测试；远端执行和修复包的真实内存收益须另行验收，不能把释放一份描述符等同于收回全部 15.9 MiB。
+
+原始证据保存于 `/private/tmp/fastab-0011-settings-19117/`，包括 `comparison-summary.json`、两进程的 heap / vmmap / footprint / engine / leaks / sample 快照。本轮代码修复不改变该目录里的 0.0.11 实测事实。
+
+本轮生产代码与真实失败/排版 fixture 已完成主代理及独立 GPT-6 Astra 源码复核，CI 接线和本文数据另经独立审查，未发现未解决的阻断问题。直接 rustfmt 与 `git diff --check` 通过；截至本节源码复核时尚未推送、执行远端回归或测量修复包的内存变化。
+
+## 15. 0.0.11 同进程手动设置对照与引用图追踪（2026-10-16）
+
+继续使用 PID 19674，没有重启、重新安装或自动化操作窗口。冷启动保持约 15 分钟后保存基线与 memgraph，再由用户手动打开并关闭设置。所有样本的 GPUI 窗口数、补全请求数和引擎初始化次数均为 0。安装版仍是第 14 节的已发布二进制，尚未包含工作区中的两项字体候选修复。
+
+| 同一进程的阶段 | 时间 | physical footprint | live heap | malloc dirty+swap fragmentation |
+| --- | --- | --- | --- | --- |
+| 未开设置的稳定基线 | 17:10:18 | 15.6728 MiB | 4,737,760 bytes | 4,989 KiB |
+| 第一次手动开关后的首样 | 17:14:09 | 31.2979 MiB | 11,096,080 bytes | 9,916 KiB |
+| 首样后约 5 分 41 秒 | 17:19:49 | 29.0948 MiB | 11,052,528 bytes | 7,815 KiB |
+| 第二次手动开关后的首样 | 17:22:24 | 30.2511 MiB | 11,386,672 bytes | 8,240 KiB |
+| 第二次首样后约 2 分 7 秒 | 17:24:31 | 30.2667 MiB | 11,316,800 bytes | 8,276 KiB |
+
+首次开关后已排除重新安装、不同进程与补全负载的干扰：首样相对冷基线增加 15.6251 MiB，继续静置后仍增加 13.4220 MiB。首样到静置样的 footprint 回落约 2.20 MiB，live heap 只减少 43,552 bytes；因此不能把 footprint 回落全部说成应用对象已释放。第二次首样相对第一次静置样的 live heap 增加 334,144 bytes，远小于首次的 6,358,320 bytes，但取样空闲时间不同，两次开关也不足以证明长期完全不增长。
+
+第二轮继续静置后的 live heap 相对第一轮静置样增加 264,272 bytes（约 258 KiB），其中约 89 KiB 是 method-cache buckets、约 136 KiB 仍属 non-object。此时 footprint 高 1.1719 MiB；尚未取得每轮相同静置时长的多轮趋势，不能把该差值直接称为每轮泄漏量。
+
+### 已从数量推进到具体引用路径
+
+以下均来自第一次开关后的 `controlled-close.memgraph`，与 `cold-before-controlled-cycle.memgraph` 对比。反向引用图会包含 raw / weak / interior pointers；只有工具明确标记的强字段可据此认定强引用，不能把路径条数当成 owner 数，也不能从浅层对象大小推算完整物理成本。
+
+- **48 / 48 个 CTLine 直接挂在 `NSMenuBarItemView._cachedLine`。** 它们是原生菜单栏项的文字布局，不是 GPUI `line_layout_cache` 残留。菜单栏 representation 经 `NSMenuBarImpl.__strong _displayIDToRepresentationView` 保留，且 `NSMenuBarImpl` 地址与冷基线相同；replicant 可追到 representation 的 `_backingViews`。两个 local-display window 经 `NSMenuBarWindowManager.__strong _windowsByDisplay` 返回 AppKit 全局管理器。第二次开关后 CTLine / item view 仍各 48，replicant 仍 8、local-display window 仍 2，第二次采样未净增一整组。
+- **9 个 IOSurface 有系统图形缓存路径。** 三个通向 CoreImage 的 `CI::gCacheList`，六个经图像 / texture / context 通向 CoreUI theme registry。CABackingStore 样本分别关联菜单栏、文字图层、QuartzCore buffer list，以及 `TextInputUIMacHelper` 单例持有的输入界面窗口。出现应用 observer 名称的另一条路径穿过未分类块和原始指针，源码也不持有 NSWindow，不能据此称为应用窗口泄漏。第二轮 IOSurface 保留原 9 个地址并增加 2 个，新增路径汇入首轮已有 `_CUIInternalLinkRendition` 的另一个 image 槽；CABackingStore 两轮均 57 个、地址集合一致，没有新应用 owner 的证据。地址一致本身不能证明对象生命周期连续。
+- **212 个 CGPath 的近端引用已逐一分类。** 206 个通向 `TGlyphOutlineDictionaryCache`，另一个通向字体 `TKeyLookUpCache`；其余三个通向 CoreUI 的 SVG rendition，两个通向系统符号图像缓存。这些近端路径不能作为 GPUI scene 未退休的证据。字体缓存可能同时被应用稳定字体表和系统使用，仍需保留这一区别，不能统称为与应用无关或可随时清空。
+- **唯一 DisplayLink 没有显示大型独占堆子树。** 完整 `referenceTree` 将该 clock 及后代归计为 5 个分配 / 1.89 KiB，而不仅是 clock 本体 1,536 bytes。源码关闭窗口后移除订阅、取消并释放 dispatch source，由 finalizer 释放 context；context 不强持有窗口。永久 registry 保留 clock 是既有的 CoreVideo Stop 非 join 安全设计。此图不能排除共享原生资源、VM 或线程栈，不能据此声称显示时钟绝无间接成本。
+
+### 未分类分配的进一步收窄
+
+首次开关的 live heap 净增约 6.06 MiB，其中普通 heap 分类的 non-object 净增 2,649,120 bytes。`heap --guessNonObjects` 按字段关联后，剩余 non-object 净增为 1,504,048 bytes；例如 596,288 bytes 被关联到 `CGPath[48]` backing，部分分配被关联到字体解析结构。该命名是工具推断，不等同于逐块强所有权证明。
+
+其他明确分类的增量包括 Objective-C method-cache buckets 551,104 bytes、Swift metadata 540,672 bytes、Foundation Data backing 354,240 bytes 与 CFData backing 222,208 bytes。新出现的较大 non-object 块另追到 Swift 全局 conformance / metadata、CoreUI PDF theme rendition、字体变体解析和 Objective-C associations 等路径。冷基线的两块 128 KiB 及主要 16–48 KiB 大块仍在原地址，未见新留下的 MiB 级单块 Rust buffer；这不能排除分散的小块 Rust 分配。
+
+这些结果收窄了未知部分，尚不能逐字节解释全部 footprint 差额。live heap、fragmentation、VM 与 physical footprint 仍须分别看待，不相加，也不把有缓存 owner 等同于已证明永不增长。
+
+### 后续优化的源码边界
+
+1. **主菜单退休需要独立生命周期设计和候选包验证。** 仅延迟启动时 `menu::install` 不能解决首次关窗后的留存：冷基线已经有主菜单，但上述绘图对象尚不存在。关窗设置 `mainMenu=nil` 只会断开已观察到的一条路径，系统全局管理器仍可能保留其他对象；当前重开路径不会恢复原生菜单。不能反复调用 `menu::install` 恢复，因为它会追加 action listeners / key bindings，GPUI 的 `menu_actions` 也追加不清。若实施，先分离一次性动作注册与原生菜单装卸，再覆盖 `mainMenu` / `windowsMenu` / `servicesMenu`、action tags、重开、快捷键、托盘和多窗口场景。全屏也会使用 Accessory，不能把所有 Accessory 切换都视为关窗。
+2. **字体真正按需加载要前移到枚举源。** 锁定的 `zed-font-kit 0.14.1-zed` CoreText source 在返回 `FamilyHandle` 前就为每个 descriptor 建立 native CTFont；应用随后为每个 face 应用 features / fallbacks 并读取属性。因此 0.0.11 的候选延迟持有降低长期 owner，但仍会首次触碰未选中的字体。进一步优化需保留 CSS 匹配、过滤顺序、PostScript 优先级、内存字体与 fallback 的语义；直接跳过空 feature 配置或保留所有 configured fonts 也各有行为 / 峰值风险，不能仅凭创建调用次数声称节省同数 native 对象。
+3. **当前证据不支持新增强制 allocator relief 或释放 clock registry。** 前者尚无候选包收益与延迟对照，后者会触及原生回调安全边界。本次没有从图形、刷新回调或字体 Create/Copy 中再确认一处正在触发的引用失衡；第 14 节两项源码修复保持待远端验证状态。
+
+证据均保存在本机 `/private/tmp/fastab-0011-settings-19117/`：各阶段 `stage-*`、`footprint-*`、`engine-*`、`heap-*`、`vmmap-*`，冷暖 `.memgraph`，`controlled-comparison-summary.json`、`graphics-object-reference-summary.json`、`graphics-second-reference-diff.json`、`cgpath-reference-summary.json`、`controlled-heap-delta.json`、`controlled-guessed-heap-delta.json` 和对应 `trace-*` 文件。调查只使用已安装二进制的只读诊断与离线图分析；没有本地构建、执行项目测试、注入清缓存调用或操作窗口。
+
+## 16. 主菜单生命周期与字体枚举按需加载（2026-10-16）
+
+### 原生菜单：实现及逐项复核
+
+动作监听和快捷键仍在启动时注册一次；原生主菜单改为设置成功打开时创建，焦点切换不重复创建，关闭后解除应用拥有的菜单引用。失败打开也清理菜单状态。关闭依据设置窗口的真实生命周期，不依赖 Accessory 策略，因此全屏、最小化、应用 Hide 与补全 overlay 不会被误当作设置关闭。
+
+GPUI 的空 `set_menus` 同时将 `NSApplication.mainMenu`、`windowsMenu`、`servicesMenu` 设为 nil，释放各自独立的 strong owner，并移走菜单配置和主菜单动作表。系统 Services 注册修正为实际 NSMenu submenu，而不是 NSMenuItem；创建和替换使用局部 autorelease pool，所有 AppKit 全局 setter 在释放平台状态锁后调用。这里释放的是应用拥有的引用，AppKit 全局管理器可能继续保留资源，不保证第 15 节中的全部 CTLine / representation window 随之消失。
+
+原来 `menu_actions` 只追加，重建菜单会累积动作；现在主菜单和 Dock 各有可替换的动作表，共用单调递增 tag。过期原生菜单项无法命中新菜单动作，退休主菜单不影响 Dock。回调在锁内取得独立 action clone，再解锁执行；一并修正了无效 tag 分支持有原锁再次加锁的潜在死锁。动作回调中关闭设置、退休其自身菜单时，正在执行的 clone 仍保持有效。
+
+红点关闭原来额外排入无窗口身份的 Close 事件；这可能在重开后关闭新窗口。现在保留关闭前的草稿清理，由 GPUI 移除原窗口；host 通过弱引用订阅真实关闭，并 defer 到 Window 析构之后，再核对当前 SettingsHandle 的 WindowId。新窗口仍存在时不退休菜单；显式 Close 仍同步移除当前句柄。没有新增强持有 host 的订阅环。
+
+两个 CPU fixture 调用生产 `MenuActionRegistry`：128 次主菜单重建/退休、旧 tag 拒绝、主菜单与 Dock 独立替换，以及真实 Arc action owner 的释放和 in-flight clone 存活。它们不操作全局 NSApplication，不将 registry 测试冒充原生界面验收。菜单项已完成实现自查、主代理检查及独立 GPT-6 Astra 源码 review，未发现未解决的阻断问题；本地只运行直接 rustfmt / diff 检查。
+
+### 字体枚举：兼容边界的独立验证
+
+用独立 Python ctypes 脚本调用本机 CoreText 的公开只读查询，未编译项目、加载项目 Rust 代码或操作 FasTab 进程。相同 family collection 查询中，Menlo 有 4 个 face、Helvetica 有 6 个；Regular 均排首位，Menlo Bold 排第三。.AppleSystemUIFont 有 27 个 face，descriptor 名称与实际 native PostScript 名全部不同，例如 `.AppleSystemUIFont` 对应 `.SFNS-Regular`。因此不能直接把系统 UI descriptor 名当作已规范化的回退身份。
+
+探针还验证：Helvetica descriptor 加入空 `kCTFontCharacterSetAttribute` 后，真实 native `m` 查询返回 glyph 0；再应用空 feature 数组仍无 `m`，但 PostScript 名保持 Helvetica。这为“晚候选失格时恢复旧回退来源”的真实回归构造提供依据。原始脚本与结果为 `/private/tmp/fastab-coretext-descriptor-probe.py`、同名 `.json`。这些查询只验证本机系统 API 的行为，不是新 Rust 实现编译、回归执行或内存收益证明。
+
+### 字体枚举：实现及逐项复核
+
+按需路径限定于系统 Menlo、Helvetica：family、`/System/Library/Fonts/` 下对应 TTC 路径、已知 PostScript face 名均须匹配，并且 descriptor 没有显式 variation / matrix，调用方没有 feature 或 fallback 配置。同名用户字体、内存字体、系统 UI alias 和其他字体继续走原兼容路径；一个 face 不符合条件，整个 family 回退。这个边界覆盖设置页实际使用的 Menlo，不把两族的探针结论推广到所有字体。
+
+枚举采用锁定版本 font-kit 相同的 family 查询和 collection 顺序，仅保存 descriptor 与候选身份；不为每个 face 预先创建 CTFont 或读取 glyph / native properties。选择时按原序逐个执行原有 feature 应用、`m` glyph、traits 类型和 native properties 检查。第一个 stretch / style / weight 全部精确命中的候选即可胜出；没有完整精确命中时，检查全族并调用原 font-kit matcher，保留非精确匹配规则。已选字体继续保存在稳定 FontId 表，未选的后续候选保持未初始化；这减少的是不必要的 native font 初始化，不承诺 CoreText 自身完全没有缓存。
+
+复核重点处理了延迟校验与回退身份：候选保存前一 PostScript 来源，晚候选因无 `m` 或 traits 不合格而被拒绝时，只有仍占当前来源才恢复前一项，不能覆盖更新的 family。native PS 名与登记身份不符时返回错误且不提交 properties / FontId，原生 fallback 查找可继续使用前一来源。加载旧候选不会夺回新配置的优先级，FontId 只追加不重编号。第 14 节的“已 materialize 候选释放重建 descriptor”和“eager family 成功后才原子登记”两项修复保留。
+
+新增两个字体 fixture 使用真实 CoreText / font-kit：枚举后零 CTFont 表项、首次精确命中后尾部候选仍 Deferred、非精确 CSS 选择与旧实现对照、中文 / emoji / ligature shaping 对照、同 family 非系统 URL 拒绝，以及真实无 `m` 字体的回退链、真实 UI alias 规范化的无部分提交。显式 features / fallbacks 和 UI alias 的 eager 路径也受检查。它们已接入 workspace 的 `fastab_gpui` 回归入口，不创建独立测试工程。
+
+### 整体复核与验收边界
+
+本轮源码检查覆盖菜单关闭 / 重开、主菜单与 Dock 动作隔离、字体选择和回退优先级、稳定 FontId，以及跨 crate fixture 导出。修正了公开菜单 fixture 缺少文档注释的问题，避免 GPUI 的 `deny(missing_docs)` 阻断 CI。远端 CI 的资源回归门槛从 15 项提高到 21 项 CPU 测试（含第 14 节两项及本节四项），保留 2 项需要 Metal 环境的 ignored 测试，并显式检查新增回归名，防止 feature / cfg 漂移使测试静默缺席。
+
+菜单和字体各自完成实现后 review；字体边界收紧后再次独立复核。最终独立 GPT-6 Astra 对全部 9 个 tracked diff 做整体检查，未发现未解决的阻断问题。上述结论限于源码层面。
+
+本地仅做源码复核、直接 `rustfmt --check`、`git diff --check` 和上述独立系统 API 探针；没有构建、编译或执行项目测试。截至本节源码复核时尚未提交、推送或触发远端 CI，不能将回归入口已接入等同于测试通过。实际内存收益与 AppKit 行为仍需候选包验证：
+
+1. 在候选提交上运行远端 workspace 测试、clippy 和上述 21 项资源回归门槛；记录 2 项 Metal ignored 的执行边界。
+2. 手动验证设置红点关闭、Cmd-W、托盘 / deep link 重开、快速关闭后重开，以及最小化、全屏和 Hide；检查菜单、Services、Window 命令、编辑快捷键与补全共存。
+3. 同一进程按固定等待时间对照冷启动、一次开关及多次开关设置后的 footprint、存活菜单 / CTLine、窗口和 IOSurface 数量，再与旧包相同操作对比。菜单 owner 解除不等同于系统菜单缓存必定归零。
+4. 验证 Menlo Regular / Bold / Italic、跨语言 fallback、emoji、ligature 和自定义 features / fallbacks；确认空闲回收后重开不丢字、不改字体配置，FontId 及后加载 family 的回退优先级保持稳定。
