@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.11
+
+- change: load native font faces only when selected or needed for fallback, reducing unused font retention while preserving font matching and stable font identities.
+- test: cover native font selection, descriptor attributes and shaping, fallback precedence, and font identity reuse in remote CI.
+
 ## v0.0.10
 
 - fix: prevent the host-only CoreVideo binding from entering generated Metal shaders, resolving the initial v0.0.10 build's crash when opening the first native window.
