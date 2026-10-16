@@ -34,6 +34,12 @@ fn native_layout_scratch_retires_without_changing_fonts_or_layout() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn generated_metal_shader_excludes_host_ffi() {
+    fixtures::generated_shader_bindings_exclude_host_ffi();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 #[ignore = "requires a Metal-capable macOS host"]
 fn metal_surface_cache_borrows_the_device() {
     fixtures::surface_cache_creation_borrows_device_on_success_and_error();

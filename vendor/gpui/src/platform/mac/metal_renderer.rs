@@ -1496,6 +1496,41 @@ pub struct SurfaceBounds {
 pub(crate) mod fastab_resource_fixtures {
     use super::*;
 
+    #[cfg(feature = "runtime_shaders")]
+    pub fn generated_shader_bindings_exclude_host_ffi() {
+        // Inspect the build output embedded in this GPUI dependency, including
+        // the exact stitched source MetalRenderer passes to the Metal compiler.
+        let header = include_str!(concat!(env!("OUT_DIR"), "/scene.h"));
+        assert!(header.contains("#define SCENE_H"));
+        assert!(header.contains("SurfaceBounds"));
+        assert!(
+            !header
+                .split_ascii_whitespace()
+                .any(|token| token == "extern"),
+            "the generated shader header must not declare host externs"
+        );
+        assert!(SHADERS_SOURCE_FILE.starts_with(header));
+        assert!(SHADERS_SOURCE_FILE.contains("vertex SurfaceVertexOutput surface_vertex("));
+        for host_symbol in [
+            "create_metal_texture_cache_borrowed",
+            "CVMetalTextureCacheCreate",
+            "CVReturn",
+            "CFAllocatorRef",
+            "CFDictionaryRef",
+            "CVMetalTextureCacheRef",
+            "MTLDevice",
+        ] {
+            assert!(
+                !header.contains(host_symbol),
+                "host FFI symbol {host_symbol} leaked into generated scene.h"
+            );
+            assert!(
+                !SHADERS_SOURCE_FILE.contains(host_symbol),
+                "host FFI symbol {host_symbol} leaked into the runtime Metal source"
+            );
+        }
+    }
+
     static CACHE_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
     fn device_retain_count(device: &metal::DeviceRef) -> usize {

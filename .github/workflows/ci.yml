@@ -207,7 +207,8 @@ jobs:
           # GPUI is not a workspace member. Its private ownership fixtures run
           # through fastab_gpui's test-support dependency, without needing a GPU.
           # Fail if feature/cfg drift silently removes a CPU-only regression.
-          test "$(grep -Ec '^test resource_ownership_tests::.* \.\.\. ok$' "$resource_log")" -eq 11
+          test "$(grep -Ec '^test resource_ownership_tests::.* \.\.\. ok$' "$resource_log")" -eq 12
+          grep -Eq '^test resource_ownership_tests::generated_metal_shader_excludes_host_ffi \.\.\. ok$' "$resource_log"
           # Metal availability is not guaranteed on hosted runners. Compile and
           # collect the hardware fixtures; execute them separately on a GPU host.
           test "$(grep -Ec '^test resource_ownership_tests::metal_surface_cache_.* \.\.\. ignored' "$resource_log")" -eq 2

@@ -146,6 +146,12 @@ mod macos {
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;
+        // `export.include` is additive: private extern functions are still exported.
+        // This host-only CoreVideo declaration must never enter the Metal header.
+        config
+            .export
+            .exclude
+            .push("create_metal_texture_cache_borrowed".into());
 
         let mut builder = cbindgen::Builder::new();
 

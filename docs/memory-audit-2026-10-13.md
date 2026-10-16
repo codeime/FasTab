@@ -318,3 +318,12 @@ cargo test --locked -p fastab_gpui resource_ownership_tests::metal_surface_cache
 各项已由未参与该项实现的代理独立审阅，随后完成主代理与 GPT-6 Astra 的整体源码复核，未发现未解决的代码阻断问题。review 已补齐 Metal fixture 的 `macos-blade` feature 排除，修正文档中没有证据的“平台常驻持有设备”断言，并通过受影响 Rust 文件的直接 rustfmt 与 `git diff --check`。这些检查不代替编译、测试执行或新包内存验收。
 
 提交前复核还发现手动 Metal 工作流没有选中新 fixture，且原 `cargo test -p gpui` 受非 workspace dev-dependencies 限制。已改为 workspace 中的两个具名 CoreVideo cache 回归，并断言恰好 2 项通过；工作流命名同步收窄。该任务仅手动运行于已注册的 `fastab-metal` GPU runner，普通 push CI 仍是 11 项执行、2 项硬件用例 ignored。旧 vendor-only GPU 回归保留独立验证副本的说明，不把本次工作流描述为已覆盖它们。
+
+
+## 12. v0.0.10 首窗启动崩溃热修（2026-10-16）
+
+安装版 `0.0.10` 的签名验证通过，但直接启动后约一秒内以 SIGABRT 退出。标准错误明确指向 `metal_renderer.rs` 的 `new_library_with_source`：生成的 Metal 源码包含 `create_metal_texture_cache_borrowed`，并报 `CVReturn`、`CFAllocatorRef`、`MTLDevice` 等未知主机类型。现场复现日志保存在 `/tmp/fastab-0010-startup-repro.log`。诊断仅运行已安装二进制，没有本地构建。
+
+cbindgen 的 `export.include` 是追加名单，并非导出白名单；扫描 renderer 时会默认导出新增的私有 extern 声明。热修在生成 `scene.h` 时明确排除该 Rust 函数，保留借用设备指针、CoreFoundation Create 规则和按需创建缓存的修复。
+
+新增普通 CPU 回归检查本次构建的真实 `OUT_DIR/scene.h` 和 renderer 实际嵌入的 Metal 源码：确认头文件、surface shader 存在，禁止主机 extern 声明及 CoreVideo FFI 类型混入。CI 要求该具名用例实际通过，CPU fixture 数量为 12。此前 Rust 编译与单测没有验证运行时 Metal 源码，因此通过不能证明首窗可用。新版本仍需远端 CI、打包及下载产物的真实首窗启动验证；不将生成产物检查等同于完整 Metal 编译或安装验收。

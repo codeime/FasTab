@@ -50,6 +50,11 @@ Fastab changes `src/platform/mac/metal_renderer.rs`:
   Settings and autocomplete frames do not create an unused video cache. Once
   created, it is reused and dropped with its renderer; submitted texture work
   keeps the existing Metal command ownership.
+- `build.rs` excludes this host-only CoreVideo binding from cbindgen's shader
+  header. Its export include list is additive, so without this exclusion the
+  private extern declaration enters the runtime Metal source and aborts the
+  first window's shader compilation. A CPU regression checks the actual generated
+  header and embedded runtime source, without requiring a Metal device.
 
 Fastab also changes `src/platform/mac/window.rs`:
 
@@ -137,7 +142,7 @@ their lifetime from the resources needed only by a live window.
 
 The new CoreVideo ownership and lazy-cache fixtures are exported through
 `test-support` to the existing `fastab_gpui` workspace test target, alongside
-the CPU-only ownership fixtures. CI requires 11 CPU-only cases to pass and both
+the CPU-only ownership fixtures. CI requires 12 CPU-only cases to pass and both
 Metal cases to be collected as ignored. On a Metal-capable macOS validation host
 (not the local development machine, where builds remain prohibited), run:
 
