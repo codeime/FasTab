@@ -15,10 +15,9 @@ use gpui::{
 use tracing::error;
 
 use crate::EventLoopProxy;
-use crate::event::{Event, WindowEvent};
+use crate::event::Event;
 use crate::permissions::{self, PermId, PermReady, PermissionSnapshot};
 use crate::platform::PlatformBoundEvent;
-use crate::webview::DASHBOARD_ID;
 #[cfg(target_os = "macos")]
 use crate::webview::menu::{Minimize, Zoom};
 
