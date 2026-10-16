@@ -327,3 +327,40 @@ cargo test --locked -p fastab_gpui resource_ownership_tests::metal_surface_cache
 cbindgen 的 `export.include` 是追加名单，并非导出白名单；扫描 renderer 时会默认导出新增的私有 extern 声明。热修在生成 `scene.h` 时明确排除该 Rust 函数，保留借用设备指针、CoreFoundation Create 规则和按需创建缓存的修复。
 
 新增普通 CPU 回归检查本次构建的真实 `OUT_DIR/scene.h` 和 renderer 实际嵌入的 Metal 源码：确认头文件、surface shader 存在，禁止主机 extern 声明及 CoreVideo FFI 类型混入。CI 要求该具名用例实际通过，CPU fixture 数量为 12。此前 Rust 编译与单测没有验证运行时 Metal 源码，因此通过不能证明首窗可用。新版本仍需远端 CI、打包及下载产物的真实首窗启动验证；不将生成产物检查等同于完整 Metal 编译或安装验收。
+
+## 13. 修复版 0.0.10 的冷启动与手动使用对照（2026-10-16）
+
+运行身份为 commit `f3477d7384c10df9533732c81c496e406da35e1c`、UUID `E54A96A6-C63F-3D97-A5FC-4DAD077C33C4`。只运行已安装二进制，使用 `footprint`、`heap`、`vmmap` 和 `ftab internal dump-state engine` 被动取样，没有本地构建。
+
+| 场景 | physical footprint | live heap | 边界 |
+| --- | --- | --- | --- |
+| 正常启动，未打开设置 | 15.84 MiB | 5,060,624 bytes | PID 14581，辅助功能已授权，窗口 0，引擎初始化 0 |
+| 用户手动打开并关闭设置后的首个样本 | 36.39 MiB | 13,956,832 bytes | 同一 PID；期间还完成 14 次补全，不能视为纯设置成本 |
+| 再观察约 3 分 18 秒 | 35.02 MiB | 14,037,008 bytes | 请求数仍为 14，窗口 0；没有再操作窗口或重启 |
+
+两次正常冷启动基线约 15.7–15.8 MiB。直接启动 executable 的一次对照因弹出权限引导而作废，不与无窗口基线混用。所有 footprint 数字均按 1 MiB = 1,048,576 bytes 换算。
+
+### 已确认的释放与仍未归因的部分
+
+- 手动场景没有 `GPUIWindow`、`GPUIView`、`CAMetalLayer`；引擎的 spec、hook、catalog、generator、队列均已清空，可见 history 容量约 45 KiB。未发现设置窗口或这些缓存未退休。
+- 手动场景没有窗口共享指示器或 `ThemeWidgetView`。此前含 CUA 的六轮中，这两类对象分别从 1 增至 6、从 4 增至 24，关窗后持续存在。该现象仅在当时 CUA／共享环境样本中观测到，手动样本未复现；来源尚未独立隔离，不能泛化为用户手动开关的泄漏。
+- 手动样本残留一组较小的 Metal / IOSurface 对象。纹理反向引用有直接分支通向 `CA::OGL::MetalContext` → `CA::CG::AccelRenderer` → QuartzCore 全局 `_list`；另一个 64 KiB 分配通向 QuartzCore `_binary_archives`。这是系统绘图资源留存的定位线索，不是 GPUI atlas 仍存活或唯一强 owner 的证明。
+- 冷暖 live heap 增量约 8.6 MiB，其中约 4.6 MiB 是尚未完全归因的 non-object 分配。物理占用、活跃堆、allocator fragmentation 不能相加或互相等同。静置中 footprint 下降而 live heap 基本不变，也不代表又释放了同等大小的应用对象。
+
+原始证据保存于本机 `/private/tmp/fastab-settings-memory-20261016-13449/`，包含各阶段时间戳、进程身份、完整 heap / vmmap / engine 快照、`trace-texture-manual-close-1.txt`、`trace-manual-0x7a8f9f8000.txt` 和 `summary.json`。
+
+### 本轮处理边界
+
+重新审查了最后窗口关闭 hook、借用池 generation、晚到 GPU completion、engine 最早期限和回调退出后的释放。没有证据支持新增周期性 allocator relief、提前销毁原生窗口、强制清系统缓存或修改输入源。Settings 图标为文本；原生文件图标路径已有 owned 返回值和局部 autorelease pool，也未发现对应的引用失衡。
+
+本轮优化字体候选的长期所有权：原流程会永久登记整个 family 的所有候选，而实际布局往往只选用少数 face。候选现在保存 normalized `CTFontDescriptor`、原 point size、CSS properties 和 PostScript 名；只在 CSS 选中或原生 fallback 实际命中时重建 `FontKitFont` 并分配稳定 FontId。同候选再次使用复用原 FontId，旧布局和已加载字体不会在空闲时失效。
+
+保留原有完整候选枚举、过滤和 CSS 匹配顺序。PostScript 映射仍在加载 family 时按原顺序更新；稍后使用旧候选不能覆盖较新 family 的 features / fallbacks 优先级。内存字体的源数据继续由 `MemSource` 持有。normalized descriptor 依据 CoreText 公开契约保留重建信息，而非通过名称重新挑选另一字体。
+
+这会减少未使用候选的长期原生字体引用，但初次匹配仍需读取候选属性，descriptor 与系统字体缓存也仍占内存。因此它不是完全消除首次字体加载，也不保证收回现场全部 19 MiB 差值。
+
+新增三个 workspace 回归入口验证实际字体选择与复用、descriptor 重建后的属性与排版、以及 fallback 候选优先级和 FontId 稳定性。CI 的普通 ownership 用例门槛由 12 改为 15，并逐个检查新入口实际通过。源码复核、格式检查、远端执行和安装包内存验收分别报告；没有远端执行与新包实测前，不声称编译通过或物理内存下降。
+
+回归采用系统字体与 CoreGraphics-backed `MemSource`，覆盖三种 style、八个 weight、中英文本、emoji 和 ligature 的真实 CoreText 输出。属性比较包含 feature、cascade、matrix 和 variation；没有单独注入非默认变换矩阵或 variable axis，不能据此声称覆盖所有第三方未注册字体或所有可变字体实例。这些重建情形依赖 CoreText normalized descriptor 的公开契约，后续新包仍须用用户实际字体验证。
+
+提交前，生产代码与 fixture 已完成主代理及独立 GPT-6 Astra 源码复核，未发现未解决的阻断问题。受影响文件的直接 rustfmt 和 `git diff --check` 通过；没有本地编译或运行项目测试。编译与回归执行交由推送后的远端 CI 验证，新安装版的内存收益仍须单独验收。
