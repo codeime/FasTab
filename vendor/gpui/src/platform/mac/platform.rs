@@ -27,6 +27,7 @@ use cocoa::{
         NSUInteger, NSURL,
     },
 };
+use collections::HashMap;
 use core_foundation::{
     base::{CFRelease, CFType, CFTypeRef, OSStatus, TCFType},
     boolean::CFBoolean,
@@ -156,6 +157,49 @@ unsafe fn build_classes() {
 
 pub(crate) struct MacPlatform(Mutex<MacPlatformState>);
 
+type MenuActionSet = HashMap<NSInteger, Box<dyn Action>>;
+
+#[derive(Default)]
+struct MenuActionRegistry {
+    next_tag: NSInteger,
+    main: MenuActionSet,
+    dock: MenuActionSet,
+}
+
+impl MenuActionRegistry {
+    fn register(&mut self, actions: &mut MenuActionSet, action: &dyn Action) -> NSInteger {
+        // AppKit can keep an old NSMenuItem alive after replacement. Never
+        // reuse its tag for a different action, including across main/dock menus.
+        self.next_tag = self
+            .next_tag
+            .checked_add(1)
+            .expect("native menu tags exhausted");
+        actions.insert(self.next_tag, action.boxed_clone());
+        self.next_tag
+    }
+
+    fn action(&self, tag: NSInteger) -> Option<Box<dyn Action>> {
+        self.main
+            .get(&tag)
+            .or_else(|| self.dock.get(&tag))
+            .map(|action| action.boxed_clone())
+    }
+
+    fn replace_main(&mut self, actions: MenuActionSet) {
+        self.main = actions;
+    }
+
+    fn replace_dock(&mut self, actions: MenuActionSet) {
+        self.dock = actions;
+    }
+}
+
+struct NativeMenuBar {
+    main: id,
+    windows: id,
+    services: id,
+}
+
 pub(crate) struct MacPlatformState {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
@@ -171,7 +215,7 @@ pub(crate) struct MacPlatformState {
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
-    menu_actions: Vec<Box<dyn Action>>,
+    menu_actions: MenuActionRegistry,
     open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
     finish_launching: Option<Box<dyn FnOnce()>>,
     dock_menu: Option<id>,
@@ -238,14 +282,24 @@ impl MacPlatform {
 
     unsafe fn create_menu_bar(
         &self,
-        menus: &Vec<Menu>,
+        menus: &[Menu],
         delegate: id,
-        actions: &mut Vec<Box<dyn Action>>,
+        registry: &mut MenuActionRegistry,
+        actions: &mut MenuActionSet,
         keymap: &Keymap,
-    ) -> id {
+    ) -> NativeMenuBar {
         unsafe {
+            if menus.is_empty() {
+                return NativeMenuBar {
+                    main: nil,
+                    windows: nil,
+                    services: nil,
+                };
+            }
             let application_menu = NSMenu::new(nil).autorelease();
             application_menu.setDelegate_(delegate);
+            let mut windows_menu = nil;
+            let mut services_menu = nil;
 
             for menu_config in menus {
                 let menu = NSMenu::new(nil).autorelease();
@@ -257,8 +311,10 @@ impl MacPlatform {
                     menu.addItem_(Self::create_menu_item(
                         item_config,
                         delegate,
+                        registry,
                         actions,
                         keymap,
+                        &mut services_menu,
                     ));
                 }
 
@@ -268,12 +324,15 @@ impl MacPlatform {
                 application_menu.addItem_(menu_item);
 
                 if menu_config.name == "Window" {
-                    let app: id = msg_send![APP_CLASS, sharedApplication];
-                    app.setWindowsMenu_(menu);
+                    windows_menu = menu;
                 }
             }
 
-            application_menu
+            NativeMenuBar {
+                main: application_menu,
+                windows: windows_menu,
+                services: services_menu,
+            }
         }
     }
 
@@ -281,18 +340,24 @@ impl MacPlatform {
         &self,
         menu_items: Vec<MenuItem>,
         delegate: id,
-        actions: &mut Vec<Box<dyn Action>>,
+        registry: &mut MenuActionRegistry,
+        actions: &mut MenuActionSet,
         keymap: &Keymap,
     ) -> id {
         unsafe {
             let dock_menu = NSMenu::new(nil);
             dock_menu.setDelegate_(delegate);
+            // A Services submenu in a dock menu must not replace the
+            // application's main-menu Services owner.
+            let mut services_menu = nil;
             for item_config in menu_items {
                 dock_menu.addItem_(Self::create_menu_item(
                     &item_config,
                     delegate,
+                    registry,
                     actions,
                     keymap,
+                    &mut services_menu,
                 ));
             }
 
@@ -303,8 +368,10 @@ impl MacPlatform {
     unsafe fn create_menu_item(
         item: &MenuItem,
         delegate: id,
-        actions: &mut Vec<Box<dyn Action>>,
+        registry: &mut MenuActionRegistry,
+        actions: &mut MenuActionSet,
         keymap: &Keymap,
+        services_menu: &mut id,
     ) -> id {
         static DEFAULT_CONTEXT: OnceLock<Vec<KeyContext>> = OnceLock::new();
 
@@ -409,9 +476,8 @@ impl MacPlatform {
                             .autorelease();
                     }
 
-                    let tag = actions.len() as NSInteger;
+                    let tag = registry.register(actions, action.as_ref());
                     let _: () = msg_send![item, setTag: tag];
-                    actions.push(action.boxed_clone());
                     item
                 }
                 MenuItem::Submenu(Menu { name, items }) => {
@@ -419,7 +485,14 @@ impl MacPlatform {
                     let submenu = NSMenu::new(nil).autorelease();
                     submenu.setDelegate_(delegate);
                     for item in items {
-                        submenu.addItem_(Self::create_menu_item(item, delegate, actions, keymap));
+                        submenu.addItem_(Self::create_menu_item(
+                            item,
+                            delegate,
+                            registry,
+                            actions,
+                            keymap,
+                            services_menu,
+                        ));
                     }
                     item.setSubmenu_(submenu);
                     item.setTitle_(ns_string(name));
@@ -434,8 +507,7 @@ impl MacPlatform {
 
                     match menu_type {
                         SystemMenuType::Services => {
-                            let app: id = msg_send![APP_CLASS, sharedApplication];
-                            app.setServicesMenu_(item);
+                            *services_menu = submenu;
                         }
                     }
 
@@ -913,14 +985,29 @@ impl Platform for MacPlatform {
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
         unsafe {
+            let pool = NSAutoreleasePool::new(nil);
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
-            let actions = &mut state.menu_actions;
-            let menu = self.create_menu_bar(&menus, NSWindow::delegate(app), actions, keymap);
+            let mut actions = MenuActionSet::default();
+            let menu = self.create_menu_bar(
+                &menus,
+                NSWindow::delegate(app),
+                &mut state.menu_actions,
+                &mut actions,
+                keymap,
+            );
+            state.menu_actions.replace_main(actions);
+            state.menus =
+                (!menus.is_empty()).then(|| menus.into_iter().map(|menu| menu.owned()).collect());
             drop(state);
-            app.setMainMenu_(menu);
+            // These are three independent NSApplication owners. Clearing only
+            // mainMenu leaves the Window/Services subtrees and their views alive.
+            // Setters may synchronously call delegates, so do not hold state.
+            app.setMainMenu_(menu.main);
+            app.setWindowsMenu_(menu.windows);
+            app.setServicesMenu_(menu.services);
+            pool.drain();
         }
-        self.0.lock().menus = Some(menus.into_iter().map(|menu| menu.owned()).collect());
     }
 
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
@@ -929,13 +1016,24 @@ impl Platform for MacPlatform {
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {
         unsafe {
+            let pool = NSAutoreleasePool::new(nil);
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
-            let actions = &mut state.menu_actions;
-            let new = self.create_dock_menu(menu, NSWindow::delegate(app), actions, keymap);
-            if let Some(old) = state.dock_menu.replace(new) {
+            let mut actions = MenuActionSet::default();
+            let new = self.create_dock_menu(
+                menu,
+                NSWindow::delegate(app),
+                &mut state.menu_actions,
+                &mut actions,
+                keymap,
+            );
+            state.menu_actions.replace_dock(actions);
+            let old = state.dock_menu.replace(new);
+            drop(state);
+            if let Some(old) = old {
                 CFRelease(old as _)
             }
+            pool.drain();
         }
     }
 
@@ -1474,10 +1572,9 @@ extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
-            let index = tag as usize;
-            if let Some(action) = lock.menu_actions.get(index) {
-                let action = action.boxed_clone();
-                drop(lock);
+            let action = lock.menu_actions.action(tag);
+            drop(lock);
+            if let Some(action) = action {
                 callback(&*action);
             }
             platform.0.lock().menu_command.get_or_insert(callback);
@@ -1492,10 +1589,9 @@ extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.validate_menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
-            let index = tag as usize;
-            if let Some(action) = lock.menu_actions.get(index) {
-                let action = action.boxed_clone();
-                drop(lock);
+            let action = lock.menu_actions.action(tag);
+            drop(lock);
+            if let Some(action) = action {
                 result = callback(action.as_ref());
             }
             platform
@@ -1656,6 +1752,91 @@ impl UTType {
 
     fn inner_mut(&self) -> *mut Object {
         self.0 as *mut _
+    }
+}
+
+// These fixtures exercise the same registry used by native menu construction
+// and callbacks, without creating or mutating the process-wide NSApplication.
+#[cfg(feature = "test-support")]
+pub(crate) mod fastab_menu_fixtures {
+    use super::*;
+
+    #[derive(Clone, PartialEq, crate::Action)]
+    #[action(no_json, no_register)]
+    struct TrackedAction(Arc<()>);
+
+    /// Exercise repeated menu retirement, stale tags, and independent Dock actions.
+    pub fn native_menu_actions_retire_without_reusing_tags_or_disturbing_dock() {
+        let mut registry = MenuActionRegistry::default();
+        let action = TrackedAction(Arc::new(()));
+        let mut dock = MenuActionSet::default();
+        let dock_tag = registry.register(&mut dock, &action);
+        registry.replace_dock(dock);
+        let mut retired = Vec::new();
+
+        for _ in 0..128 {
+            let mut main = MenuActionSet::default();
+            let main_tag = registry.register(&mut main, &action);
+            registry.replace_main(main);
+            assert!(registry.action(main_tag).is_some());
+            assert!(registry.action(dock_tag).is_some());
+            assert_eq!(registry.main.len(), 1);
+            assert_eq!(registry.dock.len(), 1);
+            for &tag in &retired {
+                assert!(registry.action(tag).is_none());
+            }
+
+            registry.replace_main(MenuActionSet::default());
+            assert!(registry.action(main_tag).is_none());
+            assert!(registry.action(dock_tag).is_some());
+            assert_eq!(registry.main.capacity(), 0);
+            retired.push(main_tag);
+        }
+
+        let mut main = MenuActionSet::default();
+        let main_tag = registry.register(&mut main, &action);
+        registry.replace_main(main);
+        let mut dock = MenuActionSet::default();
+        let new_dock_tag = registry.register(&mut dock, &action);
+        registry.replace_dock(dock);
+        assert!(registry.action(dock_tag).is_none());
+        assert!(registry.action(main_tag).is_some());
+        assert!(registry.action(new_dock_tag).is_some());
+        registry.replace_dock(MenuActionSet::default());
+        assert!(registry.action(new_dock_tag).is_none());
+        assert!(registry.action(main_tag).is_some());
+        assert!(registry.action(0).is_none());
+        assert!(registry.action(-1).is_none());
+        assert!(registry.action(NSInteger::MAX).is_none());
+    }
+
+    /// Check registry ownership while an independently cloned action is in flight.
+    pub fn native_menu_action_owners_release_on_replacement_and_retirement() {
+        let mut registry = MenuActionRegistry::default();
+        let old_action = TrackedAction(Arc::new(()));
+        let new_action = TrackedAction(Arc::new(()));
+        let mut main = MenuActionSet::default();
+        let old_tag = registry.register(&mut main, &old_action);
+        registry.replace_main(main);
+        assert_eq!(Arc::strong_count(&old_action.0), 2);
+
+        // A dispatched callback owns its clone independently of the menu. It
+        // remains valid if the action closes settings and retires its own menu.
+        let in_flight = registry.action(old_tag).unwrap();
+        assert_eq!(Arc::strong_count(&old_action.0), 3);
+        let mut main = MenuActionSet::default();
+        let new_tag = registry.register(&mut main, &new_action);
+        registry.replace_main(main);
+        assert_eq!(Arc::strong_count(&old_action.0), 2);
+        assert!(registry.action(old_tag).is_none());
+        assert!(registry.action(new_tag).is_some());
+        drop(in_flight);
+        assert_eq!(Arc::strong_count(&old_action.0), 1);
+
+        registry.replace_main(MenuActionSet::default());
+        assert_eq!(Arc::strong_count(&new_action.0), 1);
+        assert!(registry.action(new_tag).is_none());
+        assert_eq!(registry.main.capacity(), 0);
     }
 }
 

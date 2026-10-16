@@ -9,7 +9,7 @@ actions!(fastab_edit, [Cut, Copy, Paste, SelectAll, Undo, Redo]);
 mod macos {
     use fastab_util::consts::PRODUCT_NAME;
     use fastab_util::consts::url::{ISSUE_TRACKER, RELEASE_NOTES, USER_MANUAL};
-    use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, actions};
+    use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, actions};
 
     use super::{Copy, Cut, Paste, Redo, SelectAll, Undo};
     use crate::event::{Event, WindowEvent};
@@ -60,24 +60,14 @@ mod macos {
 
     #[allow(unexpected_cfgs)]
     fn finish_native_menu() {
-        // GPUI 0.2.2 passes an NSMenuItem to setServicesMenu:, which expects
-        // its NSMenu submenu. Build it as an ordinary submenu, then attach
-        // the actual NSMenu here. Keep Undo/Redo native for system text fields;
+        // Keep Undo/Redo native for system text fields;
         // our GPUI inputs have no handlers and remain unavailable.
         unsafe {
-            use cocoa::base::{id, nil};
+            use cocoa::base::id;
             use objc::{class, msg_send, sel, sel_impl};
 
             let app: id = msg_send![class!(NSApplication), sharedApplication];
             let main_menu: id = msg_send![app, mainMenu];
-            let app_item: id = msg_send![main_menu, itemAtIndex: 0isize];
-            let app_menu: id = msg_send![app_item, submenu];
-            let services_item: id = msg_send![app_menu, itemAtIndex: 3isize];
-            let services_menu: id = msg_send![services_item, submenu];
-            if services_menu != nil {
-                let _: () = msg_send![app, setServicesMenu: services_menu];
-            }
-
             let edit_item: id = msg_send![main_menu, itemAtIndex: 2isize];
             let edit_menu: id = msg_send![edit_item, submenu];
             let undo_item: id = msg_send![edit_menu, itemAtIndex: 0isize];
@@ -94,7 +84,7 @@ mod macos {
         }
     }
 
-    pub(super) fn install(cx: &mut App, proxy: EventLoopProxy) {
+    pub(super) fn install_actions(cx: &mut App, proxy: EventLoopProxy) {
         let about_proxy = proxy.clone();
         cx.on_action(move |_: &About, _| {
             send_settings_event(
@@ -133,6 +123,12 @@ mod macos {
             KeyBinding::new("cmd-c", Copy, Some("SettingsInput")),
             KeyBinding::new("cmd-v", Paste, Some("SettingsInput")),
         ]);
+    }
+
+    pub(super) fn restore_native(cx: &App) {
+        if cx.get_menus().is_some() {
+            return;
+        }
         cx.set_menus(vec![
             Menu {
                 name: PRODUCT_NAME.into(),
@@ -140,10 +136,7 @@ mod macos {
                     MenuItem::action(format!("About {PRODUCT_NAME}"), About),
                     MenuItem::action("Check for Updates…", CheckForUpdates),
                     MenuItem::separator(),
-                    MenuItem::submenu(Menu {
-                        name: "Services".into(),
-                        items: vec![],
-                    }),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
                     MenuItem::separator(),
                     MenuItem::action(format!("Hide {PRODUCT_NAME}"), Hide),
                     MenuItem::action("Hide Others", HideOthers),
@@ -190,12 +183,30 @@ mod macos {
         ]);
         finish_native_menu();
     }
+
+    pub(super) fn retire_native(cx: &App) {
+        if cx.get_menus().is_some() {
+            // GPUI detaches all three NSApplication owners and releases the
+            // matching action registry. AppKit may retain its own display caches.
+            cx.set_menus(Vec::new());
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{Minimize, Zoom};
 
 #[cfg(target_os = "macos")]
-pub fn install(cx: &mut gpui::App, proxy: crate::EventLoopProxy) {
-    macos::install(cx, proxy);
+pub fn install_actions(cx: &mut gpui::App, proxy: crate::EventLoopProxy) {
+    macos::install_actions(cx, proxy);
+}
+
+#[cfg(target_os = "macos")]
+pub fn restore_native(cx: &gpui::App) {
+    macos::restore_native(cx);
+}
+
+#[cfg(target_os = "macos")]
+pub fn retire_native(cx: &gpui::App) {
+    macos::retire_native(cx);
 }

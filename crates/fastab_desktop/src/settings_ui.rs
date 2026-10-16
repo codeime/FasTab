@@ -2153,7 +2153,6 @@ fn activate_app() {
 
 pub fn open_settings_window(cx: &mut App, proxy: EventLoopProxy) -> anyhow::Result<SettingsHandle> {
     let bounds = Bounds::centered(None, size(px(WIN_W), px(WIN_H)), cx);
-    let close_proxy = proxy.clone();
     let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2187,12 +2186,9 @@ pub fn open_settings_window(cx: &mut App, proxy: EventLoopProxy) -> anyhow::Resu
                 let _ = weak.update(cx, |this, cx| {
                     this.clear_ai_draft(cx);
                 });
-                close_proxy
-                    .send_event(Event::WindowEvent {
-                        window_id: DASHBOARD_ID,
-                        window_event: WindowEvent::Close,
-                    })
-                    .ok();
+                // GPUI removes this exact window after returning true. The
+                // host observes that removal; a queued unqualified Close could
+                // otherwise close a new window opened before it is dispatched.
                 true
             });
             entity

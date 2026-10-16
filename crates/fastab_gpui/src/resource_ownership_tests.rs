@@ -4,6 +4,18 @@ use gpui::{TestAppContext, fastab_resource_fixtures as fixtures};
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_menu_actions_retire_without_reusing_tags_or_disturbing_dock() {
+    fixtures::native_menu_actions_retire_without_reusing_tags_or_disturbing_dock();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_menu_action_owners_release_on_replacement_and_retirement() {
+    fixtures::native_menu_action_owners_release_on_replacement_and_retirement();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn copied_input_source_releases_its_owned_reference() {
     fixtures::copied_input_source_is_released_after_metadata_reads_and_failures();
 }

@@ -451,6 +451,8 @@ impl DesktopHost {
     fn show_settings(&mut self, cx: &mut App) {
         if let Some(handle) = &self.settings {
             if crate::settings_ui::focus_settings(handle, cx) {
+                #[cfg(target_os = "macos")]
+                crate::webview::menu::restore_native(cx);
                 crate::settings_ui::notify_dashboard_visible(&self.proxy, true);
                 self.refresh_settings_permissions(cx);
                 return;
@@ -459,10 +461,16 @@ impl DesktopHost {
         match crate::settings_ui::open_settings_window(cx, self.proxy.clone()) {
             Ok(handle) => {
                 self.settings = Some(handle);
+                #[cfg(target_os = "macos")]
+                crate::webview::menu::restore_native(cx);
                 crate::settings_ui::notify_dashboard_visible(&self.proxy, true);
                 self.refresh_settings_permissions(cx);
             },
-            Err(err) => error!(%err, "Failed to open native settings"),
+            Err(err) => {
+                error!(%err, "Failed to open native settings");
+                self.settings = None;
+                self.retire_settings_menu(cx);
+            },
         }
     }
 
@@ -476,7 +484,24 @@ impl DesktopHost {
         if let Some(handle) = self.settings.take() {
             crate::settings_ui::close_settings(&handle, cx);
         }
+        self.retire_settings_menu(cx);
+    }
+
+    fn retire_settings_menu(&self, cx: &App) {
+        #[cfg(target_os = "macos")]
+        crate::webview::menu::retire_native(cx);
         crate::settings_ui::notify_dashboard_visible(&self.proxy, false);
+    }
+
+    fn reconcile_closed_settings(&mut self, cx: &App) {
+        if self.settings.as_ref().is_some_and(|handle| {
+            !cx.windows()
+                .iter()
+                .any(|window| window.window_id() == handle.window_id())
+        }) {
+            self.settings = None;
+            self.retire_settings_menu(cx);
+        }
     }
 }
 
@@ -568,7 +593,18 @@ pub fn start_application(
             *reopen_proxy.borrow_mut() = Some(host.read(cx).proxy.clone());
             fastab_gpui::install_idle_cache_release(cx);
             #[cfg(target_os = "macos")]
-            crate::webview::menu::install(cx, host.read(cx).proxy.clone());
+            crate::webview::menu::install_actions(cx, host.read(cx).proxy.clone());
+            let weak_host = host.downgrade();
+            cx.on_window_closed(move |cx| {
+                let weak_host = weak_host.clone();
+                // GPUI notifies before the removed Window finishes dropping.
+                // Recheck the current handle after that drop: an old close must
+                // not retire a newly opened settings window's menu.
+                cx.defer(move |cx| {
+                    let _ = weak_host.update(cx, |host, cx| host.reconcile_closed_settings(cx));
+                });
+            })
+            .detach();
             run(host.clone(), event_rx, cx);
             #[cfg(target_os = "macos")]
             {
