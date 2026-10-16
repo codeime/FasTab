@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.11
+
+- fix: prevent the host-only CoreVideo binding from entering generated Metal shaders, resolving the v0.0.10 crash when opening the first native window.
+- test: check the actual generated shader header and embedded source in ordinary CI so this startup regression is caught without a GPU.
+
 ## v0.0.10
 
 - fix: borrow the Metal device when creating CoreVideo texture caches, balancing native references across renderer lifetimes.
