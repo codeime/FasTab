@@ -545,6 +545,8 @@ pub struct IdleCacheRelease {
     /// Empty element arena backing released on this thread, in estimated bytes.
     /// Live elements or an outstanding arena borrow prevent its retirement.
     pub element_arena_bytes: usize,
+    /// Temporary child-layout ID backing released, in estimated bytes.
+    pub layout_id_buffer_bytes: usize,
 }
 
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
@@ -2062,10 +2064,12 @@ impl App {
         // The last window is gone; also retire the maps' high-water backing.
         drop(mem::take(&mut self.tracked_entities));
         drop(mem::take(&mut self.window_invalidators_by_entity));
+        let layout_id_buffer = mem::take(&mut self.layout_id_buffer);
         Some(IdleCacheRelease {
             assets: assets.len(),
             text: self.text_system.release_idle_caches(),
             element_arena_bytes: crate::window::release_idle_element_arena().unwrap_or(0),
+            layout_id_buffer_bytes: layout_id_buffer.capacity() * mem::size_of::<LayoutId>(),
         })
     }
 
@@ -2496,7 +2500,8 @@ pub(crate) mod fastab_resource_fixtures {
     use std::{cell::Cell, rc::Rc};
 
     use crate::{
-        AppContext, Context, Empty, IntoElement, Render, TestAppContext, WeakEntity, Window,
+        AppContext, Context, Empty, IntoElement, ParentElement, Render, TestAppContext, WeakEntity,
+        Window, div,
     };
 
     fn element_arena_capacity() -> usize {
@@ -2525,6 +2530,15 @@ pub(crate) mod fastab_resource_fixtures {
     impl Drop for EntityReader {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    struct LayoutScratch;
+
+    impl Render for LayoutScratch {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Build scratch capacity through Div's real child-layout requests.
+            div().children((0..64).map(|_| div()))
         }
     }
 
@@ -2629,11 +2643,22 @@ pub(crate) mod fastab_resource_fixtures {
     pub fn idle_cache_release_skips_borrowed_arena_then_retires_and_rebuilds_on_draw(
         cx: &mut TestAppContext,
     ) {
-        let window = cx.add_window(|_, _| Empty);
+        let window = cx.add_window(|_, _| LayoutScratch);
+        let remaining = cx.add_window(|_, _| Empty);
         let capacity = element_arena_capacity();
+        let layout_capacity = cx.read(|cx| cx.layout_id_buffer.capacity());
         assert!(capacity > 0);
+        assert!(layout_capacity >= 64);
         assert!(cx.update(|cx| cx.release_idle_caches()).is_none());
         window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        assert!(cx.update(|cx| cx.release_idle_caches()).is_none());
+        assert_eq!(
+            cx.read(|cx| cx.layout_id_buffer.capacity()),
+            layout_capacity
+        );
+        remaining
             .update(cx, |_, window, _| window.remove_window())
             .unwrap();
         crate::window::ELEMENT_ARENA.with(|arena| {
@@ -2641,26 +2666,32 @@ pub(crate) mod fastab_resource_fixtures {
             let released = cx.update(|cx| cx.release_idle_caches().unwrap());
             assert_eq!(released.element_arena_bytes, 0);
             assert_eq!(borrow.capacity(), capacity);
+            assert_eq!(
+                released.layout_id_buffer_bytes,
+                layout_capacity * std::mem::size_of::<crate::LayoutId>()
+            );
+            assert_eq!(cx.read(|cx| cx.layout_id_buffer.capacity()), 0);
         });
         let released = cx.update(|cx| cx.release_idle_caches().unwrap());
         assert!(released.element_arena_bytes >= capacity);
+        assert_eq!(released.layout_id_buffer_bytes, 0);
         assert_eq!(element_arena_capacity(), 0);
         assert_eq!(
             cx.update(|cx| cx.release_idle_caches().unwrap())
                 .element_arena_bytes,
             0
         );
-        let reopened = cx.add_window(|_, _| Empty);
+        let reopened = cx.add_window(|_, _| LayoutScratch);
         assert!(element_arena_capacity() > 0);
+        assert!(cx.read(|cx| cx.layout_id_buffer.capacity()) >= 64);
         reopened
             .update(cx, |_, window, _| window.remove_window())
             .unwrap();
-        assert!(
-            cx.update(|cx| cx.release_idle_caches().unwrap())
-                .element_arena_bytes
-                > 0
-        );
+        let released = cx.update(|cx| cx.release_idle_caches().unwrap());
+        assert!(released.element_arena_bytes > 0);
+        assert!(released.layout_id_buffer_bytes > 0);
         assert_eq!(element_arena_capacity(), 0);
+        assert_eq!(cx.read(|cx| cx.layout_id_buffer.capacity()), 0);
     }
 
     pub fn idle_app_cannot_retire_another_apps_live_element_on_the_same_thread(

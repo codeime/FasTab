@@ -58,6 +58,8 @@ pub(crate) use open_type::fastab_resource_fixtures as fastab_font_fixtures;
 pub(crate) use platform::*;
 pub(crate) use window::*;
 
+#[cfg(all(feature = "test-support", feature = "font-kit"))]
+pub(crate) use text_system::fastab_resource_fixtures as fastab_text_fixtures;
 #[cfg(feature = "font-kit")]
 pub(crate) use text_system::*;
 

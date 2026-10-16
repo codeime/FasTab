@@ -82,6 +82,8 @@ pub struct TextCacheRelease {
     pub font_run_buffers: usize,
     /// Total element capacity of the dropped font-run buffers.
     pub font_run_capacity: usize,
+    /// Platform layout scratch capacity dropped, not physical memory reclaimed.
+    pub platform_scratch_bytes: usize,
 }
 
 impl TextSystem {
@@ -129,6 +131,7 @@ impl TextSystem {
             line_wrappers: wrappers.values().map(Vec::len).sum(),
             font_run_buffers: font_runs.len(),
             font_run_capacity: font_runs.iter().map(Vec::capacity).sum(),
+            platform_scratch_bytes: self.platform_text_system.release_idle_caches(),
         }
     }
 

@@ -72,6 +72,8 @@ pub mod fastab_resource_fixtures {
     pub use crate::platform::fastab_keyboard_fixtures::*;
     #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
     pub use crate::platform::fastab_metal_fixtures::*;
+    #[cfg(all(target_os = "macos", feature = "font-kit"))]
+    pub use crate::platform::fastab_text_fixtures::*;
 }
 
 mod seal {

@@ -575,6 +575,12 @@ pub trait PlatformDispatcher: Send + Sync {
 }
 
 pub(crate) trait PlatformTextSystem: Send + Sync {
+    /// Retire temporary layout storage, preserving all registered font identities.
+    /// Returns backing capacity bytes, not physical memory reclaimed.
+    fn release_idle_caches(&self) -> usize {
+        0
+    }
+
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
     fn all_font_names(&self) -> Vec<String>;
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;

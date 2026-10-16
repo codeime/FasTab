@@ -93,6 +93,18 @@ impl Default for MacTextSystem {
 }
 
 impl PlatformTextSystem for MacTextSystem {
+    fn release_idle_caches(&self) -> usize {
+        // Only layout_line uses this scratch, under the same write lock. Its
+        // returned glyphs own their indices; font identities remain untouched.
+        let scratch = {
+            let mut state = self.0.write();
+            std::mem::take(&mut state.zwnjs_scratch_space)
+        };
+        let bytes = scratch.capacity() * std::mem::size_of::<usize>();
+        drop(scratch);
+        bytes
+    }
+
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
     }
@@ -704,6 +716,75 @@ mod lenient_font_attributes {
             let reference = CFRetain(reference as *const ::std::os::raw::c_void) as CFStringRef;
             TCFType::wrap_under_create_rule(reference)
         }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[allow(missing_docs)]
+pub(crate) mod fastab_resource_fixtures {
+    use super::*;
+
+    pub fn native_text_scratch_retires_without_changing_fonts_or_layout() {
+        objc::rc::autoreleasepool(|| {
+            let fonts = MacTextSystem::new();
+            assert_eq!(fonts.release_idle_caches(), 0);
+            assert!(fonts.0.read().fonts.is_empty());
+
+            let mut requested_font = crate::font("Helvetica").bold().italic();
+            requested_font.features = FontFeatures::disable_ligatures();
+            requested_font.fallbacks = Some(FontFallbacks::from_fonts(vec!["Menlo".into()]));
+            let font_id = fonts.font_id(&requested_font).unwrap();
+            let text = "office 中文 😀".repeat(32);
+            let runs = text
+                .chars()
+                .map(|ch| FontRun {
+                    font_id,
+                    len: ch.len_utf8(),
+                })
+                .collect::<Vec<_>>();
+            let before = fonts.layout_line(&text, px(16.), &runs);
+            assert!(!before.runs.is_empty());
+            assert!(before.runs.iter().any(|run| run.font_id != font_id));
+            let (scratch_bytes, font_count, font_names) = {
+                let state = fonts.0.read();
+                (
+                    state.zwnjs_scratch_space.capacity() * std::mem::size_of::<usize>(),
+                    state.fonts.len(),
+                    state.postscript_names_by_font_id.clone(),
+                )
+            };
+            assert!(scratch_bytes > 0);
+            assert_eq!(fonts.release_idle_caches(), scratch_bytes);
+            assert_eq!(fonts.0.read().zwnjs_scratch_space.capacity(), 0);
+            assert_eq!(fonts.release_idle_caches(), 0);
+
+            // Keep the old layout alive across retirement. A later shape must
+            // still resolve its base and fallback fonts to the same identities.
+            assert_eq!(fonts.font_id(&requested_font).unwrap(), font_id);
+            let after = fonts.layout_line(&text, px(16.), &runs);
+            assert_eq!(before.font_size, after.font_size);
+            assert_eq!(before.width, after.width);
+            assert_eq!(before.ascent, after.ascent);
+            assert_eq!(before.descent, after.descent);
+            assert_eq!(before.len, after.len);
+            assert_eq!(before.runs.len(), after.runs.len());
+            for (before, after) in before.runs.iter().zip(&after.runs) {
+                assert_eq!(before.font_id, after.font_id);
+                assert_eq!(before.glyphs.len(), after.glyphs.len());
+                for (before, after) in before.glyphs.iter().zip(&after.glyphs) {
+                    assert_eq!(before.id, after.id);
+                    assert_eq!(before.position, after.position);
+                    assert_eq!(before.index, after.index);
+                    assert_eq!(before.is_emoji, after.is_emoji);
+                }
+            }
+            let state = fonts.0.read();
+            assert_eq!(state.fonts.len(), font_count);
+            assert_eq!(state.postscript_names_by_font_id, font_names);
+            assert!(state.zwnjs_scratch_space.capacity() > 0);
+            drop(state);
+            assert!(fonts.release_idle_caches() > 0);
+        });
     }
 }
 

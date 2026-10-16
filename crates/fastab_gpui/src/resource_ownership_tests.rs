@@ -28,6 +28,12 @@ fn native_font_keeps_requested_features() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_layout_scratch_retires_without_changing_fonts_or_layout() {
+    fixtures::native_text_scratch_retires_without_changing_fonts_or_layout();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 #[ignore = "requires a Metal-capable macOS host"]
 fn metal_surface_cache_borrows_the_device() {
     fixtures::surface_cache_creation_borrows_device_on_success_and_error();
