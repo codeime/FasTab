@@ -210,6 +210,9 @@ jobs:
           test "$(grep -Ec '^test resource_ownership_tests::.* \.\.\. ok$' "$resource_log")" -eq 21
           grep -Eq '^test resource_ownership_tests::native_menu_actions_retire_without_reusing_tags_or_disturbing_dock \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::native_menu_action_owners_release_on_replacement_and_retirement \.\.\. ok$' "$resource_log"
+          grep -Eq '^test resource_ownership_tests::empty_font_feature_array_has_no_abandoned_reference \.\.\. ok$' "$resource_log"
+          grep -Eq '^test resource_ownership_tests::font_attributes_keep_values_alive_without_extra_array_references \.\.\. ok$' "$resource_log"
+          grep -Eq '^test resource_ownership_tests::native_font_keeps_requested_features \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::native_font_families_keep_only_selected_faces_loaded \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::system_font_enumeration_stops_after_first_exact_match \.\.\. ok$' "$resource_log"
           grep -Eq '^test resource_ownership_tests::deferred_font_candidates_preserve_matching_and_fallback_precedence \.\.\. ok$' "$resource_log"

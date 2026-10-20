@@ -132,6 +132,39 @@ Application cache reclamation in `src/app.rs` and `src/text_system.rs`:
   mixed Unicode/fallback shaping, old layouts across retirement, stable font
   identities, and lazy scratch rebuilding.
 
+Window tracking, element arena and native menus:
+
+- `app.rs` removes a closed window's entity tracking before its close observers
+  run. `arena.rs` retires the element arena's storage once no element is live;
+  a handle from before the last clear panics on use instead of reading freed
+  storage.
+- `platform/mac/platform.rs` keeps menu actions in a registry keyed by
+  monotonically increasing tags that are never reused, so a stale tag resolves
+  to nothing. The platform lock is released before an action runs, which also
+  removes upstream's self-deadlock when `handle_menu_item` met an unknown tag.
+  The old dock menu is released outside the lock. An empty `set_menus` detaches
+  the main, Windows and Services menus and reports no menus, which Fastab's
+  idempotent retire/restore in `fastab_desktop` relies on; the Services owner is
+  now the submenu's `NSMenu` rather than upstream's `NSMenuItem`.
+
+CoreFoundation ownership and fonts:
+
+- `keyboard.rs` wraps `TISCopy…` input sources under the Create rule and copies
+  their borrowed property strings before release, including on unwind.
+- `open_type.rs` releases the initial +1 of the feature and cascade arrays once
+  the attribute dictionary retains them. Upstream built the system cascade with
+  an unconsumed lazy iterator, so a font with explicit fallbacks never received
+  the per-language system cascade; it is now appended after the requested
+  fallbacks. Fastab itself sets no `FontFallbacks`.
+- `text_system.rs` registers font faces as candidates and adds a face to the
+  font table only when it is selected or reached through fallback. Menlo and
+  Helvetica in their default configuration defer even the per-face query. Other
+  families still create a temporary configured `CTFont` per face while loading,
+  then keep only its copied descriptor until selection. Faces added with
+  `add_fonts` keep their configured font instead, because a descriptor without a
+  file URL can resolve to a same-named system font. FontIds and PostScript
+  fallback precedence are stable across retirement.
+
 The root `[patch.crates-io]` applies this copy to all GPUI consumers. Other
 `gpui_*` crates retain their registry dependencies. Font identities, rendering
 primitives, MSAA quality and instance-buffer sizing are unchanged.
@@ -142,9 +175,11 @@ their lifetime from the resources needed only by a live window.
 
 The new CoreVideo ownership and lazy-cache fixtures are exported through
 `test-support` to the existing `fastab_gpui` workspace test target, alongside
-the CPU-only ownership fixtures. CI requires 12 CPU-only cases to pass and both
-Metal cases to be collected as ignored. On a Metal-capable macOS validation host
-(not the local development machine, where builds remain prohibited), run:
+the CPU-only ownership fixtures. CI requires 21 CPU-only cases to pass (and
+names the menu, font-attribute, font-candidate and shader cases individually)
+and both Metal cases to be collected as ignored. On a Metal-capable macOS
+validation host (not the local development machine, where builds remain
+prohibited), run:
 
 ```sh
 cargo test --locked -p fastab_gpui resource_ownership_tests::metal_surface_cache_ -- --ignored --test-threads=1
@@ -157,7 +192,9 @@ fixtures below.
 
 These fixtures use a real device and CoreVideo cache, checking the borrowed
 argument at the FFI boundary, deterministic error handling, empty-batch laziness,
-cache reuse and its owned-reference release. They require hardware explicitly;
+cache reuse and its owned-reference release. Repeated create/drop cycles must
+also leave the device's retain count settled, which is what catches a consumed
+device argument. They require hardware explicitly;
 missing Metal never silently turns a test into a pass. Their execution and a
 new installed build's footprint comparison remain separate acceptance steps.
 

@@ -1616,6 +1616,24 @@ pub(crate) mod fastab_resource_fixtures {
                 owned_count - 1,
                 "retiring the lazy cache must release its Create reference"
             );
+            drop(observer);
+
+            // CoreVideo may hold transient device references of its own, so
+            // compare against a settled count. A consumed device argument
+            // leaks one reference per cache, i.e. at least one per cycle.
+            const CYCLES: usize = 32;
+            let settled = device_retain_count(&device);
+            for _ in 0..CYCLES {
+                objc::rc::autoreleasepool(|| {
+                    let mut slot = SurfaceTextureCache::default();
+                    assert!(slot.for_batch(&device, 1).unwrap().is_some());
+                });
+            }
+            let after = device_retain_count(&device);
+            assert!(
+                after < settled + CYCLES / 2,
+                "{CYCLES} lazy caches left the device at {after} references, from {settled}"
+            );
         });
     }
 }
