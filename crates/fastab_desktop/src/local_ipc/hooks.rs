@@ -4,7 +4,7 @@ use fastab_proto::local::{
 };
 use tao::dpi::{LogicalPosition, LogicalSize};
 
-use crate::event::{WindowEvent, WindowPosition};
+use crate::event::{CaretSource, WindowEvent, WindowPosition};
 use crate::platform::PlatformState;
 use crate::webview::WindowId;
 use crate::{AUTOCOMPLETE_ID, Event, EventLoopProxy};
@@ -29,14 +29,21 @@ pub async fn caret_position(
         return Ok(());
     }
 
+    let origin = hook.origin();
     proxy
         .send_event_async(Event::WindowEvent {
             window_id: AUTOCOMPLETE_ID,
-            window_event: WindowEvent::CaretPositionHook(WindowPosition::RelativeToCaret {
-                caret_position: LogicalPosition::new(x, y).into(),
-                caret_size: LogicalSize::new(width, height).into(),
-                origin: hook.origin(),
-            }),
+            window_event: WindowEvent::CaretPositionHook {
+                position: WindowPosition::RelativeToCaret {
+                    caret_position: LogicalPosition::new(x, y).into(),
+                    caret_size: LogicalSize::new(width, height).into(),
+                    origin,
+                },
+                source: CaretSource {
+                    bundle_id: hook.bundle_id,
+                    window_id: hook.window_id,
+                },
+            },
         })
         .await?;
 

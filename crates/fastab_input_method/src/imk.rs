@@ -46,22 +46,33 @@ fn is_valid_caret_rect(rect: NSRect) -> bool {
 /// palette-input-source switch, `deactivateServer:` flips `is_active` off
 /// while the terminal is still the key window — AX cannot see their caret,
 /// so dropping the request here is what makes the overlay vanish mid-session.
-fn client_is_key_window(client: &AnyObject) -> Option<bool> {
-    let window_sel = sel!(window);
-    let responds: Bool = unsafe { msg_send![client, respondsToSelector: window_sel] };
-    if !responds.as_bool() {
-        return None;
-    }
-    let window: *const AnyObject = unsafe { msg_send![client, window] };
-    if window.is_null() {
-        return None;
-    }
+fn window_is_key(window: &AnyObject) -> Option<bool> {
     let responds: Bool = unsafe { msg_send![window, respondsToSelector: sel!(isKeyWindow)] };
     if !responds.as_bool() {
         return None;
     }
     let is_key: Bool = unsafe { msg_send![window, isKeyWindow] };
     Some(is_key.as_bool())
+}
+
+/// The window server number of the client's window, which is the
+/// `CGWindowID` the desktop tracks for the focused window through AX.
+fn window_number(window: &AnyObject) -> Option<u32> {
+    let responds: Bool = unsafe { msg_send![window, respondsToSelector: sel!(windowNumber)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let number: isize = unsafe { msg_send![window, windowNumber] };
+    u32::try_from(number).ok().filter(|&number| number > 0)
+}
+
+fn client_window(client: &AnyObject) -> Option<&AnyObject> {
+    let responds: Bool = unsafe { msg_send![client, respondsToSelector: sel!(window)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let window: *const AnyObject = unsafe { msg_send![client, window] };
+    unsafe { window.as_ref() }
 }
 
 fn frontmost_bundle_identifier() -> Option<String> {
@@ -176,7 +187,7 @@ fn requested_caret_frame(
     frontmost_bundle_id: Option<&str>,
     is_active: bool,
     is_key_window: Option<bool>,
-    query_rect: impl FnOnce() -> NSRect,
+    query_caret: impl FnOnce() -> (NSRect, Option<u32>),
 ) -> Option<Vec<u8>> {
     if !terminals::supports_input_method(bundle_id) {
         log_debug!("Instance {bundle_id:?} is not a supported terminal, ignoring request");
@@ -194,7 +205,7 @@ fn requested_caret_frame(
         return None;
     }
 
-    let rect = query_rect();
+    let (rect, window_id) = query_caret();
     if !is_valid_caret_rect(rect) {
         log_debug!("Instance {bundle_id:?} reported an invalid caret rect {rect:?}, ignoring request");
         return None;
@@ -205,22 +216,27 @@ fn requested_caret_frame(
     // while this IMK controller remains alive. An unchanged rect is still needed
     // to restore that state; queued replies are coalesced by the sender instead.
     log_debug!("Sending cursor position for {bundle_id:?}: {rect:?}");
-    Some(wire::caret_position_frame(
+    Some(wire::caret_position_frame_from(
         rect.origin.x,
         rect.origin.y,
         rect.size.width,
         rect.size.height,
         Origin::BottomLeft,
+        wire::CaretSource {
+            bundle_id: Some(bundle_id),
+            window_id,
+        },
     ))
 }
 
 fn report_caret_from_client(client: &AnyObject, bundle_id: Option<&str>, is_active: bool) {
     let frontmost_bundle_id = frontmost_bundle_identifier();
+    let window = client_window(client);
     if let Some(frame) = requested_caret_frame(
         bundle_id.unwrap_or_default(),
         frontmost_bundle_id.as_deref(),
         is_active,
-        client_is_key_window(client),
+        window.and_then(window_is_key),
         || {
             let mut rect = NSRect {
                 origin: NSPoint { x: 0.0, y: 0.0 },
@@ -230,7 +246,7 @@ fn report_caret_from_client(client: &AnyObject, bundle_id: Option<&str>, is_acti
                 },
             };
             let _: () = unsafe { msg_send![client, attributesForCharacterIndex: 0 lineHeightRectangle: &mut rect] };
-            rect
+            (rect, window.and_then(window_number))
         },
     ) {
         enqueue_caret_frame(frame);
@@ -389,7 +405,7 @@ mod tests {
         let request = || {
             requested_caret_frame("io.appmakes.otty", Some("io.appmakes.otty"), true, Some(true), || {
                 queries.set(queries.get() + 1);
-                rect(100.0, 200.0, 1.0, 16.0)
+                (rect(100.0, 200.0, 1.0, 16.0), None)
             })
             .expect("every request needs a reply, even if the desktop lost its previous caret")
         };
@@ -400,11 +416,30 @@ mod tests {
     }
 
     #[test]
+    fn caret_frames_name_the_client_they_were_read_from() {
+        let frame = requested_caret_frame("io.appmakes.otty", Some("io.appmakes.otty"), true, Some(true), || {
+            (rect(100.0, 200.0, 1.0, 16.0), Some(4211))
+        });
+        let expected = wire::caret_position_frame_from(
+            100.0,
+            200.0,
+            1.0,
+            16.0,
+            Origin::BottomLeft,
+            wire::CaretSource {
+                bundle_id: Some("io.appmakes.otty"),
+                window_id: Some(4211),
+            },
+        );
+        assert_eq!(frame, Some(expected));
+    }
+
+    #[test]
     fn focus_routing_preserves_active_proxies_without_window_metadata() {
         for (active, key_window) in [(true, None), (false, Some(true))] {
             assert!(
                 requested_caret_frame("io.appmakes.otty", None, active, key_window, || {
-                    rect(100.0, 200.0, 1.0, 16.0)
+                    (rect(100.0, 200.0, 1.0, 16.0), None)
                 })
                 .is_some()
             );

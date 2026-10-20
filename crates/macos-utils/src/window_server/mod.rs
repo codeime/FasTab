@@ -31,7 +31,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSBundle, NSNotification, NSObject};
 use tracing::{debug, error, info, trace, warn};
-pub use ui_element::{AX_MESSAGING_TIMEOUT_SECONDS, CGWindowLevelForKey, UIElement};
+pub use ui_element::{AX_MESSAGING_TIMEOUT_SECONDS, CGWindowLevelForKey, UIElement, window_owner_pid};
 
 use crate::util::NotificationCenter;
 use crate::util::notification_center::get_app_from_notification;

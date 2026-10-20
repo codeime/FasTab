@@ -168,6 +168,8 @@ pub fn new_caret_position_hook(x: f64, y: f64, width: f64, height: f64, origin: 
         width,
         height,
         origin: Some(origin as i32),
+        bundle_id: None,
+        window_id: None,
     }))
 }
 

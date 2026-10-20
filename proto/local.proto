@@ -281,6 +281,12 @@ message CaretPositionHook {
   double height = 4;
 
   optional Origin origin = 5;
+
+  // The client the caret was read from, when the sender knows it. A frame
+  // queued before focus moved must not place the list over another window.
+  optional string bundle_id = 6;
+  // Window server number (CGWindowID) of the client's window.
+  optional uint32 window_id = 7;
 }
 
 message FocusChangeHook {}

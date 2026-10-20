@@ -219,6 +219,9 @@ pub(crate) struct OverlayInput {
     pub cwd: String,
     pub cursor: u32,
     pub session_id: uuid::Uuid,
+    /// The session reported the buffer and cursor it already had: the shell
+    /// redrew its line, nobody typed.
+    pub redraw: bool,
 }
 
 /// Logical ingress order, allocated under the same lock as synchronous enqueue.
@@ -288,8 +291,21 @@ impl EventLoopProxy {
     }
 
     fn duplicates_pending_input(&self, previous: &QueuedOverlayInput, input: &OverlayInput) -> bool {
-        previous.sequence.0 > self.budget.last_barrier_sequence.load(Ordering::Relaxed)
-            && previous.input.lock().unwrap_or_else(|err| err.into_inner()).as_ref() == Some(input)
+        if previous.sequence.0 <= self.budget.last_barrier_sequence.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut queued = previous.input.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(queued) = queued.as_mut().filter(|queued| {
+            queued.buffer == input.buffer
+                && queued.cwd == input.cwd
+                && queued.cursor == input.cursor
+                && queued.session_id == input.session_id
+        }) else {
+            return false;
+        };
+        // The merged input is a redraw only if both were.
+        queued.redraw &= input.redraw;
+        true
     }
 
     pub(crate) fn diagnostics(&self) -> EventQueueDiagnostics {
@@ -513,6 +529,7 @@ mod tests {
             cwd: "/tmp".into(),
             cursor: text.len() as u32,
             session_id: uuid::Uuid::nil(),
+            redraw: false,
         }
     }
 
@@ -681,7 +698,10 @@ mod tests {
         proxy
             .send_event(Event::WindowEvent {
                 window_id: crate::AUTOCOMPLETE_ID,
-                window_event: crate::event::WindowEvent::CaretPositionHook(crate::event::WindowPosition::Centered),
+                window_event: crate::event::WindowEvent::CaretPositionHook {
+                    position: crate::event::WindowPosition::Centered,
+                    source: crate::event::CaretSource::default(),
+                },
             })
             .unwrap();
         for _ in 0..ASYNC_EVENT_LIMIT {

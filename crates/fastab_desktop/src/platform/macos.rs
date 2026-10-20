@@ -389,6 +389,13 @@ fn xterm_retry_is_throttled(failed_at: Option<Instant>, now: Instant) -> bool {
     failed_at.is_some_and(|failed| now.saturating_duration_since(failed) < WINDOW_RECOVERY_BACKOFF)
 }
 
+fn same_frame(a: CGRect, b: CGRect) -> bool {
+    a.origin.x == b.origin.x
+        && a.origin.y == b.origin.y
+        && a.size.width == b.size.width
+        && a.size.height == b.size.height
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum XTermCacheUpdate {
     Retarget,
@@ -892,15 +899,24 @@ impl PlatformStateImpl {
                 return;
             }
             let terminal = Terminal::from_bundle_id(&app.bundle_id);
+            let accessibility_missing = !accessibility_is_enabled();
+            let mut sample_uncertain = false;
             let enabled = terminal.as_ref().is_some_and(|terminal| {
                 !fastab_settings::settings::get_bool_or(
                     format!("integrations.{}.disabled", terminal.internal_id()),
                     false,
                 ) && (prefers_ax_caret_for_app(&app)
                     || !terminal.supports_macos_input_method()
-                    || InputMethod::default().is_enabled().unwrap_or(false))
+                    || match InputMethod::default().read_is_enabled() {
+                        Ok(enabled) => enabled.unwrap_or(false),
+                        Err(err) => {
+                            warn!(%err, "Failed to read the input method state");
+                            sample_uncertain = true;
+                            false
+                        },
+                    })
             }) && !fastab_settings::settings::get_bool_or("autocomplete.disable", false)
-                && accessibility_is_enabled();
+                && !accessibility_missing;
             proxy
                 .send_event(Event::WindowEvent {
                     window_id: AUTOCOMPLETE_ID,
@@ -909,6 +925,8 @@ impl PlatformStateImpl {
                         cache_identity,
                         epoch,
                         enabled,
+                        accessibility_missing,
+                        sample_uncertain,
                     },
                 })
                 .ok();
@@ -987,6 +1005,42 @@ impl PlatformStateImpl {
             .map(|window| (window.pid, window.window_id))
     }
 
+    /// Whether a local caret read from window `window_id` of `app` may be
+    /// placed. Only a tracked window that AX still confirms as focused can
+    /// reject another one, and only when `app` owns the reported window: a
+    /// number that names no window of this app is no evidence, so it can never
+    /// hide the list for good. Without that, the sender's report is all there is.
+    pub(crate) fn local_caret_window_is_focused(&self, app: &ApplicationSpecifier, window_id: CGWindowID) -> bool {
+        let Some(tracked) = self
+            .focused_window
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|window| {
+                window.pid == app.pid && window.bundle_id == app.bundle_id && window.window_id != window_id
+            })
+            .cloned()
+        else {
+            return true;
+        };
+        if macos_utils::window_server::window_owner_pid(window_id) != Some(app.pid) {
+            return true;
+        }
+        // Do not hold the cache mutex across AX; this runs on the main thread.
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let tracked_is_focused = UIElement::application(tracked.pid)
+            .focused_window_before(deadline)
+            .is_ok_and(|focused| focused == tracked.ui_element);
+        if tracked_is_focused {
+            debug!(
+                reported = window_id,
+                tracked = tracked.window_id,
+                "Dropping a local caret from a window that is not focused"
+            );
+        }
+        !tracked_is_focused
+    }
+
     pub(crate) fn cached_window_is_current(&self, app: &ApplicationSpecifier) -> bool {
         let cached = self
             .focused_window
@@ -998,6 +1052,38 @@ impl PlatformStateImpl {
         // A failed old discovery need not invalidate a newer cache that AX can
         // positively identify now. Do not hold the cache mutex across AX.
         cached.is_some_and(|window| window.is_current_focused_window() == Ok(true))
+    }
+
+    /// VS Code / Cursor / Windsurf re-post focus for the helper textarea that
+    /// already has it, e.g. when the overlay window appears. That is not a pane
+    /// switch. The tracked caret element, or a helper textarea at its frame in
+    /// the same window while the tracked one still holds focus, keeps the pane
+    /// and its completion session. Two terminal tabs can put their textareas at
+    /// the same frame; only the tab the user left loses focus.
+    pub(crate) fn focused_element_keeps_x_term_pane(&self, app: &ApplicationSpecifier, element: &UIElement) -> bool {
+        if !should_refresh_x_term_cache(&app.bundle_id) {
+            return false;
+        }
+        let tracked = self.focused_window.lock().unwrap().as_ref().and_then(|window| {
+            (window.pid == app.pid && window.bundle_id == app.bundle_id)
+                .then(|| Some((window.window_id, window.x_term_tree_cache.as_ref()?.first()?.clone())))
+                .flatten()
+        });
+        let Some((window_id, leaf)) = tracked else {
+            return false;
+        };
+        if leaf == *element {
+            return true;
+        }
+        // Frames first: a real pane switch fails here, before repeating the
+        // window and helper queries the platform handler is about to make.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        matches!(
+            (element.frame_before(deadline), leaf.frame_before(deadline)),
+            (Ok(focused), Ok(tracked)) if same_frame(focused, tracked)
+        ) && element.window_id_before(deadline).is_ok_and(|id| id == window_id)
+            && element.is_xterm_helper_textarea_before(deadline).unwrap_or(false)
+            && leaf.is_xterm_helper_textarea_before(deadline).unwrap_or(false)
     }
 
     pub(crate) fn caret_epoch(&self) -> u64 {
@@ -1514,6 +1600,42 @@ mod tests {
             x_term_cache_update_for_focused_element(true, None),
             XTermCacheUpdate::Invalidate
         );
+    }
+
+    #[test]
+    fn a_reposted_focus_on_the_tracked_caret_keeps_the_xterm_pane() {
+        let (proxy, _events) = crate::event_loop::channel();
+        let state = super::PlatformStateImpl::new(proxy);
+        let pid = std::process::id() as i32;
+        let app = ApplicationSpecifier {
+            pid,
+            bundle_id: "com.microsoft.VSCode".into(),
+        };
+        // `AXUIElementCreateApplication` needs no Accessibility grant.
+        let leaf = super::UIElement::application(pid);
+        assert!(!state.focused_element_keeps_x_term_pane(&app, &leaf));
+        *state.focused_window.lock().unwrap() = Some(super::PlatformWindowImpl {
+            window_id: 7,
+            ui_element: leaf.clone(),
+            x_term_tree_cache: Some(vec![leaf.clone()]),
+            x_term_last_failure: None,
+            bundle_id: app.bundle_id.clone(),
+            pid,
+        });
+        assert!(state.focused_element_keeps_x_term_pane(&app, &leaf));
+        let otty = ApplicationSpecifier {
+            pid,
+            bundle_id: "io.appmakes.otty".into(),
+        };
+        assert!(!state.focused_element_keeps_x_term_pane(&otty, &leaf));
+        state
+            .focused_window
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .invalidate_x_term_cache();
+        assert!(!state.focused_element_keeps_x_term_pane(&app, &leaf));
     }
 
     #[test]

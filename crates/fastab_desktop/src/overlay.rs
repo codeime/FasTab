@@ -50,6 +50,34 @@ pub fn gpui_overlay_enabled() -> bool {
     true
 }
 
+/// Live TCC state: the cached flag behind `ReloadAccessibility` can lag.
+fn accessibility_grant_missing() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !macos_utils::accessibility::accessibility_is_enabled()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// IME-only terminals keep every split in one AX element, so a new pane's
+/// first prompt is the only sign the user moved. Elsewhere a pane switch
+/// already arrives as a focus change.
+fn frontmost_reports_pane_switches() -> bool {
+    // Tests must not depend on whichever app is frontmost on the host.
+    #[cfg(all(target_os = "macos", not(test)))]
+    {
+        macos_utils::window_server::frontmost_application()
+            .is_none_or(|app| crate::platform::hide_overlay_on_element_change(&app.bundle_id))
+    }
+    #[cfg(any(not(target_os = "macos"), test))]
+    {
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LastInput {
     buffer: String,
@@ -124,6 +152,13 @@ pub struct OverlayController {
     /// when its result arrives too late to be displayed.
     loading_owner: Arc<AtomicU64>,
     enabled: bool,
+    /// `enabled` is false because the Accessibility grant was missing, which a
+    /// keystroke after the grant may undo before its notification arrives.
+    disabled_by_accessibility: bool,
+    /// The platform's sample turned completion off for a reason other than the
+    /// grant. Only a confirmed sample for the frontmost app survives a keystroke.
+    #[cfg(target_os = "macos")]
+    terminal_disable: Option<TerminalDisable>,
     /// Last applied saved preference, separate from the temporary shortcut mode.
     configured_fuzzy_search: bool,
     figterm_state: Arc<FigtermState>,
@@ -139,6 +174,17 @@ pub struct OverlayController {
     /// follow-ups after the first displayed rows have consumed its Tab.
     explicit_show_pending: bool,
     show_token: u64,
+    /// Input of the latest request, keyed by its generation.
+    request_input: Option<(u64, LastInput)>,
+    /// Input the displayed rows were computed for. Typing on while a request
+    /// is in flight leaves them on screen, but their search term no longer
+    /// matches the buffer, so inserting from them would garble the token.
+    rows_input: Option<LastInput>,
+    /// An insert action that arrived while the rows were stale. It belongs to
+    /// one exact input and replays on that input's rows, never a newer one.
+    /// The raw key fterm handed over may go back to the shell when those rows
+    /// turn out to have nothing to act on.
+    pending_insert_action: Option<(String, LastInput, Option<String>)>,
     /// Buffer we expect the shell to report back after our own insertion.
     /// Stands in for the legacy `justInserted` flag, which kept the paste
     /// heuristic from mistaking an accepted completion for a paste.
@@ -225,6 +271,7 @@ impl OverlayController {
                 let _ = disable_proxy.send_event(Event::AutocompleteAction {
                     action: "relayoutOverlay".into(),
                     session_id,
+                    key: None,
                 });
             }));
         });
@@ -239,6 +286,7 @@ impl OverlayController {
         });
         let handle = Arc::new(Mutex::new(None));
         let configured_fuzzy_search = state.read(cx).fuzzy_search;
+        let accessibility_enabled = PlatformState::accessibility_is_enabled().unwrap_or(true);
         let mut controller = Self {
             state,
             handle,
@@ -249,7 +297,10 @@ impl OverlayController {
             loading_owner: Arc::new(AtomicU64::new(NO_LOADING_OWNER)),
             enabled: gpui_overlay_enabled()
                 && !fastab_settings::settings::get_bool_or("autocomplete.disable", false)
-                && PlatformState::accessibility_is_enabled().unwrap_or(true),
+                && accessibility_enabled,
+            disabled_by_accessibility: !accessibility_enabled,
+            #[cfg(target_os = "macos")]
+            terminal_disable: None,
             configured_fuzzy_search,
             figterm_state,
             platform_state,
@@ -260,6 +311,9 @@ impl OverlayController {
             debounce_task: None,
             explicit_show_pending: false,
             show_token: 0,
+            request_input: None,
+            rows_input: None,
+            pending_insert_action: None,
             self_insertion: Arc::new(Mutex::new(None)),
             proxy,
             jev: ai::JevRuntime::default(),
@@ -408,6 +462,10 @@ impl OverlayController {
     fn retire_completion(&mut self) {
         self.debounce_task = None;
         self.explicit_show_pending = false;
+        self.pending_insert_action = None;
+        // Each holds a full copy of the buffer; a long command must not outlive its list.
+        self.request_input = None;
+        self.rows_input = None;
         self.completion_display = CompletionDisplayState::Idle;
         if let Some(session) = self.current_session() {
             self.notify_input_ended(session);
@@ -415,8 +473,54 @@ impl OverlayController {
     }
 
     pub fn set_enabled(&mut self, enabled: bool, cx: &mut App) {
+        self.set_enabled_sampled(enabled, None, cx);
+    }
+
+    /// `enabled` and `accessibility_missing` were sampled together for `app`; a
+    /// later live read could disagree with the reason that state was computed.
+    /// `sample_uncertain` means part of that state could not be read.
+    #[cfg(target_os = "macos")]
+    pub fn set_terminal_enabled(
+        &mut self,
+        app: macos_utils::window_server::ApplicationSpecifier,
+        enabled: bool,
+        accessibility_missing: bool,
+        sample_uncertain: bool,
+        cx: &mut App,
+    ) {
+        self.set_enabled_sampled(enabled, Some(accessibility_missing), cx);
+        self.terminal_disable = (!self.enabled && !self.disabled_by_accessibility).then(|| {
+            if sample_uncertain {
+                TerminalDisable::Unconfirmed
+            } else {
+                TerminalDisable::Confirmed(app)
+            }
+        });
+    }
+
+    fn terminal_disable_is_stale(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            disable_sample_is_stale(
+                self.terminal_disable.as_ref(),
+                macos_utils::window_server::frontmost_application,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    fn set_enabled_sampled(&mut self, enabled: bool, accessibility_missing: Option<bool>, cx: &mut App) {
         let was_enabled = self.enabled;
         self.enabled = enabled && gpui_overlay_enabled();
+        self.disabled_by_accessibility =
+            !self.enabled && accessibility_missing.unwrap_or_else(accessibility_grant_missing);
+        #[cfg(target_os = "macos")]
+        {
+            self.terminal_disable = None;
+        }
         if !self.enabled {
             self.dismiss(cx);
         } else if !was_enabled
@@ -843,6 +947,30 @@ impl OverlayController {
         });
     }
 
+    /// A deferred insert found nothing to insert, so a Tab fterm handed over
+    /// goes to the shell after all, unless the line has moved on since. The
+    /// buffer check can miss bytes typed a few milliseconds ago, so only a key
+    /// that is harmless after them returns: a late Enter would run the newer,
+    /// half-typed line.
+    fn return_intercepted_key(&self, input: &LastInput, key: Option<String>) {
+        let Some(key) = key.filter(|key| key == "\t") else {
+            return;
+        };
+        let _ = self.figterm_state.with(&input.session_id, |session| {
+            if session.edit_buffer.text != input.buffer || session.edit_buffer.cursor != i64::from(input.cursor) {
+                return;
+            }
+            let _ = session.send(FigtermCommand::InsertText {
+                insertion: Some(key),
+                deletion: Some(0),
+                offset: None,
+                immediate: Some(false),
+                insertion_buffer: None,
+                insert_during_command: None,
+            });
+        });
+    }
+
     fn accept_single_show_result(&self, result: &CompleteResult) -> bool {
         !result.pending_generators
             && self
@@ -900,6 +1028,15 @@ impl OverlayController {
         );
     }
 
+    /// Another session owns the overlay, and the frontmost terminal reports
+    /// its own pane switches, so input from `session_id` that carries nothing
+    /// new must not take over. Not even right after a focus change: every pane
+    /// a resize repaints reports at once, and the caret would come from the
+    /// focused one whichever won. Typing there is what switches sessions.
+    pub(crate) fn is_background_session(&self, session_id: Uuid) -> bool {
+        self.current_session().is_some_and(|current| current != session_id) && frontmost_reports_pane_switches()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn complete_buffer_inner(
         &mut self,
@@ -915,6 +1052,12 @@ impl OverlayController {
             force,
             loading_threshold,
         } = options;
+        if buffer.trim().is_empty() && self.is_background_session(session_id) {
+            // A background tab's fresh prompt has nothing to show. Switching to
+            // it would only dismiss the list the user is typing into.
+            self.end_input(session_id, cx);
+            return;
+        }
         if self.current_session().is_some_and(|current| current != session_id) {
             self.show_intent = None;
             self.retire_completion();
@@ -947,6 +1090,13 @@ impl OverlayController {
             self.show_intent = None;
             self.hide_until_shown(cx);
         }
+        if self
+            .pending_insert_action
+            .as_ref()
+            .is_some_and(|(_, input, _)| *input != next_input)
+        {
+            self.pending_insert_action = None;
+        }
         let (duplicate_input, previous_input) = {
             let mut last_input = self.last_input.lock().unwrap_or_else(|err| err.into_inner());
             if last_input.as_ref() != Some(&next_input) {
@@ -966,7 +1116,11 @@ impl OverlayController {
         let terminal_disabled = self.platform_state.inner().terminal_completion_disabled();
         #[cfg(not(target_os = "macos"))]
         let terminal_disabled = false;
-        if !self.enabled && !terminal_disabled {
+        // A missing grant, a sample taken for an app that is no longer
+        // frontmost, or one whose state could not be read is undone here. A
+        // terminal turned off for its own reason (e.g. an IME terminal without
+        // the input method) stays off.
+        if !self.enabled && !terminal_disabled && (self.disabled_by_accessibility || self.terminal_disable_is_stale()) {
             #[cfg(target_os = "macos")]
             {
                 // AX grant can land while the cached `enabled` flag is still false (notification
@@ -976,6 +1130,8 @@ impl OverlayController {
                     && macos_utils::accessibility::accessibility_is_enabled()
                 {
                     self.enabled = true;
+                    self.disabled_by_accessibility = false;
+                    self.terminal_disable = None;
                 }
             }
         }
@@ -1063,6 +1219,15 @@ impl OverlayController {
         }
 
         let generation = self.bump_generation();
+        self.request_input = Some((
+            generation,
+            LastInput {
+                buffer: buffer.clone(),
+                cwd: cwd.clone(),
+                cursor,
+                session_id,
+            },
+        ));
         self.completion_display = CompletionDisplayState::Requested;
         self.take_loading_owner();
         self.clear_stale_loading(cx);
@@ -1208,6 +1373,20 @@ impl OverlayController {
             }
             return;
         }
+        self.rows_input = self
+            .request_input
+            .as_ref()
+            .filter(|(requested, _)| *requested == generation)
+            .map(|(_, input)| input.clone());
+        // A current result answers the latest request. An action for any other
+        // input will never see its own rows.
+        if self
+            .pending_insert_action
+            .as_ref()
+            .is_some_and(|(_, input, _)| self.rows_input.as_ref() != Some(input))
+        {
+            self.pending_insert_action = None;
+        }
         if result.is_err() {
             self.cancel_show();
             // A failed attempt produced nothing to show, so the recorded input
@@ -1258,6 +1437,7 @@ impl OverlayController {
             self.explicit_show_pending = false;
         }
         if accept_single {
+            self.pending_insert_action = None;
             self.state.update(cx, |overlay, _| overlay.suppress_until_shown = false);
             self.insert_selected(false, &self.figterm_state.clone(), cx);
             return;
@@ -1275,6 +1455,9 @@ impl OverlayController {
         if self.state.read(cx).suppress_until_shown || (!self.state.read(cx).visible && pending.is_none()) {
             // Empty final results have no display consumer. An initially
             // empty pending result still belongs to the active demand.
+            if let Some((_, input, key)) = self.pending_insert_action.take() {
+                self.return_intercepted_key(&input, key);
+            }
             self.retire_completion();
             self.cancel_jev(cx);
             return;
@@ -1282,6 +1465,19 @@ impl OverlayController {
         self.schedule_jev(ai_candidates, cx);
         if let Some(delay_ms) = pending {
             self.schedule_debounce(delay_ms, cx);
+        }
+        // Empty rows with generators still pending: the follow-up for the same
+        // input may have something to act on.
+        if pending.is_none() || !self.state.read(cx).items.is_empty() {
+            if let Some((action, input, key)) = self.pending_insert_action.take() {
+                if self.state.read(cx).items.is_empty() {
+                    // Only an argument hint is left: nothing to insert.
+                    self.return_intercepted_key(&input, key);
+                } else {
+                    let figterm_state = self.figterm_state.clone();
+                    self.handle_action(&action, session_id, &figterm_state, cx);
+                }
+            }
         }
     }
 
@@ -1355,6 +1551,18 @@ impl OverlayController {
     }
 
     pub fn handle_action(&mut self, action: &str, action_session_id: Uuid, figterm_state: &FigtermState, cx: &mut App) {
+        self.handle_key_action(action, None, action_session_id, figterm_state, cx);
+    }
+
+    /// `key` is the raw key fterm intercepted for `action`, if it came from one.
+    pub fn handle_key_action(
+        &mut self,
+        action: &str,
+        key: Option<String>,
+        action_session_id: Uuid,
+        figterm_state: &FigtermState,
+        cx: &mut App,
+    ) {
         if !action_session_is_current(self.current_session(), action_session_id) {
             debug!(%action_session_id, current_session = ?self.current_session(), action, "ignoring stale overlay action");
             return;
@@ -1376,6 +1584,16 @@ impl OverlayController {
         if !action_is_allowed(action, visible, loading, has_items) {
             debug!(action, loading, "ignoring overlay action without an actionable list");
             return;
+        }
+        if action_inserts_from_rows(action) {
+            let current_input = self.last_input.lock().unwrap_or_else(|err| err.into_inner()).clone();
+            if let Some(current_input) = current_input
+                && rows_are_stale(self.rows_input.as_ref(), &current_input)
+            {
+                debug!(action, "deferring insert until rows for the current input arrive");
+                self.pending_insert_action = Some((action.to_string(), current_input, key));
+                return;
+            }
         }
         if matches!(
             action,
@@ -3007,6 +3225,44 @@ fn action_requires_visible(action: &str) -> bool {
     ) || action.starts_with("selectSuggestion")
 }
 
+fn action_inserts_from_rows(action: &str) -> bool {
+    matches!(
+        action,
+        "insertSelected"
+            | "insertSelectedAndExecute"
+            | "insertCommonPrefix"
+            | "insertCommonPrefixOrInsertSelected"
+            | "insertCommonPrefixOrNavigateDown"
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalDisable {
+    /// The app's own state, e.g. an IME terminal without the input method.
+    Confirmed(macos_utils::window_server::ApplicationSpecifier),
+    /// Part of that state could not be read, so the disable is a guess.
+    Unconfirmed,
+}
+
+/// An unknown frontmost app cannot confirm the sample either.
+#[cfg(target_os = "macos")]
+fn disable_sample_is_stale(
+    disable: Option<&TerminalDisable>,
+    frontmost: impl FnOnce() -> Option<macos_utils::window_server::ApplicationSpecifier>,
+) -> bool {
+    match disable {
+        None => false,
+        Some(TerminalDisable::Unconfirmed) => true,
+        Some(TerminalDisable::Confirmed(app)) => frontmost().is_none_or(|frontmost| frontmost != *app),
+    }
+}
+
+/// Rows whose request input is unknown keep the previous behaviour.
+fn rows_are_stale(rows_input: Option<&LastInput>, current_input: &LastInput) -> bool {
+    rows_input.is_some_and(|rows| rows != current_input)
+}
+
 fn action_is_allowed(action: &str, visible: bool, loading: bool, has_items: bool) -> bool {
     !action_requires_visible(action) || (visible && (!loading || has_items))
 }
@@ -3382,6 +3638,7 @@ mod tests {
             cwd: String::new(),
             cursor: text.len() as u32,
             session_id,
+            redraw: false,
         };
         cx.update(|cx| {
             overlay.complete_buffer("git ".into(), String::new(), 4, old_session, sessions.clone(), cx);
@@ -3468,6 +3725,83 @@ mod tests {
                     ));
                 });
             });
+    }
+
+    #[gpui::test]
+    fn a_background_redraw_of_an_unchanged_line_does_not_take_over(cx: &mut gpui::TestAppContext) {
+        use crate::event_loop::OverlayInput;
+        use crate::gpui_host::dispatch_overlay_input;
+
+        let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+        let specs = tempfile::tempdir().unwrap();
+        let engine = EngineClient::spawn(specs.path().to_path_buf()).unwrap();
+        let (proxy, events) = crate::event_loop::channel();
+        let sessions = Arc::new(FigtermState::new());
+        let platform = Arc::new(PlatformState::new(proxy.clone()));
+        let mut overlay = cx.update(|cx| {
+            let mut overlay =
+                OverlayController::start(cx, engine, proxy.clone(), sessions.clone(), platform.clone()).unwrap();
+            overlay.enabled = true;
+            overlay
+        });
+        let typing = Uuid::new_v4();
+        let background = Uuid::new_v4();
+        cx.update(|cx| {
+            overlay.complete_buffer("git ".into(), String::new(), 4, typing, sessions.clone(), cx);
+        });
+        for event in events.try_iter() {
+            assert!(matches!(event, Event::JevContextChanged));
+        }
+
+        let dispatch = |overlay: &mut OverlayController, text: &str, session_id, redraw| {
+            futures::executor::block_on(proxy.send_overlay_input_async(OverlayInput {
+                buffer: text.into(),
+                cwd: String::new(),
+                cursor: text.len() as u32,
+                session_id,
+                redraw,
+            }))
+            .unwrap();
+            loop {
+                let mut needs_caret = None;
+                futures::executor::block_on(events.recv_queued())
+                    .unwrap()
+                    .dispatch(|event, _| {
+                        if let Event::GpuiOverlayInput(input) = event {
+                            needs_caret =
+                                Some(cx.update(|cx| dispatch_overlay_input(&proxy, overlay, &input, &sessions, cx)));
+                        }
+                    });
+                if let Some(needs_caret) = needs_caret {
+                    return needs_caret;
+                }
+            }
+        };
+
+        assert!(!dispatch(&mut overlay, "cargo b", background, true));
+        assert_eq!(overlay.current_session(), Some(typing));
+        assert_eq!(overlay.last_input.lock().unwrap().as_ref().unwrap().buffer, "git ");
+        // The current session's own redraw still completes.
+        assert!(dispatch(&mut overlay, "git ", typing, true));
+        assert_eq!(overlay.current_session(), Some(typing));
+        // Typing in the background tab is a real switch.
+        assert!(dispatch(&mut overlay, "cargo bu", background, false));
+        assert_eq!(overlay.current_session(), Some(background));
+        assert_eq!(overlay.last_input.lock().unwrap().as_ref().unwrap().buffer, "cargo bu");
+
+        // Neither an ended input nor a focus change lets a repaint take over:
+        // after a resize every pane repaints, and the one that wins would show
+        // its list at the focused pane's caret.
+        cx.update(|cx| overlay.end_input(background, cx));
+        assert!(!dispatch(&mut overlay, "git ", typing, true));
+        assert_eq!(overlay.current_session(), Some(background));
+        cx.update(|cx| overlay.invalidate_caret_for_focus_change(cx));
+        assert!(!dispatch(&mut overlay, "git ", typing, true));
+        assert_eq!(overlay.current_session(), Some(background));
+        // The first keystroke in the focused pane switches to it.
+        assert!(dispatch(&mut overlay, "git s", typing, false));
+        assert_eq!(overlay.current_session(), Some(typing));
+        assert_eq!(overlay.last_input.lock().unwrap().as_ref().unwrap().buffer, "git s");
     }
 
     #[gpui::test]
@@ -3748,6 +4082,33 @@ mod tests {
         });
         wait_for_release();
         assert_eq!(snapshot().requests.submitted, 6);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_disable_sampled_for_the_frontmost_app_survives_a_keystroke() {
+        use super::TerminalDisable::{Confirmed, Unconfirmed};
+        use macos_utils::window_server::ApplicationSpecifier;
+        let app = |pid, bundle_id: &str| ApplicationSpecifier {
+            pid,
+            bundle_id: bundle_id.to_owned(),
+        };
+        let ghostty = app(42, "com.mitchellh.ghostty");
+        let stale = |disable, frontmost: Option<ApplicationSpecifier>| {
+            super::disable_sample_is_stale(Some(&disable), || frontmost)
+        };
+        // An IME terminal without the input method stays off while it is frontmost.
+        assert!(!stale(Confirmed(ghostty.clone()), Some(ghostty.clone())));
+        // A sample taken for Safari, or an older Ghostty process, no longer applies.
+        assert!(stale(Confirmed(app(7, "com.apple.Safari")), Some(ghostty.clone())));
+        assert!(stale(
+            Confirmed(app(41, "com.mitchellh.ghostty")),
+            Some(ghostty.clone())
+        ));
+        assert!(stale(Confirmed(ghostty.clone()), None));
+        // A disable guessed from an unreadable input method state never sticks.
+        assert!(stale(Unconfirmed, Some(ghostty.clone())));
+        assert!(!super::disable_sample_is_stale(None, || unreachable!()));
     }
 
     #[test]

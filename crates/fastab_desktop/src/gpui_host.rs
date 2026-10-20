@@ -27,15 +27,47 @@ use fastab_os_shim::Context;
 use fastab_remote_ipc::figterm::FigtermState;
 
 #[cfg(target_os = "macos")]
-fn accept_local_caret_position(position: crate::event::WindowPosition, prefers_ax: bool) -> bool {
-    !prefers_ax
-        || !matches!(
-            position,
-            crate::event::WindowPosition::RelativeToCaret {
-                origin: fastab_proto::local::caret_position_hook::Origin::BottomLeft,
-                ..
-            }
-        )
+/// Only the IME sends `BottomLeft`, and it serves IME terminals alone. An older
+/// IME's frame carries no source, so one queued before focus moved to an
+/// AX-caret terminal or to another app would place the list over the wrong
+/// window. `ime_terminal` is `None` when the frontmost app is unknown.
+fn accept_local_caret_position(
+    position: crate::event::WindowPosition,
+    prefers_ax: bool,
+    ime_terminal: Option<bool>,
+) -> bool {
+    !matches!(
+        position,
+        crate::event::WindowPosition::RelativeToCaret {
+            origin: fastab_proto::local::caret_position_hook::Origin::BottomLeft,
+            ..
+        }
+    ) || (!prefers_ax && ime_terminal != Some(false))
+}
+
+#[cfg(target_os = "macos")]
+/// A caret queued before focus moved to another window of the same app, or to
+/// another app, names the client it came from. `window_is_focused` decides a
+/// reported window against the tracked one; an unknown frontmost app or a
+/// source without that field changes nothing.
+fn local_caret_source_is_frontmost(
+    source: &crate::event::CaretSource,
+    frontmost: Option<&macos_utils::window_server::ApplicationSpecifier>,
+    window_is_focused: impl FnOnce(&macos_utils::window_server::ApplicationSpecifier, u32) -> bool,
+) -> bool {
+    let Some(app) = frontmost else {
+        return true;
+    };
+    if source
+        .bundle_id
+        .as_deref()
+        .is_some_and(|bundle_id| bundle_id != app.bundle_id)
+    {
+        return false;
+    }
+    source
+        .window_id
+        .is_none_or(|window_id| window_is_focused(app, window_id))
 }
 
 /// The caller must first validate the native focus event against the current
@@ -62,6 +94,10 @@ pub(crate) fn dispatch_overlay_input(
     match proxy.take_overlay_input(input) {
         Some(OverlayInputDispatch::Complete(input)) => {
             let needs_caret = !input.buffer.trim().is_empty();
+            if needs_caret && input.redraw && overlay.is_background_session(input.session_id) {
+                // A background tab repainting its unchanged command line.
+                return false;
+            }
             overlay.complete_buffer(
                 input.buffer,
                 input.cwd,
@@ -263,6 +299,15 @@ impl DesktopHost {
                         {
                             return;
                         }
+                        // Same pane: the platform would bump the caret epoch and
+                        // send an empty caret, which hides the list just the same.
+                        if self
+                            .platform_state
+                            .inner()
+                            .focused_element_keeps_x_term_pane(app, element)
+                        {
+                            return;
+                        }
                         invalidate_overlay_input_focus(&self.proxy, &mut self.overlay, sequence, cx);
                     }
                 }
@@ -340,8 +385,13 @@ impl DesktopHost {
             } => {
                 self.overlay.retry_layout(generation, token, attempt, cx);
             },
-            Event::AutocompleteAction { action, session_id } => {
-                self.overlay.handle_action(&action, session_id, &self.figterm_state, cx);
+            Event::AutocompleteAction {
+                action,
+                session_id,
+                key,
+            } => {
+                self.overlay
+                    .handle_key_action(&action, key, session_id, &self.figterm_state, cx);
             },
             Event::AutocompleteClick {
                 click,
@@ -372,23 +422,40 @@ impl DesktopHost {
                     cache_identity,
                     epoch,
                     enabled,
+                    accessibility_missing,
+                    sample_uncertain,
                 } => {
                     if macos_utils::window_server::is_frontmost_application(&app)
                         && self.platform_state.inner().caret_cache_identity() == cache_identity
                         && self.platform_state.inner().enabled_epoch() == epoch
                     {
-                        self.overlay.set_enabled(enabled, cx);
+                        self.overlay
+                            .set_terminal_enabled(app, enabled, accessibility_missing, sample_uncertain, cx);
                     }
                 },
-                WindowEvent::CaretPositionHook(position) => {
+                WindowEvent::CaretPositionHook { position, source } => {
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = source;
                     #[cfg(target_os = "macos")]
                     {
-                        let prefers_ax = macos_utils::window_server::frontmost_application()
-                            .is_some_and(|app| crate::platform::prefers_ax_caret_for_app(&app));
+                        let frontmost = macos_utils::window_server::frontmost_application();
+                        let prefers_ax = frontmost
+                            .as_ref()
+                            .is_some_and(crate::platform::prefers_ax_caret_for_app);
+                        let ime_terminal = frontmost.as_ref().map(|app| {
+                            fastab_util::Terminal::from_bundle_id(&app.bundle_id)
+                                .is_some_and(|terminal| terminal.supports_macos_input_method())
+                        });
                         // The IME wire contract always uses BottomLeft. Keep the
                         // local hook distinct so native AX geometry is unaffected,
                         // including a late IME reply queued before focus changed.
-                        if !accept_local_caret_position(position, prefers_ax) {
+                        if !accept_local_caret_position(position, prefers_ax, ime_terminal)
+                            || !local_caret_source_is_frontmost(&source, frontmost.as_ref(), |app, window_id| {
+                                self.platform_state
+                                    .inner()
+                                    .local_caret_window_is_focused(app, window_id)
+                            })
+                        {
                             return;
                         }
                     }
@@ -683,9 +750,46 @@ mod tests {
             caret_size: LogicalSize::new(0.0, 18.0).into(),
             origin,
         };
-        assert!(!super::accept_local_caret_position(position(Origin::BottomLeft), true));
-        assert!(super::accept_local_caret_position(position(Origin::TopLeft), true));
-        assert!(super::accept_local_caret_position(position(Origin::BottomLeft), false));
+        let accept = |origin, prefers_ax, ime_terminal| {
+            super::accept_local_caret_position(position(origin), prefers_ax, ime_terminal)
+        };
+        assert!(!accept(Origin::BottomLeft, true, Some(true)));
+        assert!(accept(Origin::TopLeft, true, Some(true)));
+        assert!(accept(Origin::BottomLeft, false, Some(true)));
+        // A frame queued in Ghostty must not land on iTerm2 or Finder.
+        assert!(!accept(Origin::BottomLeft, false, Some(false)));
+        assert!(accept(Origin::TopLeft, false, Some(false)));
+        assert!(accept(Origin::BottomLeft, false, None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_queued_ime_caret_from_another_window_or_app_is_rejected() {
+        use crate::event::CaretSource;
+        use macos_utils::window_server::ApplicationSpecifier;
+        let ghostty = ApplicationSpecifier {
+            pid: 42,
+            bundle_id: "com.mitchellh.ghostty".to_owned(),
+        };
+        let source = |bundle_id: Option<&str>, window_id| CaretSource {
+            bundle_id: bundle_id.map(str::to_owned),
+            window_id,
+        };
+        // Window 7 is focused.
+        let accept = |source: &CaretSource, frontmost| {
+            super::local_caret_source_is_frontmost(source, frontmost, |app, window_id| {
+                assert_eq!(app.pid, 42);
+                window_id == 7
+            })
+        };
+
+        assert!(accept(&source(Some("com.mitchellh.ghostty"), Some(7)), Some(&ghostty)));
+        assert!(!accept(&source(Some("com.mitchellh.ghostty"), Some(8)), Some(&ghostty)));
+        assert!(!accept(&source(Some("net.kovidgoyal.kitty"), Some(7)), Some(&ghostty)));
+        assert!(accept(&source(Some("com.mitchellh.ghostty"), None), Some(&ghostty)));
+        // Frames from an older IME carry no source.
+        assert!(accept(&CaretSource::default(), Some(&ghostty)));
+        assert!(accept(&source(Some("net.kovidgoyal.kitty"), Some(8)), None));
     }
 
     #[test]

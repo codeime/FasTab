@@ -104,6 +104,8 @@ pub enum Event {
     AutocompleteAction {
         action: String,
         session_id: uuid::Uuid,
+        /// The raw key fterm handed over, so it can still reach the shell.
+        key: Option<String>,
     },
     /// A mouse click carries the exact row that was clicked. Keeping this in
     /// the event avoids a shared pending slot being overwritten by a second
@@ -129,7 +131,10 @@ impl Event {
                 window_event,
             } => cow_capacity(&window_id.0).saturating_add(window_event.payload_bytes()),
             Self::WindowEventAll { window_event } => window_event.payload_bytes(),
-            Self::AutocompleteAction { action, .. } | Self::MenuClicked(action) => action.capacity(),
+            Self::AutocompleteAction { action, key, .. } => action
+                .capacity()
+                .saturating_add(key.as_ref().map_or(0, String::capacity)),
+            Self::MenuClicked(action) => action.capacity(),
             Self::GpuiOverlayComplete {
                 result: Ok(result),
                 cwd,
@@ -287,6 +292,14 @@ pub enum WindowPosition {
     },
 }
 
+/// The client a local caret hook was read from, when its sender reported it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaretSource {
+    pub bundle_id: Option<String>,
+    /// `CGWindowID` of the client's window.
+    pub window_id: Option<u32>,
+}
+
 pub struct WindowGeometryResult {
     pub is_above: bool,
     pub is_clipped: bool,
@@ -302,13 +315,20 @@ pub enum WindowEvent {
     /// Sets the theme of the window (light, dark, or system if None)
     SetTheme(Option<Theme>),
     /// A local caret hook, kept distinct from native AX geometry until consumed.
-    CaretPositionHook(WindowPosition),
+    CaretPositionHook {
+        position: WindowPosition,
+        source: CaretSource,
+    },
     #[cfg(target_os = "macos")]
     TerminalEnabled {
         app: macos_utils::window_server::ApplicationSpecifier,
         cache_identity: Option<(i32, u32)>,
         epoch: u64,
         enabled: bool,
+        /// Sampled together with `enabled`.
+        accessibility_missing: bool,
+        /// The input method state could not be read, so `enabled` is a guess.
+        sample_uncertain: bool,
     },
     #[cfg(target_os = "macos")]
     TerminalCaret {
@@ -357,6 +377,7 @@ impl WindowEvent {
         match self {
             Self::Emit { payload, .. } => cow_capacity(payload),
             Self::NavigateRelative { path } => cow_capacity(path),
+            Self::CaretPositionHook { source, .. } => source.bundle_id.as_ref().map_or(0, String::capacity),
             Self::Event { event_name, payload } => {
                 cow_capacity(event_name).saturating_add(payload.as_ref().map_or(0, cow_capacity))
             },

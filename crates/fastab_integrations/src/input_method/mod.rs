@@ -867,8 +867,12 @@ impl InputMethod {
     }
 
     pub fn is_enabled(&self) -> Option<bool> {
-        let key = self.input_method_is_enabled_key();
-        state::get_bool(&key).ok().flatten()
+        self.read_is_enabled().ok().flatten()
+    }
+
+    /// Keeps a failed state read apart from a key that was never set.
+    pub fn read_is_enabled(&self) -> fastab_settings::Result<Option<bool>> {
+        state::get_bool(self.input_method_is_enabled_key())
     }
 
     fn set_is_enabled(&self, enabled: bool) {

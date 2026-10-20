@@ -962,3 +962,185 @@ fn explicit_partial_show_survives_argument_change_and_retires_at_boundaries(cx: 
         assert!(insertions(&mut commands).is_empty(), "explicit Show is display-only");
     });
 }
+
+#[gpui::test]
+fn insert_on_rows_for_an_older_input_waits_for_the_current_rows(cx: &mut gpui::TestAppContext) {
+    let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+    let (mut controller, figterm, mut commands, session) = show_outbox_fixture(cx, "git ch");
+    let input = |buffer: &str| LastInput {
+        buffer: buffer.into(),
+        cwd: String::new(),
+        cursor: buffer.len() as u32,
+        session_id: session,
+    };
+    let result = |search: &str| CompleteResult {
+        suggestions: vec![fastab_engine::Suggestion {
+            name: "checkout".into(),
+            kind: "subcommand".into(),
+            ..Default::default()
+        }],
+        search_term: search.into(),
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        for next in ["git chec", "git che"] {
+            // Rows for `ch` stay on screen while `git che` is in flight.
+            controller.state.update(cx, |state, _| {
+                state.suppress_until_shown = false;
+                state.set_suggestions(vec![row("checkout", "subcommand")], "ch".into());
+            });
+            controller.rows_input = Some(input("git ch"));
+            *controller.last_input.lock().unwrap() = Some(input("git che"));
+            controller.handle_action("insertSelected", session, &figterm, cx);
+            assert!(insertions(&mut commands).is_empty(), "`eckout` would garble `che`");
+            assert_eq!(controller.pending_insert_action.as_ref().unwrap().1, input("git che"));
+            let generation = controller.generation.load(Ordering::Relaxed);
+            controller.request_input = Some((generation, input(next)));
+            if next == "git chec" {
+                // Typing on retires the action: it never lands on newer rows.
+                controller.apply_completion(generation, Ok(result("chec")), session, "", cx);
+                assert!(controller.pending_insert_action.is_none());
+                assert!(insertions(&mut commands).is_empty());
+            } else {
+                controller.apply_completion(generation, Ok(result("che")), session, "", cx);
+                assert!(controller.pending_insert_action.is_none());
+                assert_eq!(
+                    insertions(&mut commands),
+                    vec![(Some("ckout".into()), Some(0), Some(false))]
+                );
+            }
+        }
+    });
+}
+
+#[gpui::test]
+fn a_deferred_insert_does_not_outlive_a_cancelled_list(cx: &mut gpui::TestAppContext) {
+    let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+    let (mut controller, figterm, mut commands, session) = show_outbox_fixture(cx, "git ch");
+    let input = |buffer: &str| LastInput {
+        buffer: buffer.into(),
+        cwd: String::new(),
+        cursor: buffer.len() as u32,
+        session_id: session,
+    };
+    let cancels: [fn(&mut OverlayController, &mut App); 3] = [
+        OverlayController::hide_until_shown,
+        OverlayController::dismiss,
+        OverlayController::hide,
+    ];
+    cx.update(|cx| {
+        for cancel in cancels {
+            let show_rows = |controller: &mut OverlayController, cx: &mut App| {
+                controller.state.update(cx, |state, _| {
+                    state.suppress_until_shown = false;
+                    state.set_suggestions(vec![row("checkout", "subcommand")], "ch".into());
+                });
+            };
+            show_rows(&mut controller, cx);
+            controller.rows_input = Some(input("git ch"));
+            *controller.last_input.lock().unwrap() = Some(input("git che"));
+            controller.handle_action("insertSelected", session, &figterm, cx);
+            assert!(controller.pending_insert_action.is_some());
+            cancel(&mut controller, cx);
+            assert!(controller.pending_insert_action.is_none());
+            // A later Show for the same input must only show the list.
+            show_rows(&mut controller, cx);
+            let generation = controller.generation.load(Ordering::Relaxed);
+            controller.request_input = Some((generation, input("git che")));
+            let result = CompleteResult {
+                suggestions: vec![fastab_engine::Suggestion {
+                    name: "checkout".into(),
+                    kind: "subcommand".into(),
+                    ..Default::default()
+                }],
+                search_term: "che".into(),
+                ..Default::default()
+            };
+            controller.apply_completion(generation, Ok(result), session, "", cx);
+            assert!(insertions(&mut commands).is_empty());
+        }
+    });
+}
+
+#[gpui::test]
+fn a_deferred_tab_with_nothing_to_insert_reaches_the_shell(cx: &mut gpui::TestAppContext) {
+    let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+    let (mut controller, figterm, mut commands, session) = show_outbox_fixture(cx, "ls -l");
+    let input = |buffer: &str| LastInput {
+        buffer: buffer.into(),
+        cwd: String::new(),
+        cursor: buffer.len() as u32,
+        session_id: session,
+    };
+    let set_line = |buffer: &str| {
+        figterm.with(&session, |session| {
+            session.edit_buffer.update(buffer, buffer.len() as i64)
+        });
+    };
+    cx.update(|cx| {
+        // An empty result, a failed one, and an empty result after the line
+        // moved on. A late Enter could run a newer line, so it never returns.
+        for (key, failed, line_after, returned) in [
+            ("\t", false, "ls -la", true),
+            ("\t", true, "ls -la", true),
+            ("\t", false, "ls -la ", false),
+            ("\r", false, "ls -la", false),
+        ] {
+            controller.state.update(cx, |state, _| {
+                state.suppress_until_shown = false;
+                state.set_suggestions(vec![row("-l", "option")], "-l".into());
+            });
+            controller.rows_input = Some(input("ls -l"));
+            *controller.last_input.lock().unwrap() = Some(input("ls -la"));
+            set_line("ls -la");
+            controller.handle_key_action("insertSelected", Some(key.into()), session, &figterm, cx);
+            assert!(insertions(&mut commands).is_empty());
+            set_line(line_after);
+            let generation = controller.generation.load(Ordering::Relaxed);
+            controller.request_input = Some((generation, input("ls -la")));
+            let result = if failed {
+                Err(anyhow::anyhow!("engine failed"))
+            } else {
+                Ok(CompleteResult {
+                    search_term: "-la".into(),
+                    ..Default::default()
+                })
+            };
+            controller.apply_completion(generation, result, session, "", cx);
+            assert!(controller.pending_insert_action.is_none());
+            let expected = if returned {
+                vec![(Some(key.into()), Some(0), Some(false))]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                insertions(&mut commands),
+                expected,
+                "key={key:?} failed={failed} line={line_after:?}"
+            );
+        }
+    });
+}
+
+#[gpui::test]
+fn a_background_prompt_does_not_take_over_the_typing_session(cx: &mut gpui::TestAppContext) {
+    let _settings = fastab_settings::settings::install_override(fastab_settings::Settings::new_fake());
+    let (mut controller, figterm, _commands, session) = show_outbox_fixture(cx, "git ch");
+    let background = Uuid::new_v4();
+    cx.update(|cx| {
+        controller.state.update(cx, |state, _| {
+            state.suppress_until_shown = false;
+            state.set_suggestions(vec![row("checkout", "subcommand")], "ch".into());
+        });
+        set_intercept(&figterm, session, true, true);
+        for prompt in ["", "  "] {
+            controller.complete_buffer(prompt.into(), String::new(), 0, background, figterm.clone(), cx);
+            assert_eq!(controller.current_session(), Some(session));
+            assert_eq!(figterm.get(&session).unwrap().intercept, InterceptMode::Locked);
+            assert_eq!(controller.last_input.lock().unwrap().as_ref().unwrap().buffer, "git ch");
+            let state = controller.state.read(cx);
+            assert!(state.visible);
+            assert_eq!(state.items.len(), 1);
+        }
+    });
+}

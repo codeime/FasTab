@@ -311,6 +311,10 @@ impl UIElement {
         self.query_before(deadline, Self::frame)
     }
 
+    pub fn focused_window_before(&self, deadline: Instant) -> Result<Self> {
+        self.query_before(deadline, Self::focused_window)
+    }
+
     pub fn window_id_before(&self, deadline: Instant) -> Result<CGWindowID> {
         self.query_before(deadline, |element| unsafe { element.get_window_id() })
     }
@@ -385,6 +389,20 @@ impl UIElement {
     }
 }
 
+/// The process that owns window server window `window_id`, while it exists.
+/// Owner and number need no Screen Recording grant, unlike window titles.
+pub fn window_owner_pid(window_id: CGWindowID) -> Option<pid_t> {
+    let windows = unsafe { display::CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, window_id) };
+    if windows.is_null() {
+        return None;
+    }
+    let windows = unsafe { CFArray::<CFDictionary>::wrap_under_create_rule(windows) };
+    let window = windows
+        .iter()
+        .find(|window| get_num(window, kCGWindowNumber) == Some(i64::from(window_id)))?;
+    get_num(&window, kCGWindowOwnerPID).and_then(|pid| pid_t::try_from(pid).ok())
+}
+
 fn get_value<T: ConcreteCFType>(dict: &CFDictionary, key: CFStringRef) -> Option<T> {
     let val_ref = dict.find(key as CFTypeRef)?;
     let cf_type = unsafe { CFType::wrap_under_get_rule(*val_ref) };
@@ -419,6 +437,12 @@ mod tests {
         assert!(element.is_xterm_helper_textarea_before(expired).is_err());
         assert!(element.find_x_term_caret_tree_before(expired).is_err());
         assert!(element.frame_before(expired).is_err());
+        assert!(element.focused_window_before(expired).is_err());
+    }
+
+    #[test]
+    fn a_window_that_does_not_exist_has_no_owner() {
+        assert_eq!(window_owner_pid(CGWindowID::MAX), None);
     }
 
     #[test]

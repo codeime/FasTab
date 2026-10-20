@@ -51,7 +51,9 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         // Stamp the input before any bounded legacy notification can wait.
         // A later accepted native focus must still supersede this input.
         let input_sequence = self.proxy.begin_overlay_input();
+        let mut redraw = false;
         let _old_metrics = figterm_state.with_update(session_id, |session| {
+            redraw = session.edit_buffer.text == hook.text && session.edit_buffer.cursor == hook.cursor;
             session.edit_buffer.update(&hook.text, hook.cursor);
             session
                 .terminal_cursor_coordinates
@@ -143,6 +145,7 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
                     cwd,
                     cursor: hook.cursor.max(0) as u32,
                     session_id,
+                    redraw,
                 },
                 input_sequence,
             )
@@ -299,7 +302,11 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
 
     async fn intercepted_key(
         &mut self,
-        InterceptedKeyHook { action, context: _, .. }: InterceptedKeyHook,
+        InterceptedKeyHook {
+            action,
+            key,
+            context: _,
+        }: InterceptedKeyHook,
         _session_id: Uuid,
     ) -> Result<Option<clientbound::response::Response>> {
         debug!(%action, "Intercepted Key Action");
@@ -308,6 +315,7 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
             .send_event_async(Event::AutocompleteAction {
                 action,
                 session_id: _session_id,
+                key: Some(key).filter(|key| !key.is_empty()),
             })
             .await?;
 
@@ -461,12 +469,22 @@ mod tests {
                 assert_eq!(input.cwd, "/fixture");
                 assert_eq!(input.cursor, text.len() as u32);
                 assert_eq!(input.session_id, session_id);
+                assert!(!input.redraw);
                 state.with(&session_id, |session| {
                     assert_eq!(session.edit_buffer.text, text);
                     if text.len() < 64 * 1024 {
                         assert!(session.edit_buffer.text.capacity() < 64 * 1024);
                     }
                 });
+            }
+
+            // Reporting the same line and cursor again is the shell redrawing it.
+            for redraw in [false, true] {
+                send_hook(&mut client, edit_request("tool ")).await;
+                let Event::GpuiOverlayInput(queued) = next_event(&events).await else {
+                    panic!("expected queued input");
+                };
+                assert_eq!(queued.take().unwrap().redraw, redraw);
             }
 
             // End-input hooks must release a large retained command even when
