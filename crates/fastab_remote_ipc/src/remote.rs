@@ -21,7 +21,11 @@ use crate::outbox::{self, FigtermSender, Outbox};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_REMOTE_CONNECTIONS: usize = 32;
+/// Every terminal tab or pane holds one `fterm` connection for its lifetime,
+/// so a session past this cap gets no completions at all. launchd starts the
+/// app with a 256-descriptor soft limit; keep half for SQLite, logs, Metal and
+/// the pipes of running hook scripts.
+const MAX_REMOTE_CONNECTIONS: usize = 128;
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// Accepted sockets, including authentication, blocked hooks and cleanup.
@@ -101,9 +105,26 @@ async fn serve_remote_listener(
     limit: usize,
 ) {
     let slots = Arc::new(Semaphore::new(limit));
+    let mut accept_backoff = None;
     while let Ok(permit) = slots.clone().acquire_owned().await {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
+        // EMFILE and friends are transient. Ending the loop would leave every
+        // later terminal without completions until the app restarts.
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => {
+                accept_backoff = None;
+                stream
+            },
+            Err(err) => {
+                // Back off so a lasting EMFILE does not flood the rolling log.
+                let delay = accept_backoff.map_or(Duration::from_millis(50), |delay: Duration| {
+                    (delay * 2).min(Duration::from_secs(1))
+                });
+                accept_backoff = Some(delay);
+                warn!(%err, ?delay, "Remote IPC accept failed");
+                drop(permit);
+                tokio::time::sleep(delay).await;
+                continue;
+            },
         };
         let admission = ConnectionAdmission::new(permit);
         let state = figterm_state.clone();
