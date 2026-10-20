@@ -397,10 +397,11 @@ pub fn window_owner_pid(window_id: CGWindowID) -> Option<pid_t> {
         return None;
     }
     let windows = unsafe { CFArray::<CFDictionary>::wrap_under_create_rule(windows) };
+    let (number_key, owner_key) = unsafe { (kCGWindowNumber, kCGWindowOwnerPID) };
     let window = windows
         .iter()
-        .find(|window| get_num(window, kCGWindowNumber) == Some(i64::from(window_id)))?;
-    get_num(&window, kCGWindowOwnerPID).and_then(|pid| pid_t::try_from(pid).ok())
+        .find(|window| get_num(window, number_key) == Some(i64::from(window_id)))?;
+    get_num(&window, owner_key).and_then(|pid| pid_t::try_from(pid).ok())
 }
 
 fn get_value<T: ConcreteCFType>(dict: &CFDictionary, key: CFStringRef) -> Option<T> {
