@@ -489,12 +489,10 @@ impl OverlayController {
         cx: &mut App,
     ) {
         self.set_enabled_sampled(enabled, Some(accessibility_missing), cx);
-        self.terminal_disable = (!self.enabled && !self.disabled_by_accessibility).then(|| {
-            if sample_uncertain {
-                TerminalDisable::Unconfirmed
-            } else {
-                TerminalDisable::Confirmed(app)
-            }
+        self.terminal_disable = (!self.enabled && !self.disabled_by_accessibility).then_some(if sample_uncertain {
+            TerminalDisable::Unconfirmed
+        } else {
+            TerminalDisable::Confirmed(app)
         });
     }
 
