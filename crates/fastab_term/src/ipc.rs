@@ -170,8 +170,79 @@ async fn get_forwarded_stream() -> Result<ForwardedConnection> {
     })
 }
 
+/// Removes the session socket file when dropped. A closed terminal window
+/// ends this process with SIGHUP, which runs no destructors, so
+/// [`SocketFile::new`] also unlinks it from SIGHUP / SIGTERM.
+pub(crate) struct SocketFile(std::path::PathBuf);
+
+impl SocketFile {
+    fn new(path: std::path::PathBuf) -> Self {
+        #[cfg(unix)]
+        unlink_on_termination(&path);
+        Self(path)
+    }
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
+
+#[cfg(unix)]
+static TERMINATION_UNLINK_PATH: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+extern "C" fn unlink_and_reraise(signo: std::ffi::c_int) {
+    use nix::sys::signal::{SigHandler, Signal, raise, signal};
+    // Async-signal-safe only: unlink, restore the default action, re-raise.
+    if let Some(path) = TERMINATION_UNLINK_PATH.get() {
+        nix::unistd::unlink(path.as_c_str()).ok();
+    }
+    if let Ok(signo) = Signal::try_from(signo) {
+        unsafe { signal(signo, SigHandler::SigDfl) }.ok();
+        raise(signo).ok();
+    }
+}
+
+#[cfg(unix)]
+fn unlink_on_termination(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    use nix::libc;
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    if TERMINATION_UNLINK_PATH.set(path).is_err() {
+        return;
+    }
+    let action = SigAction::new(
+        SigHandler::Handler(unlink_and_reraise),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    for signo in [Signal::SIGHUP, Signal::SIGTERM] {
+        // Keep an inherited ignore (e.g. nohup): handling it would end a
+        // process that was meant to survive the signal. Query without
+        // installing, so no signal can land on our handler in between.
+        let mut current = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        if unsafe { libc::sigaction(signo as libc::c_int, std::ptr::null(), current.as_mut_ptr()) } == 0
+            && unsafe { current.assume_init_ref() }.sa_sigaction == libc::SIG_IGN
+        {
+            continue;
+        }
+        if let Err(err) = unsafe { sigaction(signo, &action) } {
+            debug!(%err, ?signo, "Failed to install socket cleanup handler");
+        }
+    }
+}
+
 /// Spawns a local unix socket for communicating with figterm on a local machine
-pub(crate) async fn spawn_figterm_ipc(session_id: impl std::fmt::Display) -> Result<Receiver<LocalIncoming>> {
+pub(crate) async fn spawn_figterm_ipc(
+    session_id: impl std::fmt::Display,
+) -> Result<(Receiver<LocalIncoming>, SocketFile)> {
     trace!("Spawning incoming receiver");
 
     let (incoming_tx, incoming_rx) = bounded(incoming::MAX_MESSAGES);
@@ -192,6 +263,7 @@ pub(crate) async fn spawn_figterm_ipc(session_id: impl std::fmt::Display) -> Res
 
     tokio::fs::remove_file(&socket_path).await.ok();
     let socket_listener = tokio::net::UnixListener::bind(&socket_path)?;
+    let socket_file = SocketFile::new(socket_path);
 
     tokio::spawn(async move {
         loop {
@@ -217,7 +289,7 @@ pub(crate) async fn spawn_figterm_ipc(session_id: impl std::fmt::Display) -> Res
         }
     });
 
-    Ok(incoming_rx)
+    Ok((incoming_rx, socket_file))
 }
 
 async fn handle_local_connection(
@@ -484,6 +556,19 @@ mod local_connection_tests {
 
     async fn connection_slot() -> OwnedSemaphorePermit {
         Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_socket_file_is_removed_with_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // Bypass `new`: the termination handlers are process-wide.
+        let owner = SocketFile(path.clone());
+        assert!(path.exists());
+        drop(owner);
+        assert!(!path.exists());
+        drop(listener);
     }
 
     #[tokio::test]

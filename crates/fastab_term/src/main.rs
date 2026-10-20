@@ -1012,7 +1012,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
         let history_sender = history::spawn_history_task().await;
 
         // Spawn thread to handle figterm ipc
-        let incoming_receiver = spawn_figterm_ipc(&session_id).await?;
+        let (incoming_receiver, _socket_file) = spawn_figterm_ipc(&session_id).await?;
 
         // Spawn thread to handle remote ipc
         let (remote_sender, remote_receiver, stop_ipc_tx) = spawn_remote_ipc(session_id.clone(), parent_id).await?;
@@ -1243,35 +1243,46 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                                         .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
                                                 )
                                                 .await?;
-                                                debug!(?action, "Intercepted action");
-                                                let s = raw
-                                                    .clone()
-                                                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
-                                                    .unwrap_or_default();
-                                                let context = shell_state_to_context(term.shell_state());
-                                                let hook = fastab_proto::remote_hooks::new_intercepted_key_hook(
-                                                    context, action, s,
-                                                );
-                                                // The desktop's InterceptedKey handler does not
-                                                // apply its context, so it must not advance the
-                                                // generation's context synchronization marker.
-                                                let admitted = key_generation.is_some_and(|generation| {
-                                                    remote_sender
-                                                        .for_generation(generation)
-                                                        .try_send_key(
-                                                            hook_to_message(hook),
-                                                            raw.clone().unwrap_or_default(),
-                                                        )
-                                                        .is_ok()
-                                                });
-                                                if !admitted {
-                                                    reconcile_remote_state(&remote_sender, &mut key_interceptor);
-                                                }
+                                                if !deferred_pty_input.is_empty() {
+                                                    // Ordinary input is still parked behind an
+                                                    // unsettled key. A failed replay of this key
+                                                    // would be written ahead of that input, so
+                                                    // queue it behind as ordinary input instead.
+                                                    if event.key == KeyCode::Escape {
+                                                        key_interceptor.reset();
+                                                    }
+                                                    false
+                                                } else {
+                                                    debug!(?action, "Intercepted action");
+                                                    let s = raw
+                                                        .clone()
+                                                        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+                                                        .unwrap_or_default();
+                                                    let context = shell_state_to_context(term.shell_state());
+                                                    let hook = fastab_proto::remote_hooks::new_intercepted_key_hook(
+                                                        context, action, s,
+                                                    );
+                                                    // The desktop's InterceptedKey handler does not
+                                                    // apply its context, so it must not advance the
+                                                    // generation's context synchronization marker.
+                                                    let admitted = key_generation.is_some_and(|generation| {
+                                                        remote_sender
+                                                            .for_generation(generation)
+                                                            .try_send_key(
+                                                                hook_to_message(hook),
+                                                                raw.clone().unwrap_or_default(),
+                                                            )
+                                                            .is_ok()
+                                                    });
+                                                    if !admitted {
+                                                        reconcile_remote_state(&remote_sender, &mut key_interceptor);
+                                                    }
 
-                                                if event.key == KeyCode::Escape {
-                                                    key_interceptor.reset();
+                                                    if event.key == KeyCode::Escape {
+                                                        key_interceptor.reset();
+                                                    }
+                                                    admitted
                                                 }
-                                                admitted
                                             } else {
                                                 false
                                             }

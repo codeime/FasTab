@@ -258,6 +258,19 @@ async fn flush_input_batch(
     maybe_more: bool,
     finishing: bool,
 ) -> bool {
+    flush_input_batch_emitting(parser, buf, input_tx, maybe_more, finishing)
+        .await
+        .is_some()
+}
+
+/// `None` when the receiver is gone, otherwise whether any event was emitted.
+async fn flush_input_batch_emitting(
+    parser: &mut InputParser,
+    buf: &mut BytesMut,
+    input_tx: &Sender<InputEventResult>,
+    maybe_more: bool,
+    finishing: bool,
+) -> Option<bool> {
     let mut events = Vec::new();
     parser.parse(buf, |raw, event| events.push(Ok((raw, event))), maybe_more);
     buf.clear();
@@ -268,7 +281,10 @@ async fn flush_input_batch(
     if finishing {
         parser.finish(|raw, event| events.push(Ok((raw, event))));
     }
-    events.is_empty() || input_tx.send_async(events).await.is_ok()
+    if events.is_empty() {
+        return Some(false);
+    }
+    input_tx.send_async(events).await.ok().map(|()| true)
 }
 
 async fn read_input_stream(
@@ -284,7 +300,12 @@ async fn read_input_stream(
     // A fixed request size also prevents Tokio stdin's internal blocking Buf
     // from following an arbitrarily large outer allocation.
     let mut chunk = [0u8; crate::BUFFER_SIZE];
+    // Outer aggregation, timed from the batch's first byte.
     let mut batch_deadline = None;
+    // A prefix the parser holds, timed from when it was first held, so one
+    // that arrives late in a batch still gets the full window to complete.
+    // While it is set the outer batch is empty: every read flushes at once.
+    let mut held_deadline: Option<Instant> = None;
     loop {
         let read_limit = (MAX_INPUT_BATCH_BYTES - buf.len()).min(chunk.len());
         select! {
@@ -296,17 +317,29 @@ async fn read_input_stream(
                         return;
                     }
                     Ok(n) => {
+                        // Reads win the biased select, so steady input would starve the
+                        // hold timer. Settle an expired prefix alone, before the new bytes
+                        // can join it (ESC + `x` would read as Alt+x).
+                        if held_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            held_deadline = None;
+                            if !flush_input_batch(&mut parser, &mut buf, &input_tx, false, false).await { return; }
+                        }
                         buf.extend_from_slice(&chunk[..n]);
                         crate::resource_diagnostics::input_outer(buf.len(), buf.capacity());
                         let deadline = *batch_deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(1));
-                        if immediate_mode.load(Ordering::SeqCst) || buf.len() >= MAX_INPUT_BATCH_BYTES || Instant::now() >= deadline {
-                            let maybe_more = Instant::now() < deadline;
-                            if !flush_input_batch(&mut parser, &mut buf, &input_tx, maybe_more, false).await { return; }
-                            // Size/immediate flushes are read boundaries, not an
-                            // idle boundary. Preserve split escape prefixes and
-                            // settle them at the original first-byte deadline,
-                            // even when the outer batch is now empty.
-                            if !maybe_more { batch_deadline = None; }
+                        if held_deadline.is_some()
+                            || immediate_mode.load(Ordering::SeqCst)
+                            || buf.len() >= MAX_INPUT_BATCH_BYTES
+                            || Instant::now() >= deadline
+                        {
+                            // A read boundary does not settle a prefix that is still in its window.
+                            let Some(emitted) = flush_input_batch_emitting(&mut parser, &mut buf, &input_tx, true, false).await else { return; };
+                            batch_deadline = None;
+                            // Emitting consumed the old prefix, so a held one is new.
+                            let inherited = held_deadline.filter(|_| !emitted);
+                            held_deadline = parser
+                                .has_held_prefix()
+                                .then(|| inherited.unwrap_or_else(|| Instant::now() + Duration::from_millis(1)));
                         }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
@@ -319,9 +352,15 @@ async fn read_input_stream(
                     }
                 }
             }
-            _ = tokio::time::sleep_until(batch_deadline.unwrap_or_else(Instant::now)), if batch_deadline.is_some() => {
-                if !flush_input_batch(&mut parser, &mut buf, &input_tx, false, false).await { return; }
+            _ = tokio::time::sleep_until(held_deadline.or(batch_deadline).unwrap_or_else(Instant::now)),
+                if held_deadline.is_some() || batch_deadline.is_some() =>
+            {
+                let settle = held_deadline.take().is_some();
+                if !flush_input_batch(&mut parser, &mut buf, &input_tx, !settle, false).await { return; }
                 batch_deadline = None;
+                if !settle && parser.has_held_prefix() {
+                    held_deadline = Some(Instant::now() + Duration::from_millis(1));
+                }
             }
             _ = async {
                 match window_change_signal.as_mut() {
@@ -512,6 +551,104 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(rx.recv_async().await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn escape_late_in_a_batch_still_gets_its_own_window() {
+        // Step the paused clock explicitly: the timer has millisecond
+        // granularity, so sleeping would land writes on timer ticks.
+        async fn settle() {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for immediate in [false, true] {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let (tx, rx) = bounded(8);
+            let task = tokio::spawn(async move {
+                read_input_stream(reader, tx, None, &AtomicBool::new(immediate)).await;
+            });
+            writer.write_all(b"a").await.unwrap();
+            settle().await;
+            tokio::time::advance(Duration::from_micros(500)).await;
+            writer.write_all(b"\x1b").await.unwrap();
+            settle().await;
+            // Past the first byte's 1 ms, inside the escape's own.
+            tokio::time::advance(Duration::from_micros(600)).await;
+            settle().await;
+            writer.write_all(b"[A").await.unwrap();
+            settle().await;
+            drop(writer);
+            task.await.unwrap();
+            let mut events = Vec::new();
+            while let Ok(batch) = rx.recv_async().await {
+                events.extend(batch.into_iter().map(|event| event.unwrap()));
+            }
+            assert_eq!(events.len(), 2, "immediate={immediate}: {events:?}");
+            assert_eq!(events[0].0.as_deref(), Some(b"a".as_slice()));
+            assert_eq!(events[1].0.as_deref(), Some(b"\x1b[A".as_slice()));
+            assert!(matches!(
+                events[1].1,
+                InputEvent::Key(crate::input::KeyEvent {
+                    key: crate::input::KeyCode::UpArrow,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_input_cannot_keep_an_expired_escape_held() {
+        async fn settle() {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for immediate in [false, true] {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let (tx, rx) = bounded(8);
+            let task = tokio::spawn(async move {
+                read_input_stream(reader, tx, None, &AtomicBool::new(immediate)).await;
+            });
+            writer.write_all(b"\x1b").await.unwrap();
+            settle().await;
+            if !immediate {
+                // The batch timer hands ESC to the parser, which holds it.
+                tokio::time::advance(Duration::from_micros(1100)).await;
+                settle().await;
+            }
+            // The next read is ready by the time the hold expires, and reads
+            // win the biased select over the hold timer.
+            writer.write_all(b"x").await.unwrap();
+            tokio::time::advance(Duration::from_micros(1500)).await;
+            settle().await;
+            drop(writer);
+            task.await.unwrap();
+            let mut events = Vec::new();
+            while let Ok(batch) = rx.recv_async().await {
+                events.extend(batch.into_iter().map(|event| event.unwrap()));
+            }
+            assert_eq!(
+                events,
+                vec![
+                    (
+                        Some(bytes::Bytes::from_static(b"\x1b")),
+                        InputEvent::Key(crate::input::KeyEvent {
+                            key: crate::input::KeyCode::Escape,
+                            modifiers: crate::input::Modifiers::NONE,
+                        })
+                    ),
+                    (
+                        Some(bytes::Bytes::from_static(b"x")),
+                        InputEvent::Key(crate::input::KeyEvent {
+                            key: crate::input::KeyCode::Char('x'),
+                            modifiers: crate::input::Modifiers::NONE,
+                        })
+                    ),
+                ],
+                "immediate={immediate}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -806,6 +806,14 @@ enum InputState {
     Pasting(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Utf8Prefix {
+    Char(char, usize),
+    /// The first `usize` bytes can never start a valid character.
+    Invalid(usize),
+    Incomplete,
+}
+
 #[derive(Debug)]
 pub struct InputParser {
     key_map: KeyMap<InputEvent>,
@@ -1429,29 +1437,24 @@ impl InputParser {
         (c, c.len_utf8())
     }
 
-    /// This is a horrible function to pull off the first unicode character
-    /// from the sequence of bytes and return it and the remaining slice.
-    fn decode_one_char(bytes: &[u8]) -> Option<(char, usize)> {
-        // This has the potential to be an ugly hotspot since the complexity
-        // is a function of the length of the entire buffer rather than the length
-        // of the first char component.  A simple mitigation might be to slice off
-        // the first 4 bytes.  We pick 4 bytes because the docs for str::len_utf8()
-        // state that the maximum expansion for a `char` is 4 bytes.
+    /// Pull the first unicode character off the front of `bytes`.
+    fn decode_one_char(bytes: &[u8]) -> Utf8Prefix {
+        // A `char` is at most 4 bytes, so only the first 4 decide the outcome.
+        // Truncating cannot turn an invalid prefix into an incomplete one.
         let bytes = &bytes[..bytes.len().min(4)];
         match std::str::from_utf8(bytes) {
             Ok(s) => {
                 let (c, len) = Self::first_char_and_len(s);
-                Some((c, len))
+                Utf8Prefix::Char(c, len)
             },
-            Err(err) => {
-                let (valid, _after_valid) = bytes.split_at(err.valid_up_to());
-                if !valid.is_empty() {
-                    let s = unsafe { std::str::from_utf8_unchecked(valid) };
-                    let (c, len) = Self::first_char_and_len(s);
-                    Some((c, len))
-                } else {
-                    None
-                }
+            Err(err) if err.valid_up_to() > 0 => {
+                let s = unsafe { std::str::from_utf8_unchecked(&bytes[..err.valid_up_to()]) };
+                let (c, len) = Self::first_char_and_len(s);
+                Utf8Prefix::Char(c, len)
+            },
+            Err(err) => match err.error_len() {
+                Some(len) => Utf8Prefix::Invalid(len),
+                None => Utf8Prefix::Incomplete,
             },
         }
     }
@@ -1485,10 +1488,12 @@ impl InputParser {
                 }),
             ) => {
                 // The prior ESC was not part of an ALT sequence, so emit
-                // it before we start collecting for paste.
-                let raw = self.take_raw();
+                // it before we start collecting for paste. The start marker
+                // stays queued: it belongs to the paste's raw bytes, and an
+                // intercepted Esc must not carry it away from the shell.
+                let raw_esc = self.raw_byte_stack.split_to(1);
                 callback(
-                    Some(raw.freeze()),
+                    Some(raw_esc.freeze()),
                     InputEvent::Key(KeyEvent {
                         key: KeyCode::Escape,
                         modifiers: Modifiers::NONE,
@@ -1511,7 +1516,8 @@ impl InputParser {
             (InputState::EscapeMaybeAlt, event) => {
                 // The prior ESC was not part of an ALT sequence, so emit
                 // both it and the current event
-                let raw_esc = self.raw_byte_stack.split_off(1);
+                self.state = InputState::Normal;
+                let raw_esc = self.raw_byte_stack.split_to(1);
                 callback(
                     Some(raw_esc.freeze()),
                     InputEvent::Key(KeyEvent {
@@ -1616,7 +1622,9 @@ impl InputParser {
                                 }),
                             ),
                             _,
-                        ) if self.state == InputState::Normal && self.buf.len() > len => {
+                        ) if len == 1 && self.state == InputState::Normal && self.buf.len() > len => {
+                            // Only a bare ESC can prefix Alt: a CSI-u Escape carries its
+                            // own modifiers, and dispatch_callback splits off one byte.
                             self.state = InputState::EscapeMaybeAlt;
                             self.advance_buf(len);
                         },
@@ -1629,19 +1637,26 @@ impl InputParser {
                         },
                         (Found::None, _) | (Found::NeedData, false) => {
                             // No pre-defined key, so pull out a unicode character
-                            if let Some((c, len)) = Self::decode_one_char(self.buf.as_slice()) {
-                                self.advance_buf(len);
-                                self.dispatch_callback(
-                                    &mut callback,
-                                    InputEvent::Key(KeyEvent {
-                                        key: KeyCode::Char(c),
-                                        modifiers: Modifiers::NONE,
-                                    }),
-                                );
-                            } else {
+                            match Self::decode_one_char(self.buf.as_slice()) {
+                                Utf8Prefix::Char(c, len) => {
+                                    self.advance_buf(len);
+                                    self.dispatch_callback(
+                                        &mut callback,
+                                        InputEvent::Key(KeyEvent {
+                                            key: KeyCode::Char(c),
+                                            modifiers: Modifiers::NONE,
+                                        }),
+                                    );
+                                },
+                                // No later byte can make this prefix valid. Waiting for
+                                // one would hold it, and everything behind it, until EOF.
+                                Utf8Prefix::Invalid(len) => {
+                                    self.advance_buf(len);
+                                    self.dispatch_callback(&mut callback, InputEvent::RawString);
+                                },
                                 // We need more data to recognize the input, so
                                 // yield the remainder of the slice
-                                return;
+                                Utf8Prefix::Incomplete => return,
                             }
                         },
                     }
@@ -1669,6 +1684,12 @@ impl InputParser {
         self.process_bytes(callback, maybe_more);
         self.buf.release_large_empty_buffer();
         self.record_resources();
+    }
+
+    /// True while unparsed bytes may still begin a longer key. Only a parse
+    /// without `maybe_more` settles them; a paste waits for its end marker.
+    pub fn has_held_prefix(&self) -> bool {
+        !matches!(self.state, InputState::Pasting(_)) && !self.buf.is_empty()
     }
 
     /// Finish a finite input stream without losing incomplete UTF-8, escape
@@ -2000,6 +2021,138 @@ mod test {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_outside_paste_is_forwarded_without_stalling_later_keys() {
+        for (input, invalid) in [
+            (b"\xffab".as_slice(), b"\xff".as_slice()),
+            (b"\xe1ab".as_slice(), b"\xe1".as_slice()),
+        ] {
+            for split in [1, input.len()] {
+                for maybe_more in [false, true] {
+                    let mut parser = InputParser::new_raw_passthrough();
+                    let mut events = Vec::new();
+                    parser.parse(&input[..split], |raw, event| events.push((raw, event)), maybe_more);
+                    parser.parse(&input[split..], |raw, event| events.push((raw, event)), maybe_more);
+                    parser.parse(b"", |raw, event| events.push((raw, event)), false);
+                    assert_eq!(events.len(), 3, "{input:?} split at {split}");
+                    assert_eq!(
+                        events[0],
+                        (Some(Bytes::copy_from_slice(invalid)), InputEvent::RawString)
+                    );
+                    for (index, byte) in b"ab".iter().enumerate() {
+                        assert_eq!(events[index + 1].0.as_deref(), Some(std::slice::from_ref(byte)));
+                        assert_eq!(
+                            events[index + 1].1,
+                            InputEvent::Key(KeyEvent {
+                                key: KeyCode::Char(char::from(*byte)),
+                                modifiers: Modifiers::NONE
+                            })
+                        );
+                    }
+                    assert!(parser.buf.as_slice().is_empty());
+                    assert!(parser.raw_byte_stack.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_utf8_waits_for_its_continuation_bytes() {
+        let mut parser = InputParser::new_raw_passthrough();
+        let mut events = Vec::new();
+        parser.parse(b"\xe4\xb8", |raw, event| events.push((raw, event)), false);
+        assert!(events.is_empty());
+        parser.parse(b"\xad", |raw, event| events.push((raw, event)), false);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.as_deref(), Some("中".as_bytes()));
+        assert_eq!(
+            events[0].1,
+            InputEvent::Key(KeyEvent {
+                key: KeyCode::Char('中'),
+                modifiers: Modifiers::NONE
+            })
+        );
+    }
+
+    #[test]
+    fn escape_before_a_non_key_event_carries_only_its_own_byte() {
+        let mut parser = InputParser::new_raw_passthrough();
+        let mut events = Vec::new();
+        parser.parse(b"\x1b\xffa", |raw, event| events.push((raw, event)), false);
+        assert_eq!(
+            events,
+            vec![
+                (
+                    Some(Bytes::from_static(b"\x1b")),
+                    InputEvent::Key(KeyEvent {
+                        key: KeyCode::Escape,
+                        modifiers: Modifiers::NONE
+                    })
+                ),
+                (Some(Bytes::from_static(b"\xff")), InputEvent::RawString),
+                (
+                    Some(Bytes::from_static(b"a")),
+                    InputEvent::Key(KeyEvent {
+                        key: KeyCode::Char('a'),
+                        modifiers: Modifiers::NONE
+                    })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_csi_u_escape_is_never_an_alt_prefix() {
+        for mut parser in [InputParser::new(), InputParser::new_raw_passthrough()] {
+            for esc in [&b"\x1b[27u"[..], &b"\x1b[27;1u"[..]] {
+                let mut events = Vec::new();
+                parser.parse(
+                    &[esc, &b"a"[..]].concat(),
+                    |raw, event| events.push((raw, event)),
+                    false,
+                );
+                assert_eq!(
+                    events,
+                    vec![
+                        (
+                            Some(Bytes::copy_from_slice(esc)),
+                            InputEvent::Key(KeyEvent {
+                                key: KeyCode::Escape,
+                                modifiers: Modifiers::NONE
+                            })
+                        ),
+                        (
+                            Some(Bytes::from_static(b"a")),
+                            InputEvent::Key(KeyEvent {
+                                key: KeyCode::Char('a'),
+                                modifiers: Modifiers::NONE
+                            })
+                        ),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn escape_before_a_paste_leaves_the_start_marker_with_the_paste() {
+        for mut parser in [InputParser::new(), InputParser::new_raw_passthrough()] {
+            let mut events = Vec::new();
+            let input = b"\x1b\x1b[200~hi\x1b[201~";
+            parser.parse(input, |raw, event| events.push((raw, event)), false);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].0.as_deref(), Some(b"\x1b".as_slice()));
+            assert_eq!(
+                events[0].1,
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Escape,
+                    modifiers: Modifiers::NONE
+                })
+            );
+            assert_eq!(events[1].0.as_deref(), Some(&input[1..]));
         }
     }
 

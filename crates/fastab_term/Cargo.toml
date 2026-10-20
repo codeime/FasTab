@@ -72,3 +72,4 @@ winreg = "0.56.0"
 assert_cmd.workspace = true
 predicates = "3.0.1"
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
