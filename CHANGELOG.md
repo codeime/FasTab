@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.0.12
+
+- fix: keep the completion list open when focus moves within the same VS Code / Cursor terminal pane, and dismiss it when another terminal tab takes focus.
+- fix: drop input-method caret updates that belong to a previously focused window, and stop background tab prompt redraws from taking over the active session.
+- fix: send a Tab back to the shell when a deferred completion has nothing to insert, and keep a stale search term from being inserted after the line has changed.
+- fix: re-enable completion on the next keystroke only when the terminal that was disabled is no longer frontmost or its state could not be read.
+- fix: settle invalid UTF-8 bytes and a lone Esc in the terminal input parser without stalling input, keep replayed keys behind earlier typing, and remove the session socket on exit.
+- fix: raise the remote IPC connection cap and back off on accept errors instead of stopping or flooding the log.
+- fix: keep requested font features and append system font fallbacks; defer system font enumeration until it is needed.
+- fix: retire and restore native settings menus safely when the settings window closes and reopens.
+
 ## v0.0.11
 
 - change: load native font faces only when selected or needed for fallback, reducing unused font retention while preserving font matching and stable font identities.
