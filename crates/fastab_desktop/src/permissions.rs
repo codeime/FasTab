@@ -246,7 +246,7 @@ pub fn spawn_check(proxy: &EventLoopProxy) {
     let proxy = proxy.clone();
     let generation = next_permission_generation();
     tokio::spawn(async move {
-        publish_check(&proxy, false, generation).await;
+        publish_check(&proxy, false, generation, None).await;
     });
 }
 
@@ -254,10 +254,13 @@ fn next_permission_generation() -> u64 {
     NEXT_PERMISSION_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-async fn publish_check(proxy: &EventLoopProxy, completes_repair: bool, generation: u64) {
+async fn publish_check(proxy: &EventLoopProxy, completes_repair: bool, generation: u64, repair_error: Option<String>) {
     let mut required = check_required().await;
     required.generation = generation;
     required.completes_repair = completes_repair;
+    if !required.all_ready() {
+        required.error = repair_error.or(required.error);
+    }
     if proxy.send_event(Event::PermissionSnapshot(required.clone())).is_err() {
         warn!("failed to deliver permission snapshot");
         return;
@@ -273,10 +276,11 @@ pub fn spawn_repair(proxy: &EventLoopProxy, id: PermId) -> u64 {
     let proxy = proxy.clone();
     let generation = next_permission_generation();
     tokio::spawn(async move {
-        if let Err(err) = repair(id).await {
+        let repair_error = repair(id).await.err();
+        if let Some(err) = &repair_error {
             warn!(?id, %err, "permission repair failed");
         }
-        publish_check(&proxy, true, generation).await;
+        publish_check(&proxy, true, generation, repair_error).await;
         proxy.send_event(Event::ReloadAccessibility).ok();
     });
     generation
@@ -286,10 +290,11 @@ pub fn spawn_repair_all(proxy: &EventLoopProxy) -> u64 {
     let proxy = proxy.clone();
     let generation = next_permission_generation();
     tokio::spawn(async move {
-        if let Err(err) = repair_all().await {
+        let repair_error = repair_all().await.err();
+        if let Some(err) = &repair_error {
             warn!(%err, "permission repair-all failed");
         }
-        publish_check(&proxy, true, generation).await;
+        publish_check(&proxy, true, generation, repair_error).await;
         proxy.send_event(Event::ReloadAccessibility).ok();
     });
     generation

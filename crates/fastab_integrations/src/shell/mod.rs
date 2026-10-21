@@ -739,7 +739,8 @@ impl Integration for DotfileShellIntegration {
             return Ok(());
         }
         self.install_inner().await?;
-        Ok(())
+        // A rewrite the status check still rejects must not read as a successful install.
+        self.is_installed().await
     }
 
     async fn uninstall(&self) -> Result<()> {
@@ -861,16 +862,27 @@ fn split_shebang(contents: &str) -> (&str, &str) {
 /// UI); coexistence here only means "don't treat their rc trailer as a broken
 /// Fastab install."
 ///
+/// Otty 1.6 also appends a `bash-profile shim` to `~/.bash_profile` that sources
+/// `~/.bashrc`; the `.bashrc` post block still runs after it, so our hooks stay last.
+///
 /// Matched against both:
-/// - raw rc files (with `# >>> otty shell integration >>>` markers), and
+/// - raw rc files (with `# >>> otty … >>>` markers), and
 /// - the comment-/blank-stripped form produced by [`DotfileShellIntegration::is_installed`].
+///
+/// Otty has changed the guard of its `if` between releases (1.6 added
+/// `[ -n "$BASH_VERSION" ] &&`), so the stripped forms key on what the block
+/// sources, not on the exact condition.
 fn trailing_foreign_integration_patterns() -> &'static [&'static str] {
     &[
-        // Otty — marker form written into ~/.bashrc (and tmux-managed zsh/fish rc).
-        r"(?ms)\n*#\s*>>> otty shell integration >>>.*?\#\s*<<< otty shell integration <<<\s*",
-        // Otty — after is_installed strips comment-only / empty lines, only the
-        // guarded `if … OTTY_SHELL_INTEGRATION …; fi` body remains.
-        r#"(?ms)\n*if\s+\[\s+-n\s+"\$OTTY_SHELL_INTEGRATION"\s*\]\s*&&\s*\[\s+-r\s+"\$OTTY_SHELL_INTEGRATION/otty-integration\.(?:bash|zsh)"\s*\]\s*;\s*then\n\s*\.\s+"\$OTTY_SHELL_INTEGRATION/otty-integration\.(?:bash|zsh)"\nfi\s*"#,
+        // Otty — marker form written into ~/.bashrc / ~/.bash_profile (and tmux-managed zsh/fish rc).
+        // Only blocks the stripped forms below also recognise, so install and status agree.
+        // The 1.6 bash-profile shim closes with `# <<< otty bash-profile shim >>>`.
+        r"(?ms)\n*#\s*>>> otty (?:shell integration|bash-profile shim) >>>.*?#\s*<<< otty (?:shell integration|bash-profile shim) (?:<<<|>>>)\s*",
+        // Otty shell integration — after is_installed strips comment-only / empty
+        // lines, only the guarded `if … OTTY_SHELL_INTEGRATION …; fi` body remains.
+        r#"(?m)\n*^if [^\n]*"\$OTTY_SHELL_INTEGRATION"[^\n]*;\s*then\n\s*\.\s+"\$OTTY_SHELL_INTEGRATION/otty-integration\.(?:bash|zsh)"\nfi\s*"#,
+        // Otty bash-profile shim, stripped form.
+        r#"(?m)\n*^if\s+\[\s+-n\s+"\$BASH_VERSION"\s*\]\s*&&\s*\[\s+-f\s+"\$HOME/\.bashrc"\s*\]\s*;\s*then\s+\.\s+"\$HOME/\.bashrc"\s*;\s*fi\s*"#,
     ]
 }
 
@@ -929,7 +941,7 @@ fn strip_trailing_foreign_integrations(text: &str) -> String {
     loop {
         let before_len = result.len();
         for re in &patterns {
-            if let Some(m) = re.find(&result) {
+            if let Some(m) = re.find_iter(&result).last() {
                 // Only peel matches that sit at EOF — never mid-file copies.
                 if m.end() == result.len() {
                     result.truncate(m.start());
@@ -1653,6 +1665,111 @@ eval "$(ec init zsh pre --rcfile zshrc)""#,
         integration
             .matches_text(&filtered, When::Post)
             .expect("Otty trailer must not fail post installation status");
+    }
+
+    const OTTY_1_6_BASHRC_BLOCK: &str = indoc::indoc! {r#"
+        # >>> otty shell integration >>>
+        # Added by Otty — toggle in Settings > Shell > Shell Integration.
+        # Inert unless launched by Otty (it sets $OTTY_SHELL_INTEGRATION).
+        if [ -n "$BASH_VERSION" ] && [ -n "$OTTY_SHELL_INTEGRATION" ] && [ -r "$OTTY_SHELL_INTEGRATION/otty-integration.bash" ]; then
+          . "$OTTY_SHELL_INTEGRATION/otty-integration.bash"
+        fi
+        # <<< otty shell integration <<<
+    "#};
+
+    const OTTY_1_6_BASH_PROFILE_SHIM: &str = indoc::indoc! {r#"
+        # >>> otty bash-profile shim >>>
+        # Otty: login bash reads the profile, not ~/.bashrc — pull it in so
+        # the shell-integration block in ~/.bashrc is reached (e.g. in tmux).
+        if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+        # <<< otty bash-profile shim >>>
+    "#};
+
+    fn bash_post_integration(dotfile_name: &'static str) -> (DotfileShellIntegration, String) {
+        let home = directories::home_dir().unwrap();
+        let integration = DotfileShellIntegration {
+            shell: Shell::Bash,
+            pre: false,
+            post: true,
+            dotfile_directory: home,
+            dotfile_name,
+        };
+        let post = format!(
+            "{}\n{}\n",
+            integration.description(When::Post),
+            integration.source_text(When::Post).unwrap()
+        );
+        (integration, post)
+    }
+
+    /// The same filtering `is_installed` applies before `matches_text`.
+    fn filter_like_is_installed(contents: &str) -> String {
+        Regex::new(r"(?m)^\s*(#.*)?\n")
+            .unwrap()
+            .replace_all(contents, "")
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn test_post_matches_with_otty_1_6_trailers() {
+        let cases = [
+            (".bashrc", vec![OTTY_1_6_BASHRC_BLOCK]),
+            (".bash_profile", vec![OTTY_1_6_BASH_PROFILE_SHIM]),
+            (".bash_profile", vec![OTTY_1_6_BASH_PROFILE_SHIM, OTTY_1_6_BASHRC_BLOCK]),
+        ];
+        for (dotfile, trailers) in cases {
+            let (integration, post) = bash_post_integration(dotfile);
+            let trailing: String = trailers.iter().map(|t| format!("\n{t}")).collect();
+            let contents = format!(". \"$HOME/.cargo/env\"\n{post}{trailing}");
+
+            integration
+                .matches_text(&filter_like_is_installed(&contents), When::Post)
+                .unwrap_or_else(|err| panic!("{dotfile} with {trailers:?}: {err:?}"));
+
+            let (body, split_trailing) = split_trailing_foreign_integrations(&contents);
+            assert!(body.trim_end().ends_with(post.trim_end()), "{dotfile}: {body}");
+            assert_eq!(split_trailing.trim(), trailing.trim(), "{dotfile}");
+        }
+    }
+
+    #[test]
+    fn test_post_repair_lands_above_otty_1_6_block() {
+        let (integration, post) = bash_post_integration(".bashrc");
+        // Settings repair strips the post block, then reinserts it above foreign trailers.
+        let without_post = format!(". \"$HOME/.cargo/env\"\n\n{OTTY_1_6_BASHRC_BLOCK}");
+        let (body, trailing) = split_trailing_foreign_integrations(&without_post);
+        let repaired = format!("{}\n{post}{trailing}", body.trim_end());
+
+        assert!(
+            repaired.ends_with(OTTY_1_6_BASHRC_BLOCK),
+            "Otty keeps the end: {repaired}"
+        );
+        integration
+            .matches_text(&filter_like_is_installed(&repaired), When::Post)
+            .expect("repaired .bashrc must pass the status check");
+    }
+
+    #[test]
+    fn test_unknown_otty_block_is_not_a_trailer() {
+        let contents =
+            "export A=1\n\n# >>> otty path >>>\nexport PATH=\"$HOME/.otty/bin:$PATH\"\n# <<< otty path <<<\n";
+        let (body, trailing) = split_trailing_foreign_integrations(contents);
+        assert_eq!(
+            body, contents,
+            "install must append post below blocks status cannot peel"
+        );
+        assert!(trailing.is_empty());
+    }
+
+    #[test]
+    fn test_mid_file_otty_shim_does_not_hide_a_misplaced_post() {
+        let (integration, post) = bash_post_integration(".bash_profile");
+        let contents = format!("{post}\n{OTTY_1_6_BASH_PROFILE_SHIM}\nexport AFTER=1\n");
+        assert!(matches!(
+            integration.matches_text(&filter_like_is_installed(&contents), When::Post),
+            Err(Error::ImproperInstallation(_))
+        ));
     }
 
     #[cfg(target_os = "linux")]
