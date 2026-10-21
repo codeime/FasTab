@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.13
+
+- fix: recognize Otty 1.6 bashrc and bash-profile trailers so Settings reports a valid shell install as ready, and surface a repair error when the rewrite still fails the status check.
+
 ## v0.0.12
 
 - fix: keep the completion list open when focus moves within the same VS Code / Cursor terminal pane, and dismiss it when another terminal tab takes focus.
