@@ -104,6 +104,8 @@ Three cooperating native processes communicate via Unix domain sockets (protobuf
 - **`SizeInfo::new` clamps to `MIN_SCREEN_LINES` x `MIN_COLUMNS`.** A 0x0 tty used to panic in `cursor_cell`, and with `panic = "abort"` that closed the tab, since fterm runs in place of the shell.
 - **Socket checks in `fastab_ipc::unix_socket` use `std::fs`.** `tokio::fs` sent each `stat`/`chmod` to a blocking-pool thread, so every reconnect started a thread that retired 10 s later and left its allocator pages behind.
 
+`scripts/fterm-footprint-ab.py NAME=PATH...` compares builds in fresh ptys without a desktop app. CI on `main` runs it for the default build against `--features system-allocator`.
+
 **That one line of scrollback is load-bearing — do not take `max_scroll_limit` to 0.** `get_current_buffer` bails when `topmost_line() > cmd_cursor.line`, and `topmost_line()` is `Line(-history_size)`. With one line of history a prompt that has just scrolled off the top of the viewport is still readable; with none, that read returns `None` and the edit buffer is lost for the rest of the command.
 
 `fterm`'s Tokio pool is two workers, not one per core. The main loop is a single `block_on`; the rest is I/O. A ten-core machine used to start ten worker threads in every tab just to sit idle.

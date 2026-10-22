@@ -234,3 +234,35 @@ jobs:
       - name: Build release binaries (dist profile)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo build --locked --profile dist -p fastab_desktop -p fastab_term -p fastab_cli -p fastab_input_method
+
+      # One fterm stays resident per terminal tab. It binds nothing outside
+      # libSystem; a framework link that comes back costs every tab its
+      # initializers and data pages (crates/fastab_term/build.rs).
+      - name: Verify fterm links only libSystem
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          links="$(otool -L target/dist/fterm | tail -n +2 | awk '{print $1}')"
+          echo "$links"
+          test "$links" = "/usr/lib/libSystem.B.dylib"
+
+      # Rebuilding only fastab_term reuses every other dist artifact; afterwards
+      # target/dist/fterm is the system-allocator build. A measurement, not a
+      # gate: a runner without `footprint` must not fail main.
+      - name: Compare fterm footprint (mimalloc vs system allocator)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          mkdir -p target/fterm-allocator-ab
+          cp target/dist/fterm target/fterm-allocator-ab/fterm-mimalloc
+          cargo build --locked --profile dist -p fastab_term --features system-allocator
+          cp target/dist/fterm target/fterm-allocator-ab/fterm-system
+          python3 scripts/fterm-footprint-ab.py --rounds 5 \
+            mimalloc=target/fterm-allocator-ab/fterm-mimalloc \
+            system=target/fterm-allocator-ab/fterm-system | tee target/fterm-allocator-ab/footprint.txt
+
+      - name: Upload fterm allocator builds
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fterm-allocator-ab
+          path: target/fterm-allocator-ab/
