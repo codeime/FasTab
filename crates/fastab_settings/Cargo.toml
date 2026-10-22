@@ -24,6 +24,7 @@ r2d2_sqlite.workspace = true
 rusqlite = { workspace = true, features = ["bundled", "serde_json"] }
 serde_json.workspace = true
 serde.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -31,6 +32,3 @@ url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
