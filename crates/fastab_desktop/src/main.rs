@@ -100,6 +100,38 @@ fn main() -> ExitCode {
     }
 }
 
+/// launchd starts the app with a 256-descriptor soft limit. One remote IPC
+/// connection per terminal pane (up to 128), local connections (up to 64),
+/// SQLite, logs, Metal and the pipes of running hook scripts share it, so a
+/// large session could hit EMFILE and lose completions in new panes. Raise
+/// the soft limit toward the hard one; `OPEN_MAX` is the most macOS accepts.
+#[cfg(target_os = "macos")]
+fn raise_open_file_limit() {
+    const OPEN_MAX: libc::rlim_t = 10_240;
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read or write the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        warn!(err = %std::io::Error::last_os_error(), "Failed to read the open file limit");
+        return;
+    }
+    let target = OPEN_MAX.min(limit.rlim_max);
+    if limit.rlim_cur >= target {
+        return;
+    }
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = target;
+    // SAFETY: as above; the soft limit stays at or below the hard one.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        warn!(err = %std::io::Error::last_os_error(), previous, target, "Failed to raise the open file limit");
+    } else {
+        tracing::info!(previous, target, "Raised the open file limit");
+    }
+}
+
 /// Everything that has to happen before the UI loop starts. `Err` carries the
 /// exit code for the paths that stop short of launching.
 async fn async_main() -> Result<Launch, ExitCode> {
@@ -130,6 +162,9 @@ async fn async_main() -> Result<Launch, ExitCode> {
         delete_old_log_file: false,
     })
     .expect("Failed to init logging");
+
+    #[cfg(target_os = "macos")]
+    raise_open_file_limit();
 
     // macOS Tahoe's autofill heuristic controller attaches an "AutoFill (…)" helper to
     // any app with text input. SMS / contact autofill is not useful here, and the helper
