@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.0.14
+
+- fix: replace settings.json atomically and stop rewriting it as `{}` when it fails to parse; an unparsable file is kept and backed up, and a symlinked settings file keeps its link.
+- fix: count accepted-suggestion deletions and cursor moves in shell cursor positions, so emoji and accented names no longer delete the character before the token.
+- fix: raise the open file limit at launch so large sessions with many terminal panes keep their completions.
+- fix: update the Nushell integration to current Nushell syntax and quote shell init values safely.
+- fix: keep a terminal tab open when the terminal reports a zero size, instead of crashing the session.
+- change: reduce the memory each open terminal tab uses, by dropping unused system frameworks, allocating the alternate-screen buffer only while it is shown, and trimming allocator and database overhead.
+
 ## v0.0.13
 
 - fix: recognize Otty 1.6 bashrc and bash-profile trailers so Settings reports a valid shell install as ready, and surface a repair error when the rewrite still fails the status check.
