@@ -141,10 +141,11 @@ impl Db {
             .idle_timeout(Some(idle_timeout))
             .connection_timeout(std::time::Duration::from_secs(3));
         if light {
-            builder = builder.thread_pool(Arc::new(scheduled_thread_pool::ScheduledThreadPool::with_name(
-                "sqlite-pool-{}",
-                1,
-            )));
+            let thread_pool = scheduled_thread_pool::ScheduledThreadPool::builder()
+                .num_threads(1)
+                .thread_name_pattern("sqlite-pool-{}")
+                .build();
+            builder = builder.thread_pool(Arc::new(thread_pool));
         }
         let pool = builder.build(conn)?;
 
