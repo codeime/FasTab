@@ -6,22 +6,22 @@ def pathadd [path: string] {
   }
 }
 
-let-env PATH = pathadd $"($env.HOME)/.local/bin"
-let-env Q_SHELL = (^{{CLI_BINARY_NAME}} _ get-shell)
+$env.PATH = pathadd $"($env.HOME)/.local/bin"
+$env.Q_SHELL = (^{{CLI_BINARY_NAME}} _ get-shell)
 
-let-env PATH = $env.PATH
+$env.PATH = $env.PATH
 
-def-env fig_osc [s: string] {
+def --env fig_osc [s: string] {
   $"(ansi -o '697');($s)(char bel)"
 }
 
-def-env print_fig_osc [s: string] {
+def --env print_fig_osc [s: string] {
   print -n $"(fig_osc $s)"
 }
 
-def-env fig_reset_hooks [] {
-  let pre_prompt_hook = ($env.config.hooks.pre_prompt | append {(fig_pre_prompt_hook)})
-  let pre_execution_hook = ($env.config.hooks.pre_execution | append {(fig_pre_execution_hook)})
+def --env fig_reset_hooks [] {
+  let pre_prompt_hook = ($env.config.hooks.pre_prompt | default [] | append {|| fig_pre_prompt_hook })
+  let pre_execution_hook = ($env.config.hooks.pre_execution | default [] | append {|| fig_pre_execution_hook })
 
   let hooks = (
     $env.config.hooks 
@@ -29,10 +29,10 @@ def-env fig_reset_hooks [] {
     | upsert pre_execution $pre_execution_hook
   )
 
-  let-env config = ($env.config | upsert hooks $hooks)
+  $env.config = ($env.config | upsert hooks $hooks)
 }
 
-def-env fig_pre_execution_hook [] {
+def --env fig_pre_execution_hook [] {
   if "QTERM_SESSION_ID" in $env {
     print_fig_osc $"OSCLock=($env.QTERM_SESSION_ID)"
   }
@@ -111,7 +111,7 @@ def-env fig_pre_execution_hook [] {
   # }
 }
 
-def-env fig_pre_prompt_hook [] {
+def --env fig_pre_prompt_hook [] {
     print_fig_osc $"OSCUnlock=($env.QTERM_SESSION_ID)"
     print_fig_osc $"Dir=($env.PWD)"
     print_fig_osc "Shell=nu"
@@ -130,7 +130,7 @@ def-env fig_pre_prompt_hook [] {
       print_fig_osc $"Log=($env.Q_LOG_LEVEL)"
     }
 
-    print_fig_osc $"NuHintColor=($env.config.color_config.hints)"
+    print_fig_osc $"NuHintColor=($env.config.color_config.hints? | default '')"
 
     if "USER" in $env {
       print_fig_osc $"User=($env.USER)"
@@ -145,7 +145,7 @@ def-env fig_pre_prompt_hook [] {
     if (which {{CLI_BINARY_NAME}} | length) >= 1 {
       let result = ({{CLI_BINARY_NAME}} _ pre-cmd | complete)
       if $result.stdout == "EXEC_NEW_SHELL" {
-        let-env Q_DOTFILES_SOURCED = $nothing
+        $env.Q_DOTFILES_SOURCED = null
         exec nu
       } else if $result.stdout == "" {
         # do nothing
@@ -154,48 +154,48 @@ def-env fig_pre_prompt_hook [] {
       }
     }
 
-    let-env Q_HAS_SET_PROMPT = 1
+    $env.Q_HAS_SET_PROMPT = 1
 }
 
-def-env fig_set_prompt [] {
+def --env fig_set_prompt [] {
   if "PROMPT_COMMAND" in $env {
-    let-env Q_PROMPT_COMMAND = $env.PROMPT_COMMAND
-    let-env PROMPT_COMMAND = {
+    $env.Q_PROMPT_COMMAND = $env.PROMPT_COMMAND
+    $env.PROMPT_COMMAND = {||
       $"(fig_osc 'StartPrompt')(do $env.Q_PROMPT_COMMAND)"
     }
   }
   
   if "PROMPT_COMMAND_RIGHT" in $env {
-    let-env Q_PROMPT_COMMAND_RIGHT = $env.PROMPT_COMMAND_RIGHT
-    let-env PROMPT_COMMAND_RIGHT = {
+    $env.Q_PROMPT_COMMAND_RIGHT = $env.PROMPT_COMMAND_RIGHT
+    $env.PROMPT_COMMAND_RIGHT = {||
       $"(fig_osc 'StartPrompt')(do $env.Q_PROMPT_COMMAND_RIGHT)(fig_osc 'EndPrompt')"
     }
   }
 
   if "PROMPT_INDICATOR" in $env {
-    let-env Q_PROMPT_INDICATOR = $env.PROMPT_INDICATOR
-    let-env PROMPT_INDICATOR = {
+    $env.Q_PROMPT_INDICATOR = $env.PROMPT_INDICATOR
+    $env.PROMPT_INDICATOR = {||
       $"(do $env.Q_PROMPT_INDICATOR)(fig_osc 'EndPrompt')(fig_osc $"NewCmd=($env.QTERM_SESSION_ID)")"
     }
   }
 
   if "PROMPT_INDICATOR_VI_INSERT" in $env {
-    let-env Q_PROMPT_INDICATOR_VI_INSERT = $env.PROMPT_INDICATOR_VI_INSERT
-    let-env PROMPT_INDICATOR_VI_INSERT = {
+    $env.Q_PROMPT_INDICATOR_VI_INSERT = $env.PROMPT_INDICATOR_VI_INSERT
+    $env.PROMPT_INDICATOR_VI_INSERT = {||
       $"(do $env.Q_PROMPT_INDICATOR_VI_INSERT)(fig_osc 'EndPrompt')(fig_osc $"NewCmd=($env.QTERM_SESSION_ID)")"
     }
   }
 
   if "PROMPT_INDICATOR_VI_NORMAL" in $env {
-    let-env Q_PROMPT_INDICATOR_VI_NORMAL = $env.PROMPT_INDICATOR_VI_NORMAL
-    let-env PROMPT_INDICATOR_VI_NORMAL = {
+    $env.Q_PROMPT_INDICATOR_VI_NORMAL = $env.PROMPT_INDICATOR_VI_NORMAL
+    $env.PROMPT_INDICATOR_VI_NORMAL = {||
       $"(do $env.Q_PROMPT_INDICATOR_VI_NORMAL)(fig_osc 'EndPrompt')(fig_osc $"NewCmd=($env.QTERM_SESSION_ID)")"
     }
   }
 
   if "PROMPT_MULTILINE_INDICATOR" in $env {
-    let-env Q_PROMPT_MULTILINE_INDICATOR = $env.PROMPT_MULTILINE_INDICATOR
-    let-env PROMPT_MULTILINE_INDICATOR = {
+    $env.Q_PROMPT_MULTILINE_INDICATOR = $env.PROMPT_MULTILINE_INDICATOR
+    $env.PROMPT_MULTILINE_INDICATOR = {||
       $"(fig_osc 'StartPrompt')(do $env.Q_PROMPT_MULTILINE_INDICATOR)(fig_osc 'EndPrompt')"
     }
   }

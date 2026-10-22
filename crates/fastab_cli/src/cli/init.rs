@@ -52,13 +52,34 @@ enum GuardAssignment {
     AfterSourcing,
 }
 
+/// Escapes `value` for a double-quoted string in `shell`. Values are paths
+/// (`Q_SHELL`, the `qterm.path` setting); a `$`, backtick or quote in one must
+/// stay literal instead of being expanded or ending the string early.
+fn escape_double_quoted(shell: &Shell, value: &str) -> String {
+    let special: &[char] = match shell {
+        Shell::Bash | Shell::Zsh => &['\\', '"', '$', '`'],
+        Shell::Fish => &['\\', '"', '$'],
+        Shell::Nu => &['\\', '"'],
+    };
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if special.contains(&ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn assign_shell_variable(shell: &Shell, name: impl Display, value: impl Display, exported: bool) -> String {
+    let value = escape_double_quoted(shell, &value.to_string());
     match (shell, exported) {
         (Shell::Bash | Shell::Zsh, false) => format!("{name}=\"{value}\""),
         (Shell::Bash | Shell::Zsh, true) => format!("export {name}=\"{value}\""),
         (Shell::Fish, false) => format!("set -g {name} \"{value}\""),
         (Shell::Fish, true) => format!("set -gx {name} \"{value}\""),
-        (Shell::Nu, _) => format!("let-env {name} = \"{value}\";"),
+        // `let-env` was removed from Nushell (0.83).
+        (Shell::Nu, _) => format!("$env.{name} = \"{value}\""),
     }
 }
 
@@ -73,7 +94,8 @@ fn guard_source(
     output.push(match shell {
         Shell::Bash | Shell::Zsh => format!("if [ -z \"${{{guard_var}}}\" ]; then").into(),
         Shell::Fish => format!("if test -z \"${guard_var}\"").into(),
-        Shell::Nu => format!("if env | any name == '{guard_var}' {{").into(),
+        // Same sense as the other shells: run only while the guard is unset.
+        Shell::Nu => format!("if '{guard_var}' not-in $env {{").into(),
     });
 
     let shell_var = assign_shell_variable(shell, guard_var, "1", export);
@@ -270,6 +292,36 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use super::*;
+
+    #[test]
+    fn assigned_values_stay_literal_inside_double_quotes() {
+        let path = r#"/opt/a"b$c`d\e"#;
+        assert_eq!(
+            assign_shell_variable(&Shell::Zsh, "Q_TERM_PATH", path, false),
+            r#"Q_TERM_PATH="/opt/a\"b\$c\`d\\e""#
+        );
+        assert_eq!(
+            assign_shell_variable(&Shell::Fish, "Q_TERM_PATH", path, true),
+            r#"set -gx Q_TERM_PATH "/opt/a\"b\$c`d\\e""#
+        );
+        assert_eq!(
+            assign_shell_variable(&Shell::Nu, "Q_TERM_PATH", path, false),
+            r#"$env.Q_TERM_PATH = "/opt/a\"b$c`d\\e""#
+        );
+        assert_eq!(
+            assign_shell_variable(&Shell::Bash, "Q_SHELL", "/bin/zsh", false),
+            r#"Q_SHELL="/bin/zsh""#
+        );
+    }
+
+    #[test]
+    fn nu_guard_runs_only_while_unset() {
+        let output = guard_source(&Shell::Nu, false, "G", GuardAssignment::BeforeSourcing, "echo hi");
+        assert!(
+            output.starts_with("if 'G' not-in $env {\n  $env.G = \"1\"\n"),
+            "{output}"
+        );
+    }
 
     fn run_shell_stdout(shell: &Shell, text: &str) -> String {
         let mut child = Command::new(shell.as_str())
