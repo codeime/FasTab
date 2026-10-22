@@ -33,6 +33,7 @@ use fastab_settings::keybindings::{KeyBinding, KeyBindings};
 use gpui::{App, AppContext as _, Entity, Pixels, Point, Size, px, size};
 use tao::dpi::{LogicalPosition, LogicalSize, Position};
 use tracing::{debug, error, warn};
+use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 use crate::event::{Event, WindowPosition};
@@ -2580,9 +2581,9 @@ fn predicted_buffer_after_insert_with_offset(
     if cursor > buffer.len() || !buffer.is_char_boundary(cursor) {
         return None;
     }
-    let insertion_cursor = move_utf16_cursor(buffer, cursor, offset);
+    let insertion_cursor = move_edit_cursor(buffer, cursor, offset);
     let deletion = usize::try_from(deletion).ok()?;
-    let deletion_start = previous_utf16_boundary(buffer, insertion_cursor, deletion);
+    let deletion_start = previous_edit_boundary(buffer, insertion_cursor, deletion);
     let mut result =
         String::with_capacity(buffer.len().saturating_sub(insertion_cursor - deletion_start) + insertion.len());
     result.push_str(&buffer[..deletion_start]);
@@ -2597,12 +2598,12 @@ fn predicted_buffer_after_insert_with_offset(
     while offset < insertion.len() {
         let remaining = insertion.get(offset..)?;
         if remaining.starts_with("\x1b[D") {
-            predicted_cursor = previous_utf16_boundary(&result, predicted_cursor, 1);
+            predicted_cursor = previous_edit_boundary(&result, predicted_cursor, 1);
             offset += "\x1b[D".len();
             continue;
         }
         if remaining.starts_with("\x1b[C") {
-            predicted_cursor = next_utf16_boundary(&result, predicted_cursor, 1);
+            predicted_cursor = next_edit_boundary(&result, predicted_cursor, 1);
             offset += "\x1b[C".len();
             continue;
         }
@@ -2614,15 +2615,30 @@ fn predicted_buffer_after_insert_with_offset(
     Some((result, u32::try_from(predicted_cursor).ok()?))
 }
 
-fn move_utf16_cursor(buffer: &str, cursor: usize, offset: i64) -> usize {
+fn move_edit_cursor(buffer: &str, cursor: usize, offset: i64) -> usize {
     if offset < 0 {
-        previous_utf16_boundary(buffer, cursor, offset.unsigned_abs() as usize)
+        previous_edit_boundary(buffer, cursor, offset.unsigned_abs() as usize)
     } else {
-        next_utf16_boundary(buffer, cursor, offset as usize)
+        next_edit_boundary(buffer, cursor, offset as usize)
     }
 }
 
-fn previous_utf16_boundary(text: &str, from: usize, units: usize) -> usize {
+/// A zero-width mark (combining accent, ZWJ, variation selector) rides on the
+/// character before it. Readline, fish and zsh with `COMBINING_CHARS` (macOS's
+/// `/etc/zshrc` sets it) move and delete over the whole cluster, so one `\x08`
+/// or `\x1b[D` covers a character plus the marks that follow it. The WebView
+/// counted JS `.length` (UTF-16 code units) instead, which made an emoji cost
+/// two backspaces and ate the character before it.
+fn is_attached_mark(ch: char) -> bool {
+    !ch.is_control() && ch.width() == Some(0)
+}
+
+/// How many shell cursor positions `text` spans.
+fn edit_units(text: &str) -> usize {
+    text.chars().filter(|&ch| !is_attached_mark(ch)).count()
+}
+
+fn previous_edit_boundary(text: &str, from: usize, units: usize) -> usize {
     let prefix = text.get(..from).unwrap_or(text);
     let mut remaining = units;
     let mut boundary = from.min(prefix.len());
@@ -2631,21 +2647,26 @@ fn previous_utf16_boundary(text: &str, from: usize, units: usize) -> usize {
             break;
         }
         boundary = index;
-        remaining = remaining.saturating_sub(ch.len_utf16());
+        // Walking backwards meets a cluster's marks before its character.
+        if !is_attached_mark(ch) {
+            remaining -= 1;
+        }
     }
     if remaining > 0 { 0 } else { boundary }
 }
 
-fn next_utf16_boundary(text: &str, from: usize, units: usize) -> usize {
+fn next_edit_boundary(text: &str, from: usize, units: usize) -> usize {
     let suffix = text.get(from..).unwrap_or("");
     let mut remaining = units;
     let mut boundary = from.min(text.len());
     for (index, ch) in suffix.char_indices() {
-        if remaining == 0 {
-            break;
+        if !is_attached_mark(ch) {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
         }
         boundary = from + index + ch.len_utf8();
-        remaining = remaining.saturating_sub(ch.len_utf16());
     }
     boundary
 }
@@ -2664,7 +2685,7 @@ fn insertion_for(name: &str, search_term: &str) -> (String, i64) {
     } else {
         (
             name.to_string(),
-            deletion_term_for_search(search_term).encode_utf16().count() as i64,
+            edit_units(&deletion_term_for_search(search_term)) as i64,
         )
     }
 }
@@ -2781,7 +2802,7 @@ fn insertion_edit_for_raw_search(
     // characters (including escapes), not the decoded value, or they can eat
     // the opening quote as well.
     let deletion = if deletion > 0 {
-        closed_shell_quote_inner(raw_search).map_or(deletion, |(_, inner)| inner.encode_utf16().count() as i64)
+        closed_shell_quote_inner(raw_search).map_or(deletion, |(_, inner)| edit_units(inner) as i64)
     } else {
         deletion
     };
@@ -2910,7 +2931,7 @@ fn apply_shortcut_palette_deletion(
     if ranking_root_command(buffer, None) != "?" {
         return (insertion, deletion);
     }
-    let query = search_term.encode_utf16().count() as i64;
+    let query = edit_units(search_term) as i64;
     (full_text.to_string(), query + 2)
 }
 
@@ -3069,7 +3090,7 @@ fn resolve_cursor_marker(mut text: String) -> String {
     let Some(marker) = text.find(MARKER) else {
         return text;
     };
-    let after = text[marker + MARKER.len()..].encode_utf16().count();
+    let after = edit_units(&text[marker + MARKER.len()..]);
     text.replace_range(marker..marker + MARKER.len(), "");
     text.push_str(&"\x1b[D".repeat(after));
     text
@@ -4513,16 +4534,46 @@ mod tests {
     }
 
     #[test]
-    fn cursor_marker_counts_utf16_code_units() {
-        // U+1F600 is two UTF-16 code units, matching JS `string.length`.
-        assert_eq!(resolve_cursor_marker("{cursor}😀".into()), "😀\x1b[D\x1b[D");
+    fn cursor_marker_counts_characters_not_utf16_units() {
+        // The shell moves over U+1F600 with one left arrow.
+        assert_eq!(resolve_cursor_marker("{cursor}😀".into()), "😀\x1b[D");
     }
 
     #[test]
-    fn predicted_buffer_deletes_utf16_units_not_unicode_scalars() {
-        let (buffer, cursor) = predicted_buffer_after_insert("ok😀", 6, "x", 2).expect("predict");
+    fn predicted_buffer_deletes_characters_not_utf16_units() {
+        let (buffer, cursor) = predicted_buffer_after_insert("ok😀", 6, "x", 1).expect("predict");
         assert_eq!(buffer, "okx");
         assert_eq!(cursor, 3);
+        let (buffer, _) = predicted_buffer_after_insert("ok😀", 6, "x", 2).expect("predict");
+        assert_eq!(buffer, "ox");
+    }
+
+    #[test]
+    fn deletion_of_an_emoji_query_is_one_backspace_per_character() {
+        assert_eq!(insertion_for("😀.txt", "😀x"), ("😀.txt".into(), 2));
+        assert_eq!(insertion_for("src/", "😀"), ("src/".into(), 1));
+    }
+
+    #[test]
+    fn combining_marks_ride_on_the_character_before_them() {
+        // NFD `café` is five scalars but four shell positions.
+        assert_eq!(insertion_for("src/", "cafe\u{301}"), ("src/".into(), 4));
+        assert_eq!(edit_units("👍\u{1F3FD}"), 2);
+        assert_eq!(edit_units("👨\u{200D}👩"), 2);
+        assert_eq!(edit_units("❤\u{FE0F}"), 1);
+        assert_eq!(
+            resolve_cursor_marker("{cursor}e\u{301}'".into()),
+            "e\u{301}'\x1b[D\x1b[D"
+        );
+
+        let buffer = "ls cafe\u{301}";
+        let (predicted, cursor) =
+            predicted_buffer_after_insert(buffer, u32::try_from(buffer.len()).unwrap(), "x", 1).expect("predict");
+        assert_eq!(predicted, "ls cafx");
+        assert_eq!(cursor, u32::try_from("ls cafx".len()).unwrap());
+
+        assert_eq!(next_edit_boundary("e\u{301}x", 0, 1), "e\u{301}".len());
+        assert_eq!(previous_edit_boundary("xe\u{301}", "xe\u{301}".len(), 1), 1);
     }
 
     #[test]

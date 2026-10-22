@@ -168,6 +168,8 @@ The Metal renderer allocates full-window path targets only for a scene containin
 
 `overlay.rs` reproduces the WebView's `HIDDEN_UNTIL_KEYPRESS` triggers: backspacing a whole token away, and a buffer change that does not look like typing (a paste or a shell history recall). Both hide the list until the next keystroke; an insertion the overlay made itself is exempt, which is what `self_insertion` tracks.
 
+Insertion edits count shell cursor positions, not UTF-16 units or bytes: every `\x08` and `\x1b[D` moves over one character plus the zero-width marks after it (readline, fish, and zsh with `COMBINING_CHARS`, which macOS's `/etc/zshrc` sets). The WebView's JS `.length` counting deleted an extra character per emoji. `fterm` reconciles a stale `insertion_buffer` in the same units. The paste heuristic (`large_buffer_change`) still uses UTF-16 lengths on purpose.
+
 `settings.json` is replaced by temp file + `rename` (a symlink's target, even a missing one, is written and the link kept; permissions kept; stale temp files removed; plain `fsync`, not `sync_all`'s `F_FULLFSYNC`, because Settings writes on the UI thread) and is never rewritten on a failed parse: every `fterm` loads it at tab start, so the old write-`{}`-on-error path wiped hand-edited settings. An unparsable file is copied to `settings.json.invalid-<content hash>` (newest three kept) and the process runs on defaults.
 
 Relevant settings:

@@ -17,6 +17,7 @@ use flume::Sender;
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, trace, warn};
+use unicode_width::UnicodeWidthChar;
 
 use crate::event_handler::EventHandler;
 use crate::history::HistorySender;
@@ -121,6 +122,25 @@ fn create_command(
     cmd
 }
 
+/// Brings the shell's line back to the buffer the desktop computed its edit
+/// against. Each `\x08` makes the shell delete one character plus the
+/// zero-width marks after it (readline, fish, and zsh with `COMBINING_CHARS`,
+/// which macOS's `/etc/zshrc` sets), not one byte: a byte count over `文档`
+/// would also eat the space and the command before it.
+fn reconcile_insertion_buffer(buffer: &str, insertion_buffer: &str) -> String {
+    if let Some(surplus) = buffer.strip_prefix(insertion_buffer) {
+        let positions = surplus
+            .chars()
+            .filter(|ch| ch.is_control() || ch.width() != Some(0))
+            .count();
+        "\x08".repeat(positions)
+    } else if let Some(missing) = insertion_buffer.strip_prefix(buffer) {
+        missing.to_owned()
+    } else {
+        String::new()
+    }
+}
+
 async fn acquire_process_slot(slots: Arc<Semaphore>, sender: &GenerationSender) -> Option<OwnedSemaphorePermit> {
     tokio::select! {
         biased;
@@ -173,15 +193,7 @@ pub(crate) async fn process_figterm_request(
                     });
                 }
                 if let Some(ref insertion_buffer) = request.insertion_buffer {
-                    if buffer.ne(insertion_buffer) {
-                        if buffer.starts_with(insertion_buffer) {
-                            if let Some(len_diff) = buffer.len().checked_sub(insertion_buffer.len()) {
-                                insertion_string.extend(std::iter::repeat_n('\x08', len_diff));
-                            }
-                        } else if insertion_buffer.starts_with(&buffer) {
-                            insertion_string.push_str(&insertion_buffer[buffer.len()..]);
-                        }
-                    }
+                    insertion_string.push_str(&reconcile_insertion_buffer(&buffer, insertion_buffer));
                 }
             }
             insertion_string.push_str(&request.to_term_string());
@@ -538,6 +550,18 @@ pub(crate) async fn process_remote_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insertion_buffer_surplus_is_deleted_by_character() {
+        assert_eq!(reconcile_insertion_buffer("ls 文档", "ls 文"), "\x08");
+        assert_eq!(reconcile_insertion_buffer("ls 文档", "ls "), "\x08\x08");
+        assert_eq!(reconcile_insertion_buffer("ls 😀", "ls "), "\x08");
+        assert_eq!(reconcile_insertion_buffer("ls cafe\u{301}", "ls caf"), "\x08");
+        assert_eq!(reconcile_insertion_buffer("git ch", "git c"), "\x08");
+        assert_eq!(reconcile_insertion_buffer("ls ", "ls 文"), "文");
+        assert_eq!(reconcile_insertion_buffer("ls 文", "ls 文"), "");
+        assert_eq!(reconcile_insertion_buffer("cd a", "ls b"), "");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
