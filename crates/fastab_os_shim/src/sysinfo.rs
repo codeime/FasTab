@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 
 use crate::Shim;
@@ -26,19 +25,6 @@ mod inner {
 impl SysInfo {
     pub fn new_fake() -> Self {
         Self(inner::Inner::Fake(Arc::new(Mutex::new(inner::Fake::default()))))
-    }
-
-    /// Returns whether the process containing `name` is running.
-    pub fn is_process_running(&self, name: &str) -> bool {
-        use inner::Inner;
-        match &self.0 {
-            Inner::Real => {
-                let system = sysinfo::System::new_all();
-
-                system.processes_by_name(&OsString::from(name)).next().is_some()
-            },
-            Inner::Fake(fake) => fake.lock().unwrap().process_names.contains(name),
-        }
     }
 
     pub fn add_running_processes(&self, process_names: &[&str]) {

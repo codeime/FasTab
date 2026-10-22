@@ -261,7 +261,7 @@ pub(crate) async fn spawn_figterm_ipc(
         }
     }
 
-    tokio::fs::remove_file(&socket_path).await.ok();
+    std::fs::remove_file(&socket_path).ok();
     let socket_listener = tokio::net::UnixListener::bind(&socket_path)?;
     let socket_file = SocketFile::new(socket_path);
 

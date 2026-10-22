@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthChar;
 use self::cell::FigFlags;
 use crate::ansi::{self, Attr, CharsetIndex, Color, Handler, NamedColor, StandardCharset};
 use crate::event::{DelayedEvent, Event, EventListener};
-use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
+use crate::grid::{Cursor, Dimensions, Grid, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Rect};
 use crate::term::cell::{Cell, LineLength, ShellFlags};
 use crate::term::color::{Colors, Rgb};
@@ -80,8 +80,16 @@ pub struct SizeInfo {
 }
 
 impl SizeInfo {
+    /// A tty can report 0x0 (an unsized pty, a collapsed pane). The grid
+    /// indexes `columns - 1` and the last line, so a zero dimension would
+    /// panic, and fterm runs in place of the shell, so that takes the tab
+    /// down. Clamp the way upstream Alacritty does; the inner pty keeps the
+    /// size the outer terminal reported.
     pub fn new(screen_lines: usize, columns: usize) -> SizeInfo {
-        SizeInfo { screen_lines, columns }
+        SizeInfo {
+            screen_lines: max(screen_lines, MIN_SCREEN_LINES),
+            columns: max(columns, MIN_COLUMNS),
+        }
     }
 
     #[inline]
@@ -204,9 +212,14 @@ pub struct Term<T> {
 
     /// Currently inactive grid.
     ///
-    /// Opposite of the active grid. While the alternate screen buffer is active, this will be the
-    /// primary grid. Otherwise it is the alternate screen buffer.
-    inactive_grid: Grid<Cell>,
+    /// While the alternate screen buffer is active, this is the primary grid. Outside it there is
+    /// none: entering the alternate screen clears every cell anyway, so a full-size second grid
+    /// was ~24 bytes a cell of every resident fterm (0.6 MB at 80x300) for a screen most shells
+    /// never open. `ALT_SCREEN` is set exactly when this is `Some`.
+    inactive_grid: Option<Grid<Cell>>,
+
+    /// The alternate screen's DECSC state, which outlives leaving that screen.
+    alt_saved_cursor: Cursor<Cell>,
 
     /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
     active_charset: CharsetIndex,
@@ -260,7 +273,6 @@ impl<T> Term<T> {
 
         // TODO: determine max_scroll_limit
         let grid = Grid::new(num_lines, num_cols, max_scroll_limit);
-        let alt = Grid::new(num_lines, num_cols, 0);
 
         let tabs = TabStops::new(grid.columns());
 
@@ -272,7 +284,8 @@ impl<T> Term<T> {
 
         Term {
             grid,
-            inactive_grid: alt,
+            inactive_grid: None,
+            alt_saved_cursor: Cursor::default(),
             active_charset: Default::default(),
             tabs,
             mode: Default::default(),
@@ -419,7 +432,9 @@ impl<T> Term<T> {
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        if let Some(inactive_grid) = &mut self.inactive_grid {
+            inactive_grid.resize(is_alt, num_lines, num_cols);
+        }
 
         // Reset scrolling region.
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
@@ -433,18 +448,33 @@ impl<T> Term<T> {
 
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
-        if !self.mode.contains(TermMode::ALT_SCREEN) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            // Leaving: restore the primary grid and release the alternate one,
+            // keeping only its saved cursor. `ALT_SCREEN` always carries the
+            // primary grid; were it missing, only the mode would change.
+            let Some(primary) = self.inactive_grid.take() else {
+                self.mode.remove(TermMode::ALT_SCREEN);
+                return;
+            };
+            let alt = mem::replace(&mut self.grid, primary);
+            self.alt_saved_cursor = alt.saved_cursor;
+        } else {
+            let mut alt = Grid::new(self.screen_lines(), self.columns(), 0);
+            alt.saved_cursor = self.alt_saved_cursor.clone();
+
             // Set alt screen cursor to the current primary screen cursor.
-            self.inactive_grid.cursor = self.grid.cursor.clone();
+            alt.cursor = self.grid.cursor.clone();
 
             // Drop information about the primary screens saved cursor.
             self.grid.saved_cursor = self.grid.cursor.clone();
 
-            // Reset alternate screen contents.
-            self.inactive_grid.reset_region(..);
+            // Reset alternate screen contents with the cursor's template, as
+            // clearing the kept grid did.
+            alt.reset_region(..);
+
+            self.inactive_grid = Some(mem::replace(&mut self.grid, alt));
         }
 
-        mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
     }
 
@@ -1358,12 +1388,12 @@ impl<T: EventListener> Handler for Term<T> {
     /// Reset all important fields in the term struct.
     #[inline]
     fn reset_state(&mut self) {
-        if self.mode.contains(TermMode::ALT_SCREEN) {
-            mem::swap(&mut self.grid, &mut self.inactive_grid);
+        if let Some(primary) = self.inactive_grid.take() {
+            self.grid = primary;
         }
+        self.alt_saved_cursor = Cursor::default();
         self.active_charset = Default::default();
         self.grid.reset();
-        self.inactive_grid.reset();
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();
@@ -2065,6 +2095,58 @@ mod tests {
     use crate::event::VoidListener;
     use crate::grid::Scroll;
     use crate::index::{Column, Point};
+
+    #[test]
+    fn a_zero_sized_tty_is_clamped_instead_of_panicking() {
+        let size = SizeInfo::new(0, 0);
+        assert_eq!((size.screen_lines, size.columns), (MIN_SCREEN_LINES, MIN_COLUMNS));
+
+        let mut term = Term::new_test(size, VoidListener, 10);
+        term.input('a');
+        term.newline();
+        term.resize(SizeInfo::new(24, 80));
+        term.resize(SizeInfo::new(0, 0));
+        term.input('b');
+        assert_eq!(term.columns(), MIN_COLUMNS);
+        assert_eq!(term.screen_lines(), MIN_SCREEN_LINES);
+    }
+
+    #[test]
+    fn the_alternate_grid_exists_only_while_its_screen_is_shown() {
+        let mut term = Term::new_test(SizeInfo::new(5, 10), VoidListener, 10);
+        assert!(term.inactive_grid.is_none());
+        term.input('p');
+
+        term.set_mode(ansi::Mode::SwapScreenAndSetRestoreCursor);
+        assert!(term.mode.contains(TermMode::ALT_SCREEN));
+        assert!(term.inactive_grid.is_some());
+        // Entry clears the screen and starts at the primary cursor.
+        assert_eq!(term.grid[Line(0)][Column(0)].c, ' ');
+        assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(1)));
+        term.goto(Line(2), Column(3));
+        term.save_cursor_position();
+        term.input('a');
+
+        term.resize(SizeInfo::new(6, 12));
+        assert_eq!(term.inactive_grid.as_ref().unwrap().columns(), 12);
+
+        term.unset_mode(ansi::Mode::SwapScreenAndSetRestoreCursor);
+        assert!(!term.mode.contains(TermMode::ALT_SCREEN));
+        assert!(term.inactive_grid.is_none());
+        assert_eq!(term.grid[Line(0)][Column(0)].c, 'p');
+        assert_eq!(term.columns(), 12);
+
+        // The alternate screen's DECSC state survives leaving it.
+        term.set_mode(ansi::Mode::SwapScreenAndSetRestoreCursor);
+        assert_eq!(term.grid[Line(2)][Column(3)].c, ' ');
+        term.restore_cursor_position();
+        assert_eq!(term.grid.cursor.point, Point::new(Line(2), Column(3)));
+
+        term.reset_state();
+        assert!(!term.mode.contains(TermMode::ALT_SCREEN));
+        assert!(term.inactive_grid.is_none());
+        assert_eq!(term.alt_saved_cursor, Cursor::default());
+    }
 
     #[test]
     fn scroll_display_page_up() {

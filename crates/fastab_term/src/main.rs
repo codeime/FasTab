@@ -1,3 +1,4 @@
+mod allocator;
 #[cfg(target_os = "linux")]
 mod cleanup;
 pub mod cli;
@@ -19,7 +20,7 @@ use std::env;
 use std::ffi::{CString, OsStr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::ansi::Processor;
@@ -213,12 +214,12 @@ async fn write_insert_bytes(
 
 #[derive(Default)]
 struct InsertionRetry {
-    owner: Option<SystemTime>,
+    owner: Option<Instant>,
     deadline: Option<tokio::time::Instant>,
 }
 
 impl InsertionRetry {
-    fn update(&mut self, owner: Option<SystemTime>) {
+    fn update(&mut self, owner: Option<Instant>) {
         if self.owner != owner {
             self.owner = owner;
             self.deadline = owner.map(|_| tokio::time::Instant::now() + Duration::from_millis(16));
@@ -430,9 +431,6 @@ async fn finish_pty_sync(
     Ok(())
 }
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 const BUFFER_SIZE: usize = 16384;
 
 pub(crate) struct PendingInsertion {
@@ -443,7 +441,9 @@ pub(crate) struct PendingInsertion {
 }
 
 pub(crate) struct InsertionLock {
-    at: SystemTime,
+    /// Monotonic: a wall-clock step backwards must not keep the lock (and
+    /// with it every edit-buffer frame) held until the clock catches up.
+    at: Instant,
     expected: String,
     origin: RequestOrigin,
 }
@@ -741,7 +741,7 @@ where
 fn insertion_lock_is_active<T: EventListener>(handle: &mut Option<InsertionLock>, term: &Term<T>) -> bool {
     match handle.as_ref() {
         Some(lock) => {
-            let lock_expired = lock.at.elapsed().unwrap_or(Duration::ZERO) > Duration::from_millis(16);
+            let lock_expired = lock.at.elapsed() > Duration::from_millis(16);
             let should_unlock = lock_expired
                 || term
                     .get_current_buffer()
@@ -1258,13 +1258,14 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                                         .clone()
                                                         .and_then(|b| String::from_utf8(b.to_vec()).ok())
                                                         .unwrap_or_default();
-                                                    let context = shell_state_to_context(term.shell_state());
-                                                    let hook = fastab_proto::remote_hooks::new_intercepted_key_hook(
-                                                        context, action, s,
-                                                    );
-                                                    // The desktop's InterceptedKey handler does not
-                                                    // apply its context, so it must not advance the
+                                                    // The desktop neither applies nor reads a key's
+                                                    // context, so do not clone, encode and decode the
+                                                    // environment and aliases on every arrow key. For
+                                                    // the same reason the key must not advance the
                                                     // generation's context synchronization marker.
+                                                    let hook = fastab_proto::remote_hooks::new_intercepted_key_hook(
+                                                        None, action, s,
+                                                    );
                                                     let admitted = key_generation.is_some_and(|generation| {
                                                         remote_sender
                                                             .for_generation(generation)
@@ -2452,7 +2453,7 @@ mod tests {
                 parser.advance(&mut term, *byte);
             }
             let mut lock = Some(InsertionLock {
-                at: SystemTime::now(),
+                at: Instant::now(),
                 expected: "pending".into(),
                 origin: RequestOrigin::Local,
             });

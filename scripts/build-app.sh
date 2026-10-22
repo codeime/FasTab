@@ -289,6 +289,15 @@ node "${REPO_DIR}/scripts/build-spec-inputs.mjs" \
 cp "${BIN_BUILD_SNAPSHOT}/${APP_NAME}" "$MACOS_DIR/"
 cp "${BIN_BUILD_SNAPSHOT}/ftab"        "$MACOS_DIR/"
 cp "${BIN_BUILD_SNAPSHOT}/fterm"      "$MACOS_DIR/"
+# fterm stays resident once per terminal tab and binds nothing outside
+# libSystem; crates/fastab_term/build.rs drops the unused framework links.
+# Each one that comes back costs every tab its initializers and data pages.
+fterm_links="$(otool -L "${MACOS_DIR}/fterm" | tail -n +2 | awk '{print $1}')"
+if [ "$fterm_links" != "/usr/lib/libSystem.B.dylib" ]; then
+  echo "error: fterm links more than libSystem:" >&2
+  echo "$fterm_links" >&2
+  exit 1
+fi
 # Older shell sessions still resolve the previous PTY entry point.
 ln -s fterm "${MACOS_DIR}/fastabterm"
 

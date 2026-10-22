@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::term::ShellState;
@@ -187,7 +187,7 @@ pub(crate) async fn process_figterm_request(
                     let expected = format!("{buffer}{text_to_insert}");
                     trace!(?expected, "lock set, expected buffer");
                     *INSERTION_LOCK.lock().unwrap() = Some(InsertionLock {
-                        at: SystemTime::now(),
+                        at: Instant::now(),
                         expected,
                         origin,
                     });

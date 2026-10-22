@@ -18,6 +18,8 @@ workspace = true
 # Tests that do not work on CI
 desktop-tests = []
 profiling_early_exit = []
+# Build with the system allocator instead of mimalloc, for footprint A/B runs.
+system-allocator = []
 
 [dependencies]
 alacritty_terminal = { path = "../alacritty_terminal" }

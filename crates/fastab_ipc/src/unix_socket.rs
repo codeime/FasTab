@@ -14,6 +14,10 @@ impl std::fmt::Display for OctalU32 {
     }
 }
 
+/// The checks here are a `stat` or `chmod` on a local socket path, microseconds
+/// each, so they run inline. `tokio::fs` would hand each one to a blocking-pool
+/// thread, and fterm, whose stdin reader already holds one, started and retired
+/// another for every reconnect (each leaving its allocator pages behind).
 pub async fn validate_socket(socket: impl AsRef<Path>) -> Result<(), ConnectError> {
     cfg_if::cfg_if! {
             if #[cfg(unix)] {
@@ -21,7 +25,7 @@ pub async fn validate_socket(socket: impl AsRef<Path>) -> Result<(), ConnectErro
 
             let socket = socket.as_ref();
 
-            match tokio::fs::metadata(socket).await {
+            match std::fs::metadata(socket) {
                 Ok(metadata) => {
                     let mode = metadata.permissions().mode();
                     if validate_mode_bits(mode, 0o600) {
@@ -36,7 +40,7 @@ pub async fn validate_socket(socket: impl AsRef<Path>) -> Result<(), ConnectErro
             }
 
             if let Some(parent_path) = socket.parent() {
-                let metadata = tokio::fs::metadata(parent_path).await?;
+                let metadata = std::fs::metadata(parent_path)?;
                 let mode = metadata.permissions().mode();
                 if validate_mode_bits(mode, 0o700) {
                     debug!(?socket, mode =% OctalU32(mode), "Socket folder permissions are 0o700");
@@ -71,13 +75,13 @@ pub async fn socket_connect(socket_path: impl AsRef<Path>) -> Result<UnixStream,
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = tokio::fs::metadata(&socket_path).await {
+        if let Ok(metadata) = std::fs::metadata(socket_path) {
             let mut permissions = metadata.permissions();
             let new_mode = 0o600 | (permissions.mode() & !0o777);
             if permissions.mode() != new_mode {
                 debug!(?socket_path, mode =% OctalU32(new_mode), "Setting socket permissions to 0o600");
                 permissions.set_mode(new_mode);
-                if let Err(err) = tokio::fs::set_permissions(&socket_path, permissions).await {
+                if let Err(err) = std::fs::set_permissions(socket_path, permissions) {
                     warn!(%err, ?socket_path, "Failed to set socket permissions");
                 }
             }
