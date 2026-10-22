@@ -1565,6 +1565,10 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 }
 
 fn main() {
+    // One fterm stays resident per terminal tab; it reads a few keys at
+    // startup and writes a history row per command. Do not keep r2d2's three
+    // maintenance threads and an idle SQLite connection alive in every tab.
+    fastab_settings::sqlite::prefer_light_pool();
     let cli = Cli::parse();
     let command = cli.command.as_deref();
 

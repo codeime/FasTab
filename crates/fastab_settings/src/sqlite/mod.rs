@@ -1,6 +1,7 @@
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use fastab_util::directories::fig_data_dir;
 use r2d2::Pool;
@@ -8,7 +9,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::FromSql;
 use rusqlite::{Connection, Error, ToSql, params};
 use serde_json::Map;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::Result;
 use crate::error::DbOpenError;
@@ -17,7 +18,30 @@ const STATE_TABLE_NAME: &str = "state";
 const AUTH_TABLE_NAME: &str = "auth_kv";
 const POOL_MAX_SIZE: u32 = 4;
 
+static LIGHT_POOL: AtomicBool = AtomicBool::new(false);
+/// Set once [`DATABASE`] starts opening, after which the pool shape is fixed.
+static DATABASE_OPENED: AtomicBool = AtomicBool::new(false);
+
+/// Opts this process into a pool that keeps nothing open between uses: one
+/// maintenance thread instead of r2d2's three, and no idle connection held.
+/// For `fterm`, which stays resident once per terminal tab and only touches
+/// the database at startup and once per finished command. Takes effect only
+/// before the first [`database()`] call; a later call is a bug in the caller,
+/// so it is reported instead of being ignored silently.
+pub fn prefer_light_pool() {
+    LIGHT_POOL.store(true, Ordering::SeqCst);
+    let too_late = DATABASE_OPENED.load(Ordering::SeqCst);
+    if too_late {
+        warn!("prefer_light_pool() ran after the database was opened; the full pool stays");
+    }
+    debug_assert!(
+        !too_late,
+        "prefer_light_pool() must run before the first database() call"
+    );
+}
+
 pub static DATABASE: LazyLock<Result<Db, DbOpenError>> = LazyLock::new(|| {
+    DATABASE_OPENED.store(true, Ordering::SeqCst);
     let db = Db::new().map_err(|e| DbOpenError(e.to_string()))?;
     db.migrate().map_err(|e| DbOpenError(e.to_string()))?;
     Ok(db)
@@ -73,10 +97,19 @@ impl Db {
     }
 
     fn open(path: &Path) -> Result<Self> {
-        Self::open_with_idle_timeout(path, std::time::Duration::from_secs(60))
+        Self::open_pool(
+            path,
+            std::time::Duration::from_secs(60),
+            LIGHT_POOL.load(Ordering::SeqCst),
+        )
     }
 
+    #[cfg(test)]
     fn open_with_idle_timeout(path: &Path, idle_timeout: std::time::Duration) -> Result<Self> {
+        Self::open_pool(path, idle_timeout, false)
+    }
+
+    fn open_pool(path: &Path, idle_timeout: std::time::Duration, light: bool) -> Result<Self> {
         // make the parent dir if it doesnt exist
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -102,12 +135,18 @@ impl Db {
         // expired idle connections, then replenishes the one-connection floor;
         // it does not preserve a particular connection indefinitely. With the
         // production timeout, a fully idle pool shrinks after about 60-90s.
-        let pool = Pool::builder()
+        let mut builder = Pool::builder()
             .max_size(POOL_MAX_SIZE)
-            .min_idle(Some(1))
+            .min_idle(Some(if light { 0 } else { 1 }))
             .idle_timeout(Some(idle_timeout))
-            .connection_timeout(std::time::Duration::from_secs(3))
-            .build(conn)?;
+            .connection_timeout(std::time::Duration::from_secs(3));
+        if light {
+            builder = builder.thread_pool(Arc::new(scheduled_thread_pool::ScheduledThreadPool::with_name(
+                "sqlite-pool-{}",
+                1,
+            )));
+        }
+        let pool = builder.build(conn)?;
 
         // Also check sidecars created while the pool was initialized.
         #[cfg(unix)]
@@ -447,6 +486,22 @@ mod tests {
         assert_eq!(db.pool.state().idle_connections, 0);
         assert!(db.pool.try_get().is_none());
         drop(connections);
+    }
+
+    #[test]
+    fn light_pool_opens_connections_on_demand_and_keeps_none_idle() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db = Db::open_pool(
+            &tempdir.path().join("data.sqlite3"),
+            std::time::Duration::from_secs(60),
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.pool.min_idle(), Some(0));
+        assert_eq!(db.pool.state().connections, 0);
+        db.migrate().unwrap();
+        db.set_state_value("light", true).unwrap();
+        assert_eq!(db.get_state_value("light").unwrap(), Some(serde_json::json!(true)));
     }
 
     #[test]
