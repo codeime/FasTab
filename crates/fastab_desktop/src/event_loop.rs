@@ -536,9 +536,8 @@ mod tests {
     fn owned_payload_event(capacity: usize) -> Event {
         Event::WindowEvent {
             window_id: crate::AUTOCOMPLETE_ID,
-            window_event: crate::event::WindowEvent::Emit {
-                event_name: crate::event::EmitEventName::Notification,
-                payload: String::with_capacity(capacity).into(),
+            window_event: crate::event::WindowEvent::NavigateRelative {
+                path: String::with_capacity(capacity).into(),
             },
         }
     }

@@ -18,7 +18,6 @@ bitflags.workspace = true
 bytes.workspace = true
 camino.workspace = true
 cfg-if.workspace = true
-cookie = "0.18.0"
 fastab_integrations.workspace = true
 fastab_os_shim.workspace = true
 fastab_settings.workspace = true

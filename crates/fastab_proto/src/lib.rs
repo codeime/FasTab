@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 
 use bytes::{Buf, Bytes, BytesMut};
 pub use prost;
-use prost::{DecodeError, Message};
+use prost::{DecodeError, EncodeError, Message};
 use prost_reflect::DescriptorPool;
 pub use prost_reflect::{DynamicMessage, ReflectMessage};
 use serde::Serialize;
@@ -115,6 +115,8 @@ pub enum FigMessageEncodeError {
     #[error(transparent)]
     IntError(#[from] std::num::TryFromIntError),
     #[error(transparent)]
+    ProstEncode(#[from] EncodeError),
+    #[error(transparent)]
     JsonEncode(#[from] serde_json::Error),
     #[error(transparent)]
     RmpEncode(#[from] rmp_serde::encode::Error),
@@ -133,20 +135,28 @@ impl FigMessage {
 
     pub fn encode_buf(&self, dst: &mut BytesMut) -> Result<(), FigMessageEncodeError> {
         let body = &self.inner;
-        if body.len() > MAX_FIG_MESSAGE_BODY_BYTES {
-            return Err(FigMessageEncodeError::BodyTooLarge(body.len()));
-        }
-        let message_type = self.message_type;
+        Self::encode_header(dst, self.message_type, body.len())?;
+        dst.extend_from_slice(body);
+        Ok(())
+    }
 
-        let message_len: u64 = body.len().try_into()?;
+    /// Write the frame header for a `body_len`-byte body and reserve room for
+    /// that body. An oversized body is rejected before `dst` is touched.
+    fn encode_header(
+        dst: &mut BytesMut,
+        message_type: FigMessageType,
+        body_len: usize,
+    ) -> Result<(), FigMessageEncodeError> {
+        if body_len > MAX_FIG_MESSAGE_BODY_BYTES {
+            return Err(FigMessageEncodeError::BodyTooLarge(body_len));
+        }
+        let message_len: u64 = body_len.try_into()?;
         let message_len_be = message_len.to_be_bytes();
 
-        dst.reserve(b"\x1b@".len() + message_type.header().len() + message_len_be.len() + body.len());
+        dst.reserve(b"\x1b@".len() + message_type.header().len() + message_len_be.len() + body_len);
         dst.extend_from_slice(b"\x1b@");
         dst.extend_from_slice(message_type.header());
         dst.extend_from_slice(&message_len_be);
-        dst.extend_from_slice(body);
-
         Ok(())
     }
 
@@ -266,7 +276,12 @@ pub trait FigProtobufEncodable: Debug + Send + Sync {
 
 impl<T: Message + Debug> FigProtobufEncodable for T {
     fn encode_fastab_protobuf(&self) -> Result<Bytes, FigMessageEncodeError> {
-        FigMessage::encode(FigMessageType::Protobuf, self.encode_to_vec().into())
+        // Every IPC frame goes through here: encode the body directly behind
+        // its header instead of into a separate buffer that is then copied.
+        let mut dst = BytesMut::new();
+        FigMessage::encode_header(&mut dst, FigMessageType::Protobuf, self.encoded_len())?;
+        self.encode(&mut dst)?;
+        Ok(dst.freeze())
     }
 }
 
@@ -334,6 +349,13 @@ mod tests {
     fn test_to_fig_pbuf() {
         let message = test_message();
         assert_eq!(&message.encode_fastab_protobuf().unwrap()[..10], b"\x1b@fig-pbuf");
+    }
+
+    #[test]
+    fn single_buffer_protobuf_frame_matches_the_framed_body() {
+        let message = test_message();
+        let expected = FigMessage::encode(FigMessageType::Protobuf, message.encode_to_vec().into()).unwrap();
+        assert_eq!(message.encode_fastab_protobuf().unwrap(), expected);
     }
 
     #[test]

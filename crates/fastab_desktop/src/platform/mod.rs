@@ -6,7 +6,6 @@ use serde::Serialize;
 use tao::dpi::Position;
 
 use crate::utils::Rect;
-use crate::webview::notification::WebviewNotificationsState;
 use crate::webview::{FigIdMap, WindowId};
 use crate::{EventLoopProxy, EventLoopWindowTarget};
 
@@ -49,11 +48,8 @@ impl PlatformState {
         event: PlatformBoundEvent,
         window_target: &EventLoopWindowTarget,
         window_map: &FigIdMap,
-        notifications_state: &Arc<WebviewNotificationsState>,
     ) -> anyhow::Result<()> {
-        self.clone()
-            .0
-            .handle(event, window_target, window_map, notifications_state)
+        self.clone().0.handle(event, window_target, window_map)
     }
 
     /// Position the window at the given coordinates

@@ -76,7 +76,6 @@ name = "alacritty_terminal"
 version = "0.0.14"
 dependencies = [
  "bitflags 2.13.1",
- "camino",
  "fastab_os_shim",
  "serde",
  "serde_json",
@@ -1542,15 +1541,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "convert_case"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
-dependencies = [
- "unicode-segmentation",
-]
-
-[[package]]
 name = "cookie"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2493,8 +2483,6 @@ dependencies = [
  "arboard",
  "assert_cmd",
  "async-trait",
- "base64 0.23.1",
- "bitflags 2.13.1",
  "bytes",
  "cfg-if",
  "clap",
@@ -2502,7 +2490,6 @@ dependencies = [
  "clap_complete_fig",
  "color-eyre",
  "color-print",
- "convert_case 0.11.0",
  "criterion",
  "crossterm",
  "ctrlc",
@@ -2520,11 +2507,9 @@ dependencies = [
  "fastab_settings",
  "fastab_telemetry",
  "fastab_util",
- "flume 0.12.0",
  "futures",
  "glob",
  "globset",
- "indicatif",
  "indoc",
  "insta",
  "macos-utils",
@@ -2534,7 +2519,6 @@ dependencies = [
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
  "owo-colors",
- "parking_lot",
  "paste",
  "predicates",
  "rand 0.10.2",
@@ -2545,14 +2529,11 @@ dependencies = [
  "spinners",
  "sysinfo 0.36.1",
  "tempfile",
- "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
- "unicode-width 0.2.2",
  "url",
  "uuid",
  "walkdir",
@@ -2569,7 +2550,6 @@ dependencies = [
  "accessibility-sys",
  "anyhow",
  "async-trait",
- "base64 0.23.1",
  "bytes",
  "cfg-if",
  "clap",
@@ -2659,14 +2639,9 @@ dependencies = [
 name = "fastab_diagnostic"
 version = "0.0.14"
 dependencies = [
- "cfg-if",
- "clap",
- "fastab_ipc",
  "fastab_os_shim",
- "fastab_proto",
  "fastab_util",
  "serde",
- "serde_json",
  "sysinfo 0.36.1",
  "time",
  "tokio",
@@ -2747,7 +2722,6 @@ dependencies = [
  "bytes",
  "camino",
  "cfg-if",
- "cookie",
  "fastab_integrations",
  "fastab_ipc",
  "fastab_os_shim",
@@ -2782,7 +2756,6 @@ dependencies = [
  "cfg-if",
  "clap",
  "core-foundation 0.10.0",
- "dirs 5.0.1",
  "dispatch",
  "fastab_hitoolbox",
  "fastab_os_shim",
@@ -2818,14 +2791,12 @@ dependencies = [
  "flate2",
  "nix 0.31.3",
  "pin-project-lite",
- "rand 0.10.2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
  "uuid",
- "whoami",
 ]
 
 [[package]]
@@ -2833,8 +2804,6 @@ name = "fastab_log"
 version = "0.0.14"
 dependencies = [
  "fastab_os_shim",
- "fastab_util",
- "parking_lot",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
@@ -2896,7 +2865,6 @@ dependencies = [
  "fastab_ipc",
  "fastab_proto",
  "fastab_util",
- "flume 0.12.0",
  "parking_lot",
  "serde",
  "time",
@@ -2921,9 +2889,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -2935,7 +2901,6 @@ dependencies = [
  "fastab_settings",
  "fastab_util",
  "reqwest",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -3016,15 +2981,11 @@ name = "fastab_test_utils"
 version = "0.0.14"
 dependencies = [
  "bytes",
- "fastab_os_shim",
- "fastab_util",
- "hex",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "reqwest",
- "ring",
  "tokio",
  "tokio-util",
 ]
@@ -4596,19 +4557,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "indicatif"
-version = "0.18.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9433806cd6b4ec1aba79c021c7e4c58fb4c3b9977c085062e611ac929998fb0c"
-dependencies = [
- "console",
- "portable-atomic",
- "unicode-width 0.2.2",
- "unit-prefix",
- "web-time",
 ]
 
 [[package]]
@@ -6633,12 +6581,6 @@ name = "pollster"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
-
-[[package]]
-name = "portable-atomic"
-version = "1.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
 
 [[package]]
 name = "portable-pty"
@@ -9623,12 +9565,6 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
-
-[[package]]
-name = "unit-prefix"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
 
 [[package]]
 name = "unsafe-libyaml"

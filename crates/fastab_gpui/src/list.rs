@@ -2,9 +2,10 @@ use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, BoxShadow, Context, Entity, FontWeight, HighlightStyle,
     InteractiveElement, IntoElement, ListSizingBehavior, ParentElement, Render, RenderImage, Rgba, ScrollHandle,
-    ScrollStrategy, StatefulInteractiveElement, Styled, StyledText, UnderlineStyle, UniformListScrollHandle, Window,
-    div, hsla, point, px, rgb, uniform_list,
+    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledText, UnderlineStyle,
+    UniformListScrollHandle, Window, div, hsla, point, px, rgb, uniform_list,
 };
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
@@ -421,16 +422,18 @@ fn normalize_kind(kind: &str) -> &str {
     }
 }
 
-fn items_match_for_prefix(candidate: &SuggestionItem, selected: &SuggestionItem) -> bool {
+/// Only the selected row's name and kind take part, so callers that adjust
+/// them (an auto-execute row's original type) need not copy the whole row.
+fn items_match_for_prefix(candidate: &SuggestionItem, selected_name: &str, selected_kind: &str) -> bool {
     // Keep the old `isMatchingType` asymmetry: a `../` candidate only joins
     // the prefix set when `../` itself is selected. Without this guard the
     // parent-directory row destroys the useful common prefix of ordinary
     // files/folders (for example `src/` and `scripts/`).
     if candidate.name == "../" {
-        return selected.name == "../";
+        return selected_name == "../";
     }
     let a = normalize_kind(&candidate.kind);
-    let b = normalize_kind(&selected.kind);
+    let b = normalize_kind(selected_kind);
     a == b || (is_fileish(a) && is_fileish(b))
 }
 
@@ -603,19 +606,22 @@ pub fn common_prefix_for(selected: usize, items: &[SuggestionItem], typed: &str)
     let Some(selected_item) = items.get(selected) else {
         return String::new();
     };
-    let mut type_filter = selected_item.clone();
+    // Runs on every frame while a title scrolls: borrow the selected row's
+    // name and kind instead of cloning the row to adjust them.
+    let mut filter_kind = selected_item.kind.as_str();
+    let mut filter_name = Cow::Borrowed(selected_item.name.as_str());
     if selected_item.kind == "auto-execute" {
-        type_filter.kind = selected_item.original_type.clone().unwrap_or_default();
-        if type_filter.kind == "folder" && !type_filter.name.ends_with('/') {
-            type_filter.name.push('/');
+        filter_kind = selected_item.original_type.as_deref().unwrap_or_default();
+        if filter_kind == "folder" && !filter_name.ends_with('/') {
+            filter_name.to_mut().push('/');
         }
     }
-    if matches!(type_filter.kind.as_str(), "" | "special" | "auto-execute") {
+    if matches!(filter_kind, "" | "special" | "auto-execute") {
         return String::new();
     }
     let mut names = items
         .iter()
-        .filter(|item| items_match_for_prefix(item, &type_filter))
+        .filter(|item| items_match_for_prefix(item, &filter_name, filter_kind))
         .map(|item| visible_suggestion_title(item, typed));
     let Some(first) = names.next() else {
         return String::new();
@@ -686,7 +692,7 @@ pub fn tab_prefix_insertion(selected: usize, items: &[SuggestionItem], search: &
     }
     let prefix_matches: Vec<&str> = items
         .iter()
-        .filter(|item| items_match_for_prefix(item, selected_item))
+        .filter(|item| items_match_for_prefix(item, &selected_item.name, &selected_item.kind))
         .map(|item| item.name.as_str())
         .filter(|name| search.is_empty() || match_prefix_bytes(name, &search) > 0)
         .collect();
@@ -926,7 +932,8 @@ impl Render for SuggestionList {
         let theme = overlay.theme;
         let selected = overlay.selected;
         let count = overlay.items.len();
-        let font_family = overlay.font_family.clone();
+        // Cloned into every visible row on every frame: share one allocation.
+        let font_family: SharedString = overlay.font_family.clone().into();
         let font_size = overlay.effective_font_size();
         let row_height = overlay.effective_row_height();
         let list_width = overlay.effective_list_width();
@@ -1039,6 +1046,8 @@ impl Render for SuggestionList {
                             let click = click.clone();
                             let suggestion_font_family = font_family.clone();
                             move |range, window, cx| {
+                                // One copy per visible range; rows share it.
+                                let insertion_search: SharedString = state.read(cx).search_term.clone().into();
                                 range
                                     .filter_map(|ix| {
                                         let mut content_key = std::collections::hash_map::DefaultHasher::new();
@@ -1073,7 +1082,7 @@ impl Render for SuggestionList {
                                             ix == 0 && overlay.has_ai_promotion(),
                                             search_term,
                                             &typed_path,
-                                            &overlay.search_term,
+                                            insertion_search.clone(),
                                             fuzzy,
                                             &common_prefix,
                                             theme,
@@ -1193,7 +1202,7 @@ fn suggestion_row(
     is_ai_promoted: bool,
     search_term: &str,
     typed: &str,
-    insertion_search_term: &str,
+    insertion_search_term: SharedString,
     fuzzy: bool,
     common_prefix: &str,
     theme: OverlayTheme,
@@ -1205,7 +1214,7 @@ fn suggestion_row(
     // Top and bottom radii this row must reproduce to keep the card's corners
     // intact, since GPUI's overflow clip does not follow a border radius.
     corners: (f32, f32),
-    font_family: String,
+    font_family: SharedString,
     state: Entity<OverlayState>,
     click: Option<Arc<dyn Fn(ClickInsert) + Send + Sync>>,
     ix: usize,
@@ -1246,11 +1255,10 @@ fn suggestion_row(
         search_term
     };
     let runs = name_runs(title_name, highlight, fuzzy, common_prefix);
-    let insertion_search_term = insertion_search_term.to_string();
     let (title_text, title_highlights) = suggestion_title_highlights(&runs, text, match_text, match_bg);
     let available = (list_width - row_pad_left(font_size) - icon_size - 5.0).max(1.0);
     let title_style = gpui::TextStyle {
-        font_family: font_family.clone().into(),
+        font_family: font_family.clone(),
         ..Default::default()
     };
     let measured_width = |value: &str| {
@@ -2051,7 +2059,7 @@ mod tests {
                     overlay.has_ai_promotion(),
                     "",
                     "",
-                    "",
+                    SharedString::default(),
                     false,
                     "",
                     overlay.theme,
@@ -2061,7 +2069,7 @@ mod tests {
                     160.,
                     overlay.title_overflow,
                     (0., 0.),
-                    overlay.font_family.clone(),
+                    overlay.font_family.clone().into(),
                     self.overlay.clone(),
                     None,
                     0,

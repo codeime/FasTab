@@ -21,7 +21,6 @@ use tracing::{debug, error, trace, warn};
 
 use crate::event::Event;
 use crate::platform::PlatformState;
-use crate::webview::notification::WebviewNotificationsState;
 use crate::{AUTOCOMPLETE_ID, DASHBOARD_ID, EventLoopProxy};
 
 const MAX_LOCAL_CONNECTIONS: usize = 64;
@@ -94,7 +93,6 @@ impl ContextArcProvider for LocalIpcContext {
 pub async fn start_local_ipc(
     platform_state: Arc<PlatformState>,
     figterm_state: Arc<FigtermState>,
-    webview_notifications_state: Arc<WebviewNotificationsState>,
     proxy: EventLoopProxy,
 ) -> Result<()> {
     let socket_path = directories::desktop_socket_path()?;
@@ -124,7 +122,6 @@ pub async fn start_local_ipc(
         let admission = ConnectionAdmission { _permit: permit };
         let platform = platform_state.clone();
         let figterm = figterm_state.clone();
-        let notifications = webview_notifications_state.clone();
         let proxy = proxy.clone();
         tokio::spawn(async move {
             let _admission = admission;
@@ -132,7 +129,6 @@ pub async fn start_local_ipc(
                 BufferedUnixStream::new(stream),
                 platform,
                 figterm,
-                notifications,
                 proxy,
                 LocalIpcContext::new(),
             )
@@ -147,7 +143,6 @@ async fn handle_local_ipc<Ctx>(
     mut stream: BufferedUnixStream,
     platform_state: Arc<PlatformState>,
     figterm_state: Arc<FigtermState>,
-    webview_notifications_state: Arc<WebviewNotificationsState>,
     proxy: EventLoopProxy,
     ctx: Ctx,
 ) where
@@ -206,14 +201,7 @@ async fn handle_local_ipc<Ctx>(
                             Login(_) => commands::login(&proxy).await,
                             Logout(_) => commands::logout(&proxy).await,
                             DumpState(command) => {
-                                commands::dump_state(
-                                    command,
-                                    &figterm_state,
-                                    &webview_notifications_state,
-                                    &platform_state,
-                                    &proxy,
-                                )
-                                .await
+                                commands::dump_state(command, &figterm_state, &platform_state, &proxy).await
                             },
                             ConnectToIbus(_) => commands::connect_to_ibus(proxy.clone(), &platform_state).await,
                             BundleMetadata(_) => commands::bundle_metadata(&ctx.context_arc()).await,
@@ -353,7 +341,6 @@ mod admission_tests {
         let (proxy, _events) = crate::event_loop::channel();
         let platform = Arc::new(PlatformState::new(proxy.clone()));
         let figterm = Arc::new(FigtermState::new());
-        let notifications = Arc::new(WebviewNotificationsState::default());
         let mut clients = Vec::new();
         let mut servers = tokio::task::JoinSet::new();
         for partial in [false, true] {
@@ -366,7 +353,6 @@ mod admission_tests {
                 BufferedUnixStream::new(stream),
                 platform.clone(),
                 figterm.clone(),
-                notifications.clone(),
                 proxy.clone(),
                 LocalIpcContext::new(),
             ));

@@ -17,7 +17,6 @@ dispatch = ["dep:dispatch"]
 async-trait.workspace = true
 cfg-if.workspace = true
 clap.workspace = true
-dirs.workspace = true
 fastab_os_shim.workspace = true
 fastab_settings.workspace = true
 fastab_util.workspace = true

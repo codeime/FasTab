@@ -17,7 +17,6 @@ workspace = true
 
 [dependencies]
 bitflags.workspace = true
-camino.workspace = true
 fastab_os_shim.workspace = true
 serde.workspace = true
 serde_yaml = "0.9"

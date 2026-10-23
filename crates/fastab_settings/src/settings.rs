@@ -99,21 +99,20 @@ impl Settings {
     }
 
     pub fn get<T: DeserializeOwned>(&self, key: impl AsRef<str>) -> Result<Option<T>> {
+        // Deserialize from the stored value in place. Some keys are read on
+        // every keystroke; copying the whole value first bought nothing.
         match &self.0 {
             inner::Inner::Real => {
                 let settings = OldSettings::load()?;
                 let v = settings.get(key);
                 match v.as_deref() {
-                    Some(value) => Ok(Some(serde_json::from_value(value.clone())?)),
+                    Some(value) => Ok(Some(T::deserialize(value)?)),
                     None => Ok(None),
                 }
             },
-            inner::Inner::Fake(map) => {
-                let value = map.lock()?.get(key.as_ref()).cloned();
-                match value {
-                    Some(value) => Ok(Some(serde_json::from_value(value)?)),
-                    None => Ok(None),
-                }
+            inner::Inner::Fake(map) => match map.lock()?.get(key.as_ref()) {
+                Some(value) => Ok(Some(T::deserialize(value)?)),
+                None => Ok(None),
             },
         }
     }

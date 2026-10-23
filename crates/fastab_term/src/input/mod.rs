@@ -1426,6 +1426,8 @@ impl InputParser {
             }),
         );
 
+        // One table per resident fterm: do not keep the growth slack.
+        map.shrink_to_fit();
         map
     }
 

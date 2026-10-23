@@ -19,7 +19,6 @@ use self::x11::X11State;
 use super::PlatformBoundEvent;
 use crate::platform::linux::sway::SwayState;
 use crate::utils::Rect;
-use crate::webview::notification::WebviewNotificationsState;
 use crate::webview::{FigIdMap, WindowId};
 use crate::{EventLoopProxy, EventLoopWindowTarget};
 
@@ -103,7 +102,6 @@ impl PlatformStateImpl {
         event: PlatformBoundEvent,
         _: &EventLoopWindowTarget,
         _: &FigIdMap,
-        _: &Arc<WebviewNotificationsState>,
     ) -> anyhow::Result<()> {
         match event {
             PlatformBoundEvent::Initialize => {

@@ -2,8 +2,10 @@
 //! control flow.  String operations stay on the parent UTF-16 helpers so the
 //! T2.1 goldens keep one implementation.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::rc::Rc;
 
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -39,6 +41,7 @@ pub(super) fn evaluate_with_effects(
     arguments: &[TypedValue],
     effects: Option<&TypedHookEffects<'_>>,
 ) -> TypedHookResult<TypedValue> {
+    let _regex_scope = RegexCacheScope::enter();
     let mut locals = BTreeMap::new();
     let result = evaluate_inner(expression, arguments, &mut locals, effects);
     crate::cancellation::check().map_err(|_| TypedHookError::cancelled())?;
@@ -111,28 +114,28 @@ fn evaluate_inner(
         },
         TypedExpr::Length { value } => Ok(TypedValue::Integer(safe_len(&ev(value, locals)?)?)),
         TypedExpr::StringIncludes { value, needle } => {
-            let value = as_utf16(&ev(value, locals)?, "string-includes.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "string-includes.needle")?;
+            let value = into_utf16(ev(value, locals)?, "string-includes.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "string-includes.needle")?;
             Ok(TypedValue::Bool(utf16_index_of(&value, &needle).is_some()))
         },
         TypedExpr::StringIndexOf { value, needle } => {
-            let value = as_utf16(&ev(value, locals)?, "string-index-of.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "string-index-of.needle")?;
+            let value = into_utf16(ev(value, locals)?, "string-index-of.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "string-index-of.needle")?;
             Ok(TypedValue::Integer(utf16_index_of_i64(&value, &needle)?))
         },
         TypedExpr::StringIndexOfFrom { value, needle, start } => {
-            let value = as_utf16(&ev(value, locals)?, "string-index-of-from.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "string-index-of-from.needle")?;
+            let value = into_utf16(ev(value, locals)?, "string-index-of-from.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "string-index-of-from.needle")?;
             let start = as_i64(&ev(start, locals)?, "string-index-of-from.start")?;
             Ok(TypedValue::Integer(utf16_index_of_from(&value, &needle, start)?))
         },
         TypedExpr::StringLastIndexOf { value, needle } => {
-            let value = as_utf16(&ev(value, locals)?, "string-last-index-of.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "string-last-index-of.needle")?;
+            let value = into_utf16(ev(value, locals)?, "string-last-index-of.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "string-last-index-of.needle")?;
             Ok(TypedValue::Integer(utf16_last_index_of_i64(&value, &needle)?))
         },
         TypedExpr::StringSlice { value, start } => {
-            let value = as_utf16(&ev(value, locals)?, "string-slice.value")?;
+            let value = into_utf16(ev(value, locals)?, "string-slice.value")?;
             let start = as_i64(&ev(start, locals)?, "string-slice.start")?;
             Ok(TypedValue::String(js_slice(&value, start)?))
         },
@@ -145,8 +148,8 @@ fn evaluate_inner(
             Ok(TypedValue::String(js_slice_range(&value, start, end)?))
         },
         TypedExpr::StringSliceAfterFirst { value, needle } => {
-            let value = as_utf16(&ev(value, locals)?, "string-slice-after-first.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "string-slice-after-first.needle")?;
+            let value = into_utf16(ev(value, locals)?, "string-slice-after-first.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "string-slice-after-first.needle")?;
             let Some(index) = utf16_index_of(&value, &needle) else {
                 return Ok(TypedValue::String(value));
             };
@@ -154,14 +157,14 @@ fn evaluate_inner(
             Ok(TypedValue::String(js_slice(&value, start)?))
         },
         TypedExpr::StringSubstring { value, start, end } => {
-            let value = as_utf16(&ev(value, locals)?, "string-substring.value")?;
+            let value = into_utf16(ev(value, locals)?, "string-substring.value")?;
             let start = as_i64(&ev(start, locals)?, "string-substring.start")?;
             let end = as_i64(&ev(end, locals)?, "string-substring.end")?;
             Ok(TypedValue::String(js_substring(&value, start, end)?))
         },
         TypedExpr::StringSplit { value, separator } => {
-            let value = as_utf16(&ev(value, locals)?, "string-split.value")?;
-            let separator = as_utf16(&ev(separator, locals)?, "string-split.separator")?;
+            let value = into_utf16(ev(value, locals)?, "string-split.value")?;
+            let separator = into_utf16(ev(separator, locals)?, "string-split.separator")?;
             Ok(TypedValue::StringArray(js_split(&value, &separator)))
         },
         TypedExpr::StringSplitLimit {
@@ -169,8 +172,8 @@ fn evaluate_inner(
             separator,
             limit,
         } => {
-            let value = as_utf16(&ev(value, locals)?, "string-split-limit.value")?;
-            let separator = as_utf16(&ev(separator, locals)?, "string-split-limit.separator")?;
+            let value = into_utf16(ev(value, locals)?, "string-split-limit.value")?;
+            let separator = into_utf16(ev(separator, locals)?, "string-split-limit.separator")?;
             let limit = as_i64(&ev(limit, locals)?, "string-split-limit.limit")?;
             Ok(TypedValue::StringArray(js_split_limit(&value, &separator, limit)))
         },
@@ -197,9 +200,9 @@ fn evaluate_inner(
             needle,
             replacement,
         } => {
-            let value = as_utf16(&ev(value, locals)?, "replace.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "replace.needle")?;
-            let replacement = as_utf16(&ev(replacement, locals)?, "replace.replacement")?;
+            let value = into_utf16(ev(value, locals)?, "replace.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "replace.needle")?;
+            let replacement = into_utf16(ev(replacement, locals)?, "replace.replacement")?;
             Ok(TypedValue::String(js_replace(&value, &needle, &replacement, false)?))
         },
         TypedExpr::StringReplaceAll {
@@ -207,60 +210,60 @@ fn evaluate_inner(
             needle,
             replacement,
         } => {
-            let value = as_utf16(&ev(value, locals)?, "replace-all.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "replace-all.needle")?;
-            let replacement = as_utf16(&ev(replacement, locals)?, "replace-all.replacement")?;
+            let value = into_utf16(ev(value, locals)?, "replace-all.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "replace-all.needle")?;
+            let replacement = into_utf16(ev(replacement, locals)?, "replace-all.replacement")?;
             Ok(TypedValue::String(js_replace(&value, &needle, &replacement, true)?))
         },
         TypedExpr::StringStartsWith { value, needle } => {
-            let value = as_utf16(&ev(value, locals)?, "starts-with.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "starts-with.needle")?;
+            let value = into_utf16(ev(value, locals)?, "starts-with.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "starts-with.needle")?;
             Ok(TypedValue::Bool(utf16_starts_with(&value, &needle)))
         },
         TypedExpr::StringEndsWith { value, needle } => {
-            let value = as_utf16(&ev(value, locals)?, "ends-with.value")?;
-            let needle = as_utf16(&ev(needle, locals)?, "ends-with.needle")?;
+            let value = into_utf16(ev(value, locals)?, "ends-with.value")?;
+            let needle = into_utf16(ev(needle, locals)?, "ends-with.needle")?;
             Ok(TypedValue::Bool(utf16_ends_with(&value, &needle)))
         },
         TypedExpr::StringToLower { value } => Ok(TypedValue::String(js_map_case(
-            &as_utf16(&ev(value, locals)?, "to-lower")?,
+            &into_utf16(ev(value, locals)?, "to-lower")?,
             false,
         ))),
         TypedExpr::StringToUpper { value } => Ok(TypedValue::String(js_map_case(
-            &as_utf16(&ev(value, locals)?, "to-upper")?,
+            &into_utf16(ev(value, locals)?, "to-upper")?,
             true,
         ))),
         TypedExpr::StringPadStart { value, target, pad } => {
-            let value = as_utf16(&ev(value, locals)?, "pad-start.value")?;
+            let value = into_utf16(ev(value, locals)?, "pad-start.value")?;
             let target = as_i64(&ev(target, locals)?, "pad-start.target")?;
-            let pad = as_utf16(&ev(pad, locals)?, "pad-start.pad")?;
+            let pad = into_utf16(ev(pad, locals)?, "pad-start.pad")?;
             Ok(TypedValue::String(js_pad(&value, target, &pad, false)?))
         },
         TypedExpr::StringPadEnd { value, target, pad } => {
-            let value = as_utf16(&ev(value, locals)?, "pad-end.value")?;
+            let value = into_utf16(ev(value, locals)?, "pad-end.value")?;
             let target = as_i64(&ev(target, locals)?, "pad-end.target")?;
-            let pad = as_utf16(&ev(pad, locals)?, "pad-end.pad")?;
+            let pad = into_utf16(ev(pad, locals)?, "pad-end.pad")?;
             Ok(TypedValue::String(js_pad(&value, target, &pad, true)?))
         },
         TypedExpr::StringRepeat { value, count } => {
-            let value = as_utf16(&ev(value, locals)?, "repeat.value")?;
+            let value = into_utf16(ev(value, locals)?, "repeat.value")?;
             let count = as_i64(&ev(count, locals)?, "repeat.count")?;
             Ok(TypedValue::String(js_repeat(&value, count)?))
         },
         TypedExpr::StringConcat { parts } => {
             let mut units = Vec::new();
             for part in parts {
-                units.extend_from_slice(&as_utf16(&ev(part, locals)?, "concat")?.0);
+                units.extend_from_slice(&into_utf16(ev(part, locals)?, "concat")?.0);
             }
             Ok(TypedValue::String(ensure_string_limit(units)?))
         },
         TypedExpr::StringCharAt { value, index } => {
-            let value = as_utf16(&ev(value, locals)?, "char-at.value")?;
+            let value = into_utf16(ev(value, locals)?, "char-at.value")?;
             let index = as_i64(&ev(index, locals)?, "char-at.index")?;
             Ok(TypedValue::String(js_char_at(&value, index)))
         },
         TypedExpr::StringAt { value, index } => {
-            let value = as_utf16(&ev(value, locals)?, "at.value")?;
+            let value = into_utf16(ev(value, locals)?, "at.value")?;
             let index = as_i64(&ev(index, locals)?, "at.index")?;
             Ok(TypedValue::String(js_at(&value, index)?))
         },
@@ -369,7 +372,7 @@ fn evaluate_inner(
             Err(Abort::Error(_)) => ev(catch, locals),
         },
         TypedExpr::ForOf { names, value, body } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             let mut iterations = 0_u32;
             for item in items {
                 iterations = iterations.saturating_add(1);
@@ -391,7 +394,7 @@ fn evaluate_inner(
             Ok(value)
         },
         TypedExpr::AssignProp { object, key, value } => {
-            let key = as_utf16(&ev(key, locals)?, "assign-prop.key")?.to_string_lossy();
+            let key = into_utf16(ev(key, locals)?, "assign-prop.key")?.to_string_lossy();
             let value = ev(value, locals)?;
             if let TypedExpr::Var { name } = object.as_ref() {
                 let mut current = locals.get(name).cloned().unwrap_or(TypedValue::Null);
@@ -435,7 +438,7 @@ fn evaluate_inner(
         },
         TypedExpr::Get { value, key } | TypedExpr::JsonGet { value, key } => {
             let value = ev(value, locals)?;
-            let key = as_utf16(&ev(key, locals)?, "get.key")?.to_string_lossy();
+            let key = into_utf16(ev(key, locals)?, "get.key")?.to_string_lossy();
             Ok(get_prop(&value, &key))
         },
         TypedExpr::ObjectKeys { value } => Ok(TypedValue::Array(
@@ -457,7 +460,7 @@ fn evaluate_inner(
                 .collect(),
         )),
         TypedExpr::ArrayMap { value, callback } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             let mut out = Vec::with_capacity(items.len());
             for (index, item) in items.into_iter().enumerate() {
                 out.push(apply_lambda(
@@ -471,7 +474,7 @@ fn evaluate_inner(
             Ok(TypedValue::Array(out))
         },
         TypedExpr::ArrayFilter { value, callback } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             let mut out = Vec::new();
             for (index, item) in items.into_iter().enumerate() {
                 if is_truthy(&apply_lambda(
@@ -487,7 +490,7 @@ fn evaluate_inner(
             Ok(TypedValue::Array(out))
         },
         TypedExpr::ArrayFlatMap { value, callback } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             let mut out = Vec::new();
             for (index, item) in items.into_iter().enumerate() {
                 let mapped = apply_lambda(
@@ -497,19 +500,19 @@ fn evaluate_inner(
                     &[item, TypedValue::Integer(index as i64)],
                     effects,
                 )?;
-                out.extend(as_array(&mapped));
+                out.extend(into_array(mapped));
             }
             Ok(TypedValue::Array(out))
         },
         TypedExpr::ArraySlice { value, start, end } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             let start = as_i64(&ev(start, locals)?, "array-slice.start")?;
             let end = as_i64(&ev(end, locals)?, "array-slice.end")?;
             Ok(TypedValue::Array(slice_vec(&items, start, end)))
         },
         TypedExpr::ArrayJoin { value, separator } => {
-            let items = as_array(&ev(value, locals)?);
-            let separator = as_utf16(&ev(separator, locals)?, "array-join.separator")?.to_string_lossy();
+            let items = into_array(ev(value, locals)?);
+            let separator = into_utf16(ev(separator, locals)?, "array-join.separator")?.to_string_lossy();
             let joined = items
                 .iter()
                 .map(|item| as_utf16(item, "array-join.item").map(|value| value.to_string_lossy()))
@@ -518,7 +521,7 @@ fn evaluate_inner(
             Ok(TypedValue::String(Utf16String::from_str(&joined)))
         },
         TypedExpr::ArraySome { value, callback } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             for (index, item) in items.into_iter().enumerate() {
                 if is_truthy(&apply_lambda(
                     callback,
@@ -533,7 +536,7 @@ fn evaluate_inner(
             Ok(TypedValue::Bool(false))
         },
         TypedExpr::ArrayEvery { value, callback } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             for (index, item) in items.into_iter().enumerate() {
                 if !is_truthy(&apply_lambda(
                     callback,
@@ -548,7 +551,7 @@ fn evaluate_inner(
             Ok(TypedValue::Bool(true))
         },
         TypedExpr::ArrayFind { value, callback } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             for (index, item) in items.into_iter().enumerate() {
                 if is_truthy(&apply_lambda(
                     callback,
@@ -563,7 +566,7 @@ fn evaluate_inner(
             Ok(TypedValue::Null)
         },
         TypedExpr::ArrayFindIndex { value, callback } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             for (index, item) in items.into_iter().enumerate() {
                 if is_truthy(&apply_lambda(
                     callback,
@@ -578,13 +581,13 @@ fn evaluate_inner(
             Ok(TypedValue::Integer(-1))
         },
         TypedExpr::ArrayIndexOf { value, needle } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             let needle = ev(needle, locals)?;
             let index = items.iter().position(|item| strict_equal(item, &needle));
             Ok(TypedValue::Integer(index.map(|index| index as i64).unwrap_or(-1)))
         },
         TypedExpr::ArrayIndexOfFrom { value, needle, start } => {
-            let items = as_array(&ev(value, locals)?);
+            let items = into_array(ev(value, locals)?);
             let needle = ev(needle, locals)?;
             let start = js_index(as_i64(&ev(start, locals)?, "array-index-of-from.start")?, items.len());
             let index = items[start..]
@@ -604,7 +607,7 @@ fn evaluate_inner(
                         | TypedValue::StringSet(_)
                         | TypedValue::Json(JsonValue::Array(_))
                 ) {
-                    out.extend(as_array(&value));
+                    out.extend(into_array(value));
                 } else {
                     out.push(value);
                 }
@@ -612,12 +615,12 @@ fn evaluate_inner(
             Ok(TypedValue::Array(out))
         },
         TypedExpr::ArrayReverse { value } => {
-            let mut items = as_array(&ev(value, locals)?);
+            let mut items = into_array(ev(value, locals)?);
             items.reverse();
             Ok(TypedValue::Array(items))
         },
         TypedExpr::ArraySort { value, callback } => {
-            let mut items = as_array(&ev(value, locals)?);
+            let mut items = into_array(ev(value, locals)?);
             items.sort_by(|left, right| {
                 match apply_lambda(callback, arguments, locals, &[left.clone(), right.clone()], effects) {
                     Ok(TypedValue::Integer(value)) => value.cmp(&0),
@@ -634,36 +637,38 @@ fn evaluate_inner(
                     if index < 0 {
                         return Ok(TypedValue::Null);
                     }
-                    return Ok(as_array(&value)
-                        .get(index as usize)
-                        .cloned()
+                    return Ok(into_array(value)
+                        .into_iter()
+                        .nth(index as usize)
                         .unwrap_or(TypedValue::Null));
                 }
             }
-            let key = as_utf16(&index, "array-index")?.to_string_lossy();
+            let key = into_utf16(index, "array-index")?.to_string_lossy();
             Ok(get_prop(&value, &key))
         },
         TypedExpr::ArrayPush { name, item } => {
             let item = ev(item, locals)?;
-            let mut items = locals.get(name).map(as_array).unwrap_or_default();
+            // Take the binding instead of copying it: a push loop must not
+            // clone the whole array once per element.
+            let mut items = locals.remove(name).map(into_array).unwrap_or_default();
             items.push(item);
             let length = items.len() as i64;
             locals.insert(name.clone(), TypedValue::Array(items));
             Ok(TypedValue::Integer(length))
         },
         TypedExpr::ArrayPop { value } => {
-            let mut items = as_array(&ev(value, locals)?);
+            let mut items = into_array(ev(value, locals)?);
             Ok(items.pop().unwrap_or(TypedValue::Null))
         },
         TypedExpr::ArrayEntries { value } => Ok(TypedValue::Array(
-            as_array(&ev(value, locals)?)
+            into_array(ev(value, locals)?)
                 .into_iter()
                 .enumerate()
                 .map(|(index, item)| TypedValue::Array(vec![TypedValue::Integer(index as i64), item]))
                 .collect(),
         )),
         TypedExpr::ArrayShift { name } => {
-            let mut items = locals.get(name).map(as_array).unwrap_or_default();
+            let mut items = locals.remove(name).map(into_array).unwrap_or_default();
             let first = if items.is_empty() {
                 TypedValue::Null
             } else {
@@ -679,17 +684,17 @@ fn evaluate_inner(
                 let count = usize::try_from(count).unwrap_or(0).min(10_000);
                 return Ok(TypedValue::Array(vec![TypedValue::Null; count]));
             }
-            Ok(TypedValue::Array(as_array(&value)))
+            Ok(TypedValue::Array(into_array(value)))
         },
         TypedExpr::ArrayFlat { value, depth } => {
             let depth = as_i64(&ev(depth, locals)?, "array-flat.depth")?;
-            Ok(TypedValue::Array(flatten(as_array(&ev(value, locals)?), depth)))
+            Ok(TypedValue::Array(flatten(into_array(ev(value, locals)?), depth)))
         },
         TypedExpr::JsonParse { value } => {
-            let text = as_utf16(&ev(value, locals)?, "json-parse")?.to_string_lossy();
+            let text = into_utf16(ev(value, locals)?, "json-parse")?.to_string_lossy();
             Ok(parse_js_json(&text).unwrap_or(TypedValue::Null))
         },
-        TypedExpr::JsonArrayItems { value } => Ok(TypedValue::Array(as_array(&ev(value, locals)?))),
+        TypedExpr::JsonArrayItems { value } => Ok(TypedValue::Array(into_array(ev(value, locals)?))),
         TypedExpr::JsonAsString { value } => match ev(value, locals)? {
             TypedValue::String(value) => Ok(TypedValue::String(value)),
             _ => Ok(TypedValue::Null),
@@ -704,15 +709,15 @@ fn evaluate_inner(
             Ok(TypedValue::String(Utf16String::from_str(&json.to_string())))
         },
         TypedExpr::RegexTest { value, pattern, flags } => {
-            let value = as_utf16(&ev(value, locals)?, "regex-test")?.to_string_lossy();
+            let value = into_utf16(ev(value, locals)?, "regex-test")?.to_string_lossy();
             Ok(TypedValue::Bool(regex_is_match(pattern, flags, &value)?))
         },
         TypedExpr::RegexMatch { value, pattern, flags } => {
-            let value = as_utf16(&ev(value, locals)?, "regex-match")?.to_string_lossy();
+            let value = into_utf16(ev(value, locals)?, "regex-match")?.to_string_lossy();
             Ok(regex_match(pattern, flags, &value)?)
         },
         TypedExpr::RegexMatchAll { value, pattern, flags } => {
-            let value = as_utf16(&ev(value, locals)?, "regex-match-all")?.to_string_lossy();
+            let value = into_utf16(ev(value, locals)?, "regex-match-all")?.to_string_lossy();
             Ok(regex_match_all(pattern, flags, &value)?)
         },
         TypedExpr::RegexReplace {
@@ -721,8 +726,8 @@ fn evaluate_inner(
             flags,
             replacement,
         } => {
-            let value = as_utf16(&ev(value, locals)?, "regex-replace.value")?.to_string_lossy();
-            let replacement = as_utf16(&ev(replacement, locals)?, "regex-replace.replacement")?.to_string_lossy();
+            let value = into_utf16(ev(value, locals)?, "regex-replace.value")?.to_string_lossy();
+            let replacement = into_utf16(ev(replacement, locals)?, "regex-replace.replacement")?.to_string_lossy();
             Ok(TypedValue::String(Utf16String::from_str(&regex_replace(
                 pattern,
                 flags,
@@ -731,11 +736,11 @@ fn evaluate_inner(
             )?)))
         },
         TypedExpr::RegexSearch { value, pattern, flags } => {
-            let value = as_utf16(&ev(value, locals)?, "regex-search")?.to_string_lossy();
+            let value = into_utf16(ev(value, locals)?, "regex-search")?.to_string_lossy();
             Ok(TypedValue::Integer(regex_search(pattern, flags, &value)?))
         },
         TypedExpr::StringSplitRegex { value, pattern, flags } => {
-            let value = as_utf16(&ev(value, locals)?, "string-split-regex")?.to_string_lossy();
+            let value = into_utf16(ev(value, locals)?, "string-split-regex")?.to_string_lossy();
             Ok(TypedValue::Array(
                 regex_split(pattern, flags, &value)?
                     .into_iter()
@@ -744,7 +749,7 @@ fn evaluate_inner(
             ))
         },
         TypedExpr::MathMax { values } => {
-            let items = as_array(&ev(values, locals)?);
+            let items = into_array(ev(values, locals)?);
             let mut max = i64::MIN;
             for item in items {
                 max = max.max(as_i64(&item, "math-max")?);
@@ -753,13 +758,13 @@ fn evaluate_inner(
         },
         TypedExpr::StringSet { value } => {
             let mut set = Vec::new();
-            for item in as_array(&ev(value, locals)?) {
-                string_set_insert(&mut set, as_utf16(&item, "string-set")?);
+            for item in into_array(ev(value, locals)?) {
+                string_set_insert(&mut set, into_utf16(item, "string-set")?);
             }
             Ok(TypedValue::StringSet(set))
         },
         TypedExpr::StringSetAdd { name, item } => {
-            let item = as_utf16(&ev(item, locals)?, "string-set-add")?;
+            let item = into_utf16(ev(item, locals)?, "string-set-add")?;
             let mut set = match locals.get(name) {
                 Some(TypedValue::StringSet(set)) => set.clone(),
                 Some(other) => {
@@ -807,10 +812,10 @@ fn evaluate_inner(
             }
             Ok(TypedValue::Null)
         },
-        TypedExpr::ToString { value } => Ok(TypedValue::String(as_utf16(&ev(value, locals)?, "to-string")?)),
+        TypedExpr::ToString { value } => Ok(TypedValue::String(into_utf16(ev(value, locals)?, "to-string")?)),
         TypedExpr::LocaleCompare { left, right } => {
-            let left = as_utf16(&ev(left, locals)?, "locale-compare.left")?.to_string_lossy();
-            let right = as_utf16(&ev(right, locals)?, "locale-compare.right")?.to_string_lossy();
+            let left = into_utf16(ev(left, locals)?, "locale-compare.left")?.to_string_lossy();
+            let right = into_utf16(ev(right, locals)?, "locale-compare.right")?.to_string_lossy();
             Ok(TypedValue::Integer(js_locale_compare(&left, &right)))
         },
         TypedExpr::Exec {
@@ -856,7 +861,7 @@ fn evaluate_inner(
                 .collect(),
         )),
         TypedExpr::CtxEnv { name } => {
-            let name = as_utf16(&ev(name, locals)?, "ctx-env.name")?.to_string_lossy();
+            let name = into_utf16(ev(name, locals)?, "ctx-env.name")?.to_string_lossy();
             let value = require_effects(effects)?
                 .context
                 .environment_variables
@@ -871,7 +876,7 @@ fn evaluate_inner(
             fields, arguments, locals, None, effects,
         )?)),
         TypedExpr::Throw { class, message } => {
-            let message = as_utf16(&ev(message, locals)?, "throw.message")?.to_string_lossy();
+            let message = into_utf16(ev(message, locals)?, "throw.message")?.to_string_lossy();
             Err(Abort::Error(TypedHookError::throw(class, message)))
         },
     }
@@ -901,7 +906,7 @@ fn evaluate_exec(
     let args = as_array(args)
         .into_iter()
         .map(|item| {
-            as_utf16(&item, "exec.args")
+            into_utf16(item, "exec.args")
                 .map(|value| value.to_string_lossy())
                 .map_err(Abort::from)
         })
@@ -915,7 +920,7 @@ fn evaluate_exec(
         other => object_entries(other)
             .into_iter()
             .map(|(key, value)| {
-                as_utf16(&value, "exec.env")
+                into_utf16(value, "exec.env")
                     .map(|text| (key, text.to_string_lossy()))
                     .map_err(Abort::from)
             })
@@ -1019,9 +1024,9 @@ fn bind_for_of(locals: &mut BTreeMap<String, TypedValue>, names: &[String], item
         locals.insert(names[0].clone(), item);
         return;
     }
-    let items = as_array(&item);
-    for (index, name) in names.iter().enumerate() {
-        locals.insert(name.clone(), items.get(index).cloned().unwrap_or(TypedValue::Null));
+    let mut items = into_array(item).into_iter();
+    for name in names {
+        locals.insert(name.clone(), items.next().unwrap_or(TypedValue::Null));
     }
 }
 
@@ -1029,7 +1034,16 @@ fn receiver_utf16(value: TypedValue, label: &str) -> EvalResult<Option<Utf16Stri
     if matches!(value, TypedValue::Null) {
         return Ok(None);
     }
-    Ok(Some(as_utf16(&value, label)?))
+    Ok(Some(into_utf16(value, label)?))
+}
+
+/// [`as_utf16`] for a value the caller no longer needs: a string moves out
+/// instead of being copied.
+fn into_utf16(value: TypedValue, label: &str) -> TypedHookResult<Utf16String> {
+    match value {
+        TypedValue::String(value) => Ok(value),
+        other => as_utf16(&other, label),
+    }
 }
 
 fn as_utf16(value: &TypedValue, label: &str) -> TypedHookResult<Utf16String> {
@@ -1108,6 +1122,20 @@ fn locale_rank(ch: char) -> (u8, char) {
 fn string_set_insert(set: &mut Vec<Utf16String>, item: Utf16String) {
     if !set.iter().any(|existing| existing == &item) {
         set.push(item);
+    }
+}
+
+/// [`as_array`] for a value the caller no longer needs: array storage moves
+/// out instead of every element being copied.
+fn into_array(value: TypedValue) -> Vec<TypedValue> {
+    match value {
+        TypedValue::Array(items) => items,
+        TypedValue::StringArray(items) | TypedValue::StringSet(items) => {
+            items.into_iter().map(TypedValue::String).collect()
+        },
+        TypedValue::Json(JsonValue::Array(items)) => items.iter().map(json_to_value).collect(),
+        TypedValue::Null => Vec::new(),
+        other => vec![other],
     }
 }
 
@@ -1384,7 +1412,10 @@ fn array_includes(value: &TypedValue, needle: &TypedValue) -> bool {
             return set.contains(&needle);
         }
     }
-    as_array(value).iter().any(|item| strict_equal(item, needle))
+    match value {
+        TypedValue::Array(items) => items.iter().any(|item| strict_equal(item, needle)),
+        other => as_array(other).iter().any(|item| strict_equal(item, needle)),
+    }
 }
 
 fn safe_len(value: &TypedValue) -> TypedHookResult<i64> {
@@ -1432,7 +1463,7 @@ fn flatten(items: Vec<TypedValue>, depth: i64) -> Vec<TypedValue> {
     let mut out = Vec::new();
     for item in items {
         if matches!(item, TypedValue::Array(_) | TypedValue::StringArray(_)) {
-            out.extend(flatten(as_array(&item), depth - 1));
+            out.extend(flatten(into_array(item), depth - 1));
         } else {
             out.push(item);
         }
@@ -1464,7 +1495,41 @@ fn js_split_limit(value: &Utf16String, separator: &Utf16String, limit: i64) -> V
     parts
 }
 
-fn compile_regex(pattern: &str, flags: &str) -> TypedHookResult<fancy_regex::Regex> {
+thread_local! {
+    /// Regex literals compiled by the evaluation running on this thread. An
+    /// array callback evaluates the same literal once per element; compile it
+    /// once. The cache lives only as long as the outermost evaluation, so no
+    /// compiled program stays resident between hooks.
+    static REGEX_CACHE: RefCell<RegexCache> = RefCell::new(RegexCache::default());
+}
+
+#[derive(Default)]
+struct RegexCache {
+    depth: usize,
+    compiled: HashMap<String, Rc<fancy_regex::Regex>>,
+}
+
+struct RegexCacheScope;
+
+impl RegexCacheScope {
+    fn enter() -> Self {
+        REGEX_CACHE.with_borrow_mut(|cache| cache.depth += 1);
+        Self
+    }
+}
+
+impl Drop for RegexCacheScope {
+    fn drop(&mut self) {
+        REGEX_CACHE.with_borrow_mut(|cache| {
+            cache.depth -= 1;
+            if cache.depth == 0 {
+                cache.compiled = HashMap::new();
+            }
+        });
+    }
+}
+
+fn compile_regex(pattern: &str, flags: &str) -> TypedHookResult<Rc<fancy_regex::Regex>> {
     let mut builder = String::new();
     if flags.contains('i') {
         builder.push_str("(?i)");
@@ -1476,7 +1541,20 @@ fn compile_regex(pattern: &str, flags: &str) -> TypedHookResult<fancy_regex::Reg
         builder.push_str("(?s)");
     }
     builder.push_str(pattern);
-    fancy_regex::Regex::new(&builder).map_err(|error| TypedHookError::new(format!("regex compile: {error}")))
+    let cached = REGEX_CACHE.with_borrow(|cache| cache.compiled.get(&builder).cloned());
+    if let Some(regex) = cached {
+        return Ok(regex);
+    }
+    // Only successes are kept: an invalid literal fails the same way each time.
+    let regex = Rc::new(
+        fancy_regex::Regex::new(&builder).map_err(|error| TypedHookError::new(format!("regex compile: {error}")))?,
+    );
+    REGEX_CACHE.with_borrow_mut(|cache| {
+        if cache.depth > 0 {
+            cache.compiled.insert(builder, Rc::clone(&regex));
+        }
+    });
+    Ok(regex)
 }
 
 fn regex_is_match(pattern: &str, flags: &str, value: &str) -> TypedHookResult<bool> {
@@ -1644,5 +1722,22 @@ mod cancellation_tests {
         canceller.join().unwrap();
         assert!(error.is_cancelled());
         assert!(!error.is_timed_out());
+    }
+
+    #[test]
+    fn regex_literals_compile_once_per_evaluation_and_are_released_after() {
+        {
+            let _scope = RegexCacheScope::enter();
+            let first = compile_regex("a+", "i").unwrap();
+            let second = compile_regex("a+", "i").unwrap();
+            assert!(Rc::ptr_eq(&first, &second));
+            assert!(compile_regex("(", "").is_err());
+        }
+        REGEX_CACHE.with_borrow(|cache| {
+            assert_eq!(cache.depth, 0);
+            assert!(cache.compiled.is_empty());
+        });
+        let outside = compile_regex("a+", "i").unwrap();
+        assert!(!Rc::ptr_eq(&outside, &compile_regex("a+", "i").unwrap()));
     }
 }

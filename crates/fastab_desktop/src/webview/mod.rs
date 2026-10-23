@@ -1,5 +1,4 @@
 pub mod menu;
-pub mod notification;
 pub mod window_id;
 
 use std::collections::HashSet;
@@ -13,7 +12,6 @@ use tao::dpi::LogicalSize;
 use tao::window::Theme as TaoTheme;
 use tracing::{debug, error, warn};
 
-use self::notification::WebviewNotificationsState;
 use crate::event::{Event, WindowEvent};
 use crate::notification_bus::{JsonNotification, NOTIFICATION_BUS};
 use crate::platform::{PlatformBoundEvent, PlatformState};
@@ -42,7 +40,6 @@ pub struct WebviewManager {
     pub(crate) proxy: EventLoopProxy,
     pub(crate) figterm_state: Arc<FigtermState>,
     pub(crate) platform_state: Arc<PlatformState>,
-    pub(crate) notifications_state: Arc<WebviewNotificationsState>,
     pub(crate) context: Arc<Context>,
     pub(crate) show_dashboard_after_normal_launch: bool,
 }
@@ -70,7 +67,6 @@ impl WebviewManager {
 
         let figterm_state = Arc::new(FigtermState::default());
         let platform_state = Arc::new(PlatformState::new(proxy.clone()));
-        let notifications_state = Arc::new(WebviewNotificationsState::default());
 
         Self {
             fig_id_map: Default::default(),
@@ -78,7 +74,6 @@ impl WebviewManager {
             proxy,
             figterm_state,
             platform_state,
-            notifications_state,
             context,
             show_dashboard_after_normal_launch,
         }
@@ -91,21 +86,15 @@ impl WebviewManager {
     pub async fn prepare(mut self) -> anyhow::Result<crate::gpui_host::Setup> {
         let window_target = EventLoopWindowTarget;
         self.platform_state
-            .handle(
-                PlatformBoundEvent::Initialize,
-                &window_target,
-                &self.fig_id_map,
-                &self.notifications_state,
-            )
+            .handle(PlatformBoundEvent::Initialize, &window_target, &self.fig_id_map)
             .expect("Failed to initialize platform state");
 
         {
             let platform_state = self.platform_state.clone();
             let figterm_state = self.figterm_state.clone();
-            let notifications_state = self.notifications_state.clone();
             let proxy = self.proxy.clone();
             tokio::spawn(async move {
-                match local_ipc::start_local_ipc(platform_state, figterm_state, notifications_state, proxy).await {
+                match local_ipc::start_local_ipc(platform_state, figterm_state, proxy).await {
                     Ok(_) => (),
                     Err(err) => error!("Unable to start local ipc: {:?}", err),
                 }
@@ -116,12 +105,11 @@ impl WebviewManager {
             fastab_util::directories::local_remote_socket_path().unwrap(),
             self.figterm_state.clone(),
             RemoteHook {
-                notifications_state: self.notifications_state.clone(),
                 proxy: self.proxy.clone(),
             },
         ));
 
-        file_watcher::setup_listeners(self.notifications_state.clone(), self.proxy.clone()).await;
+        file_watcher::setup_listeners(self.proxy.clone()).await;
 
         init_webview_notification_listeners(self.proxy.clone()).await;
 
@@ -167,7 +155,6 @@ impl WebviewManager {
         let fig_id_map = self.fig_id_map;
         let figterm_state = self.figterm_state;
         let platform_state = self.platform_state;
-        let notifications_state = self.notifications_state;
         let context = self.context;
         let show_dashboard_after_normal_launch = self.show_dashboard_after_normal_launch;
 
@@ -183,7 +170,6 @@ impl WebviewManager {
                 fig_id_map,
                 figterm_state,
                 platform_state,
-                notifications_state,
                 context,
                 show_dashboard_after_normal_launch,
                 proxy,
