@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.0.15
+
+- change: pasting a large block of text into a running command no longer stalls the terminal; input parsing now grows linearly with the paste.
+- change: complete faster for commands with many global options (such as kubectl and docker) and for generators that filter command output with regular expressions.
+- change: do less work per keystroke in the terminal process and the completion overlay, use less memory for each terminal tab's key table, and drop an unused notification path from the desktop app.
+
 ## v0.0.14
 
 - fix: replace settings.json atomically and stop rewriting it as `{}` when it fails to parse; an unparsable file is kept and backed up, and a symlinked settings file keeps its link.
