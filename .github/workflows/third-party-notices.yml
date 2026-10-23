@@ -1,0 +1,61 @@
+name: Third-Party Notices
+
+# Regenerate THIRD_PARTY_NOTICES.txt on a macOS runner and upload it as an
+# artifact. The DMG build checks the committed file with `--check`, so run this
+# after a dependency change and commit the result.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Keep in step with release.yml: the notices embed this Sparkle version.
+  SPARKLE_VERSION: 2.9.3
+
+jobs:
+  generate:
+    name: Generate notices
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Sparkle framework
+        uses: actions/cache@v6
+        with:
+          path: build/sparkle
+          key: sparkle-${{ env.SPARKLE_VERSION }}
+
+      - name: Set up Rust
+        run: rustup show
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.0.10
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          cache: pnpm
+
+      - name: Install JS dependencies
+        env:
+          HUSKY: 0
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch Sparkle
+        run: ./scripts/fetch-sparkle.sh
+
+      - name: Generate notices
+        run: node scripts/generate-third-party-notices.mjs
+
+      - name: Show changes
+        run: git diff --stat -- THIRD_PARTY_NOTICES.txt
+
+      - name: Upload notices
+        uses: actions/upload-artifact@v7
+        with:
+          name: third-party-notices
+          path: THIRD_PARTY_NOTICES.txt
+          if-no-files-found: error
