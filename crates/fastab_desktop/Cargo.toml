@@ -39,7 +39,6 @@ custom-protocol = []
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-base64.workspace = true
 bytes.workspace = true
 cfg-if.workspace = true
 clap.workspace = true

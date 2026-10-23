@@ -287,8 +287,8 @@ pub(crate) async fn process_figterm_request(
             }
             Ok(None)
         },
-        // Local dispatch applies this through MainLoopControl. Never send
-        // synchronously into the bounded queue consumed by this same loop.
+        // SSH remote-install prompting is disabled: acknowledge and do
+        // nothing. Never send into the bounded queue this same loop consumes.
         FigtermRequest::NotifySshSessionStarted(_) => Ok(None),
         FigtermRequest::Telemtety(_) => anyhow::bail!("Telemetry is not supported over remote"),
         FigtermRequest::InlineShellCompletion(_)

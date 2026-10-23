@@ -710,8 +710,9 @@ pub(crate) struct CompletionContext {
     pub help_parent: Arc<Spec>,
     /// The effective persistent option set after walking through any parent
     /// subcommands/loadSpecs. The WebView parser mutates this set onto the
-    /// child completion object before collecting rows.
-    pub persistent_options: Vec<OptionSpec>,
+    /// child completion object before collecting rows. Entries share the
+    /// spec's own `Arc`s, so walking a subcommand does not copy the options.
+    pub persistent_options: Vec<Arc<OptionSpec>>,
     /// Options consumed in the current parser scope. Entering a subcommand or
     /// a loadSpec resets this list, matching `passedOptions` in the WebView.
     pub passed_options: Vec<OptionSpec>,
@@ -837,7 +838,7 @@ pub(crate) fn resolve_context(
     };
     let mut trace = crate::history::WalkTrace::new(root.as_ref());
     let walked = walk_spec(root, tokens, current_limit, registry, Some(&mut trace));
-    let persistent_refs: Vec<&OptionSpec> = walked.persistent_options.iter().collect();
+    let persistent_refs: Vec<&OptionSpec> = walked.persistent_options.iter().map(Arc::as_ref).collect();
     // `walk_spec` splices `parserDirectives.alias` expansions into `tokens`
     // in place (Fig: `tokens = currentCommand.tokens.slice(startIndex)`), so
     // the boundary of the token being typed is the walker's, not the one
@@ -876,7 +877,7 @@ struct WalkedSpec {
     path_end: usize,
     /// Index of the token being typed after alias expansion grew `tokens`.
     limit: usize,
-    persistent_options: Vec<OptionSpec>,
+    persistent_options: Vec<Arc<OptionSpec>>,
     passed_options: Vec<OptionSpec>,
     parser_directives: ParserDirectives,
     options_allowed: bool,
@@ -922,7 +923,7 @@ fn walk_spec(
     let mut substituted_aliases = HashSet::new();
     while index < limit {
         let token = &tokens[index];
-        let persistent_refs: Vec<&OptionSpec> = persistent_options.iter().collect();
+        let persistent_refs: Vec<&OptionSpec> = persistent_options.iter().map(Arc::as_ref).collect();
         let subcommand_arg = positional_arg(&current.args, positional);
         let options_allowed = can_consume_options(
             &parser_directives,
@@ -1279,7 +1280,7 @@ fn enter_loaded_spec(
     parent: &mut Arc<Spec>,
     path_end: &mut usize,
     positional: &mut usize,
-    persistent_options: &mut Vec<OptionSpec>,
+    persistent_options: &mut Vec<Arc<OptionSpec>>,
     parser_directives: &mut ParserDirectives,
     passed_options: &mut Vec<OptionSpec>,
     option_arg: &mut Option<OptionArgState>,
@@ -1615,13 +1616,13 @@ fn positional_arg(args: &[ArgSpec], index: usize) -> Option<&ArgSpec> {
     Some(arg)
 }
 
-fn merge_persistent_options(parent: &[OptionSpec], spec: &Spec) -> Vec<OptionSpec> {
+fn merge_persistent_options(parent: &[Arc<OptionSpec>], spec: &Spec) -> Vec<Arc<OptionSpec>> {
     let mut options = parent.to_vec();
     for option in &spec.persistent_options {
         if let Some(existing) = options.iter_mut().find(|existing| options_are_equal(existing, option)) {
-            *existing = option.as_ref().clone();
+            *existing = Arc::clone(option);
         } else {
-            options.push(option.as_ref().clone());
+            options.push(Arc::clone(option));
         }
     }
     options
@@ -2160,7 +2161,7 @@ pub(crate) fn complete_with_settings(
         context.active_arg.as_ref().map(|active| &active.arg),
     );
     let current = context.spec.as_ref();
-    let persistent_refs: Vec<&OptionSpec> = context.persistent_options.iter().collect();
+    let persistent_refs: Vec<&OptionSpec> = context.persistent_options.iter().map(Arc::as_ref).collect();
     let option_chain = (!ends_with_space)
         .then(|| {
             parse_short_option_chain(

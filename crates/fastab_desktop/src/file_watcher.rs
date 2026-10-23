@@ -1,7 +1,3 @@
-use std::sync::Arc;
-
-use fastab_proto::fig::notification::Type as NotificationEnum;
-use fastab_proto::fig::{NotificationType, SettingsChangedNotification};
 use fastab_settings::JsonStore;
 use fastab_util::directories;
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -11,9 +7,8 @@ use tracing::{debug, error, trace};
 use crate::Event;
 use crate::EventLoopProxy;
 use crate::notification_bus::NOTIFICATION_BUS;
-use crate::webview::notification::WebviewNotificationsState;
 
-pub async fn setup_listeners(notifications_state: Arc<WebviewNotificationsState>, proxy: EventLoopProxy) {
+pub async fn setup_listeners(proxy: EventLoopProxy) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     let mut watcher = notify::recommended_watcher(move |res| match res {
@@ -100,22 +95,6 @@ pub async fn setup_listeners(notifications_state: Arc<WebviewNotificationsState>
                                 proxy
                                     .send_event(Event::ReloadCredentials)
                                     .map_err(|err| error!(?err, "failed to refresh overlay after settings change"))
-                                    .ok();
-
-                                notifications_state
-                                    .broadcast_notification_all(
-                                        &NotificationType::NotifyOnSettingsChange,
-                                        fastab_proto::fig::Notification {
-                                            r#type: Some(NotificationEnum::SettingsChangedNotification(
-                                                SettingsChangedNotification {
-                                                    json_blob: serde_json::to_string(&settings).ok(),
-                                                },
-                                            )),
-                                        },
-                                        &proxy,
-                                    )
-                                    .await
-                                    .map_err(|err| error!(?err, "failed to broadcast settings change"))
                                     .ok();
 
                                 json_map_diff(

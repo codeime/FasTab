@@ -20,7 +20,6 @@ use crate::event_loop::{InputSequence, OverlayInputDispatch, QueuedOverlayInput}
 use crate::overlay::OverlayController;
 use crate::platform::{PlatformBoundEvent, PlatformState};
 use crate::tray::{self, get_context_menu, get_icon};
-use crate::webview::notification::WebviewNotificationsState;
 use crate::webview::{DASHBOARD_ID, FigIdMap, WindowId};
 use crate::{EventLoopProxy, EventLoopWindowTarget};
 use fastab_os_shim::Context;
@@ -120,7 +119,6 @@ pub struct DesktopHost {
     pub fig_id_map: FigIdMap,
     pub figterm_state: Arc<FigtermState>,
     pub platform_state: Arc<PlatformState>,
-    pub notifications_state: Arc<WebviewNotificationsState>,
     #[allow(dead_code)]
     pub context: Arc<Context>,
     /// The launch flow deferred its normal settings/dashboard open until the
@@ -311,12 +309,10 @@ impl DesktopHost {
                         invalidate_overlay_input_focus(&self.proxy, &mut self.overlay, sequence, cx);
                     }
                 }
-                if let Err(err) = self.platform_state.handle(
-                    native_event,
-                    &self.window_target,
-                    &self.fig_id_map,
-                    &self.notifications_state,
-                ) {
+                if let Err(err) = self
+                    .platform_state
+                    .handle(native_event, &self.window_target, &self.fig_id_map)
+                {
                     debug!(%err, "Failed to handle native event");
                 }
             },

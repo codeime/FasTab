@@ -1421,7 +1421,6 @@ impl OverlayController {
                 cwd,
                 &self.last_position,
                 &self.platform_state,
-                icons,
                 !explicit_show,
                 cx,
             );
@@ -2252,7 +2251,6 @@ fn apply_complete_result(
     _cwd: &str,
     last_position: &Mutex<Option<WindowPosition>>,
     platform_state: &PlatformState,
-    _file_icons: &mut file_icons::FileIconCache,
     allow_arg_hide: bool,
     cx: &mut App,
 ) -> bool {

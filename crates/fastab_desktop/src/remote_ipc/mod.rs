@@ -2,28 +2,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use base64::prelude::*;
-use bytes::BytesMut;
-use fastab_proto::fig::server_originated_message::Submessage as ServerOriginatedSubMessage;
-use fastab_proto::fig::{
-    EditBufferChangedNotification, HistoryUpdatedNotification, LocationChangedNotification, Notification,
-    NotificationType, Process, ProcessChangedNotification, ServerOriginatedMessage, ShellPromptReturnedNotification,
-};
 use fastab_proto::local::{EditBufferHook, InterceptedKeyHook, PostExecHook, PreExecHook, PromptHook};
-use fastab_proto::prost::Message;
 use fastab_proto::remote::clientbound;
 use fastab_remote_ipc::figterm::{FigtermState, SessionMetrics};
 use time::OffsetDateTime;
-use tracing::{debug, error};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::EventLoopProxy;
-use crate::event::{EmitEventName, Event, WindowEvent};
-use crate::webview::notification::WebviewNotificationsState;
+use crate::event::Event;
 
 #[derive(Debug, Clone)]
 pub struct RemoteHook {
-    pub notifications_state: Arc<WebviewNotificationsState>,
     pub proxy: EventLoopProxy,
 }
 
@@ -48,8 +38,8 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         session_id: Uuid,
         figterm_state: &Arc<FigtermState>,
     ) -> Result<Option<clientbound::response::Response>> {
-        // Stamp the input before any bounded legacy notification can wait.
-        // A later accepted native focus must still supersede this input.
+        // Stamp the input before the bounded overlay send can wait. A later
+        // accepted native focus must still supersede this input.
         let input_sequence = self.proxy.begin_overlay_input();
         let mut redraw = false;
         let _old_metrics = figterm_state.with_update(session_id, |session| {
@@ -77,57 +67,6 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
                 None
             }
         });
-
-        // GPUI never inserts here. Skip UTF-16 / protobuf / base64 unless a
-        // leftover WebView subscriber is actually listening.
-        if !self.notifications_state.subscriptions.is_empty() {
-            let utf16_cursor_position = hook
-                .text
-                .get(..hook.cursor as usize)
-                .map(|s| s.encode_utf16().count() as i32);
-
-            // Do not retain a DashMap shard guard across bounded admission.
-            let subscribers: Vec<_> = self
-                .notifications_state
-                .subscriptions
-                .iter()
-                .filter_map(|sub| {
-                    sub.get(&NotificationType::NotifyOnEditbuffferChange)
-                        .map(|id| (sub.key().clone(), *id))
-                })
-                .collect();
-            for (window_id, message_id) in subscribers {
-                let hook = hook.clone();
-                let message = ServerOriginatedMessage {
-                    id: Some(message_id),
-                    submessage: Some(ServerOriginatedSubMessage::Notification(Notification {
-                        r#type: Some(fastab_proto::fig::notification::Type::EditBufferNotification(
-                            EditBufferChangedNotification {
-                                context: hook.context,
-                                buffer: Some(hook.text),
-                                cursor: utf16_cursor_position,
-                                session_id: Some(session_id.into()),
-                            },
-                        )),
-                    })),
-                };
-
-                let mut encoded = BytesMut::new();
-                message.encode(&mut encoded).unwrap();
-
-                debug!(%message_id, "Sending edit buffer change notification to webview");
-
-                self.proxy
-                    .send_event_async(Event::WindowEvent {
-                        window_id,
-                        window_event: WindowEvent::Emit {
-                            event_name: EmitEventName::Notification,
-                            payload: BASE64_STANDARD.encode(encoded).into(),
-                        },
-                    })
-                    .await?;
-            }
-        }
 
         let cwd = figterm_state
             .with(&session_id, |session| {
@@ -160,66 +99,12 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         session_id: Uuid,
         figterm_state: &Arc<FigtermState>,
     ) -> Result<Option<clientbound::response::Response>> {
-        let mut cwd_changed = false;
-        let mut new_cwd = None;
         figterm_state.with(&session_id, |session| {
             session.edit_buffer.end_input();
-            if let (Some(old_context), Some(new_context)) = (&session.context, &hook.context) {
-                cwd_changed = old_context.current_working_directory != new_context.current_working_directory;
-                new_cwd.clone_from(&new_context.current_working_directory);
-            }
-
             session.apply_context(hook.context.clone());
         });
 
         let _ = self.proxy.send_event_async(Event::JevContextChanged).await;
-
-        if cwd_changed {
-            if let Err(err) = self
-                .notifications_state
-                .broadcast_notification_all_bounded(
-                    &NotificationType::NotifyOnLocationChange,
-                    Notification {
-                        r#type: Some(fastab_proto::fig::notification::Type::LocationChangedNotification(
-                            LocationChangedNotification {
-                                session_id: Some(session_id.to_string()),
-                                host_name: hook.context.as_ref().and_then(|ctx| ctx.hostname.clone()),
-                                user_name: None,
-                                directory: new_cwd,
-                            },
-                        )),
-                    },
-                    &self.proxy,
-                )
-                .await
-            {
-                error!(%err, "Failed to broadcast LocationChangedNotification");
-            }
-        }
-
-        if let Err(err) = self
-            .notifications_state
-            .broadcast_notification_all_bounded(
-                &NotificationType::NotifyOnPrompt,
-                Notification {
-                    r#type: Some(fastab_proto::fig::notification::Type::ShellPromptReturnedNotification(
-                        ShellPromptReturnedNotification {
-                            session_id: Some(session_id.to_string()),
-                            shell: hook.context.as_ref().map(|ctx| Process {
-                                pid: ctx.pid,
-                                executable: ctx.process_name.clone(),
-                                directory: ctx.current_working_directory.clone(),
-                                env: vec![],
-                            }),
-                        },
-                    )),
-                },
-                &self.proxy,
-            )
-            .await
-        {
-            error!(%err, "Failed to broadcast ShellPromptReturnedNotification");
-        }
 
         Ok(None)
     }
@@ -239,27 +124,6 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
             .send_event_async(Event::GpuiOverlayEndInput { session_id })
             .await?;
 
-        self.notifications_state
-            .broadcast_notification_all_bounded(
-                &NotificationType::NotifyOnProcessChanged,
-                Notification {
-                    r#type: Some(fastab_proto::fig::notification::Type::ProcessChangeNotification(
-                        ProcessChangedNotification {
-                        session_id: Some(session_id.to_string()),
-                        new_process: // TODO: determine active application based on tty
-                        hook.context.as_ref().map(|ctx| Process {
-                            pid: ctx.pid,
-                            executable: ctx.process_name.clone(),
-                            directory: ctx.current_working_directory.clone(),
-                            env: vec![],
-                        }),
-                    },
-                    )),
-                },
-                &self.proxy,
-            )
-            .await?;
-
         Ok(None)
     }
 
@@ -274,28 +138,6 @@ impl fastab_remote_ipc::RemoteHookHandler for RemoteHook {
         });
 
         let _ = self.proxy.send_event_async(Event::JevContextChanged).await;
-
-        self.notifications_state
-            .broadcast_notification_all_bounded(
-                &NotificationType::NotifyOnHistoryUpdated,
-                Notification {
-                    r#type: Some(fastab_proto::fig::notification::Type::HistoryUpdatedNotification(
-                        HistoryUpdatedNotification {
-                            command: hook.command.clone(),
-                            process_name: hook.context.as_ref().and_then(|ctx| ctx.process_name.clone()),
-                            current_working_directory: hook
-                                .context
-                                .as_ref()
-                                .and_then(|ctx| ctx.current_working_directory.clone()),
-                            session_id: Some(session_id.to_string()),
-                            hostname: hook.context.as_ref().and_then(|ctx| ctx.hostname.clone()),
-                            exit_code: hook.exit_code,
-                        },
-                    )),
-                },
-                &self.proxy,
-            )
-            .await?;
 
         Ok(None)
     }
@@ -363,76 +205,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_notification_admission_keeps_the_edit_buffers_original_focus_order() {
-        use fastab_remote_ipc::RemoteHookHandler as _;
-
-        let state = Arc::new(FigtermState::new());
-        let (proxy, events) = crate::event_loop::channel();
-        // Fill the real ingress until a producer has to wait, without a
-        // second copy of its count/byte limit in this socket-hook fixture.
-        let mut admitted = 0;
-        loop {
-            let mut send = Box::pin(proxy.send_event_async(Event::ReloadAccessibility));
-            match futures::poll!(send.as_mut()) {
-                std::task::Poll::Ready(result) => {
-                    result.unwrap();
-                    admitted += 1;
-                },
-                std::task::Poll::Pending => break,
-            }
-        }
-        let notifications = Arc::new(WebviewNotificationsState::default());
-        let subscriptions = crate::webview::notification::WebviewNotificationWindowState::default();
-        subscriptions.insert(NotificationType::NotifyOnEditbuffferChange, 1);
-        notifications.subscriptions.insert(crate::DASHBOARD_ID, subscriptions);
-        let mut hook = RemoteHook {
-            notifications_state: notifications,
-            proxy: proxy.clone(),
-        };
-        let edit = EditBufferHook {
-            text: "git s".into(),
-            cursor: 5,
-            ..Default::default()
-        };
-        let mut pending = Box::pin(hook.edit_buffer(&edit, Uuid::nil(), &state));
-        assert!(futures::poll!(pending.as_mut()).is_pending());
-        proxy
-            .send_event(Event::PlatformBoundEvent(
-                crate::platform::PlatformBoundEvent::ExternalWindowFocusChanged {
-                    #[cfg(target_os = "macos")]
-                    app: macos_utils::window_server::ApplicationSpecifier {
-                        pid: 1,
-                        bundle_id: "test.terminal".into(),
-                    },
-                    window: None,
-                },
-            ))
-            .unwrap();
-        for _ in 0..admitted {
-            events.recv_queued().await.unwrap().dispatch(|_, _| {});
-        }
-        pending.await.unwrap();
-        assert_eq!(events.len(), 3, "focus, legacy notification, then overlay input");
-        events.recv_queued().await.unwrap().dispatch(|event, sequence| {
-            assert!(matches!(event, Event::PlatformBoundEvent(_)));
-            proxy.accept_input_focus(sequence);
-        });
-        assert!(matches!(next_event(&events).await, Event::WindowEvent { .. }));
-        let Event::GpuiOverlayInput(input) = next_event(&events).await else {
-            panic!("expected input");
-        };
-        assert!(proxy.take_overlay_input(&input).is_none());
-        assert_eq!(proxy.diagnostics().async_events, 0);
-    }
-
-    #[tokio::test]
     async fn edit_buffers_reach_overlay_before_caret_refresh() {
         let state = Arc::new(FigtermState::new());
         let (proxy, events) = crate::event_loop::channel();
-        let hook = RemoteHook {
-            notifications_state: Arc::new(WebviewNotificationsState::default()),
-            proxy,
-        };
+        let hook = RemoteHook { proxy };
         let mut session_ids = Vec::new();
         // Real handshakes exercise distinct session owners even for the same
         // shell ID, followed by the production hook and desktop event queue.

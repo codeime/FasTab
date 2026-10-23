@@ -15,7 +15,6 @@ use core_foundation::base::TCFType;
 use core_graphics::display::CGRect;
 use core_graphics::window::CGWindowID;
 use fastab_integrations::input_method::InputMethod;
-use fastab_proto::fig::{AccessibilityChangeNotification, Notification, NotificationType};
 use fastab_proto::local::caret_position_hook::Origin;
 use fastab_util::Terminal;
 use macos_utils::accessibility::accessibility_is_enabled;
@@ -33,7 +32,6 @@ use tracing::{debug, error, trace, warn};
 use super::{PlatformBoundEvent, PlatformWindow};
 use crate::event::{Event, WindowEvent, WindowPosition};
 use crate::utils::Rect;
-use crate::webview::notification::WebviewNotificationsState;
 use crate::webview::{FigIdMap, WindowId};
 use crate::{AUTOCOMPLETE_ID, AUTOCOMPLETE_WINDOW_TITLE, DASHBOARD_ID, EventLoopProxy, EventLoopWindowTarget};
 
@@ -476,7 +474,6 @@ impl PlatformStateImpl {
         event: PlatformBoundEvent,
         window_target: &EventLoopWindowTarget,
         window_map: &FigIdMap,
-        notifications_state: &Arc<WebviewNotificationsState>,
     ) -> anyhow::Result<()> {
         match &event {
             PlatformBoundEvent::FocusedElementChanged { app, .. } => {
@@ -715,25 +712,6 @@ impl PlatformStateImpl {
                 //         .ok();
                 //     });
                 // }
-
-                let proxy = self.proxy.clone();
-                let notifications_state = notifications_state.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = notifications_state
-                        .broadcast_notification_all(
-                            &NotificationType::NotifyOnAccessibilityChange,
-                            Notification {
-                                r#type: Some(fastab_proto::fig::notification::Type::AccessibilityChangeNotification(
-                                    AccessibilityChangeNotification { enabled },
-                                )),
-                            },
-                            &proxy,
-                        )
-                        .await
-                    {
-                        error!(%err, "Failed to broadcast notification");
-                    }
-                });
 
                 self.proxy.send_event(Event::ReloadAccessibility).ok();
 

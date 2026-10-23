@@ -265,22 +265,6 @@ pub struct ShowMessageNotification {
     pub buttons_result: Option<tokio::sync::mpsc::Sender<rfd::MessageDialogResult>>,
 }
 
-#[derive(Debug, Clone)]
-pub enum EmitEventName {
-    Notification,
-    ProtoMessageReceived,
-    GlobalErrorOccurred,
-}
-
-impl std::fmt::Display for EmitEventName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Notification | Self::ProtoMessageReceived => "FigProtoMessageReceived",
-            Self::GlobalErrorOccurred => "FigGlobalErrorOccurred",
-        })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowPosition {
     Absolute(Position),
@@ -351,10 +335,6 @@ pub enum WindowEvent {
     /// Closes the window.
     Close,
     Show,
-    Emit {
-        event_name: EmitEventName,
-        payload: Cow<'static, str>,
-    },
     NavigateRelative {
         path: Cow<'static, str>,
     },
@@ -375,7 +355,6 @@ pub enum WindowEvent {
 impl WindowEvent {
     fn payload_bytes(&self) -> usize {
         match self {
-            Self::Emit { payload, .. } => cow_capacity(payload),
             Self::NavigateRelative { path } => cow_capacity(path),
             Self::CaretPositionHook { source, .. } => source.bundle_id.as_ref().map_or(0, String::capacity),
             Self::Event { event_name, payload } => {
@@ -394,14 +373,7 @@ impl WindowEvent {
     pub fn is_allowed_while_disabled(&self) -> bool {
         matches!(
             self,
-            WindowEvent::Hide
-                | WindowEvent::Close
-                | WindowEvent::SetEnabled(_)
-                // TODO: we really shouldnt need to allow this to be called when disabled,
-                // however we allow it at the moment because notification listeners are
-                // initialized early on and we dont have a way to delay them until the window
-                // is enabled
-                | WindowEvent::Emit { .. }
+            WindowEvent::Hide | WindowEvent::Close | WindowEvent::SetEnabled(_)
         )
     }
 }

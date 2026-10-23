@@ -17,8 +17,6 @@ default = []
 
 [dependencies]
 fastab_os_shim.workspace = true
-fastab_util.workspace = true
-parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-appender = "0.2.2"

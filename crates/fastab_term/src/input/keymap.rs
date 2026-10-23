@@ -34,6 +34,13 @@ impl<Value: Debug> Node<Value> {
         }
     }
 
+    fn shrink_to_fit(&mut self) {
+        self.children.shrink_to_fit();
+        for child in &mut self.children {
+            child.shrink_to_fit();
+        }
+    }
+
     fn lookup(&self, key: &[u8], depth: usize) -> NodeFind<&Value> {
         if key.is_empty() {
             // We've matched the maximum extent of the input key.
@@ -139,6 +146,13 @@ impl<Value: Debug + Clone> KeyMap<Value> {
         self.root.insert(key.as_ref(), value);
     }
 
+    /// Release spare child capacity once every key is inserted. Most nodes
+    /// sit on a single-child chain, and a `Vec`'s first growth reserves four
+    /// slots, so an unshrunk map keeps several times the nodes it uses.
+    pub fn shrink_to_fit(&mut self) {
+        self.root.shrink_to_fit();
+    }
+
     /// Perform a lookup for `key`.
     /// `key` can be a string consisting of a sequence of bytes.
     /// The `lookup` operation considers the prefix of `key` and searches
@@ -198,6 +212,10 @@ mod test {
         assert_eq!(km.lookup("boa"), Found::Exact(3, true),);
         assert_eq!(km.lookup("boo"), Found::Ambiguous(3, true),);
         assert_eq!(km.lookup("boom"), Found::Exact(4, false),);
+        assert_eq!(km.lookup("boom!"), Found::Exact(4, false),);
+        km.shrink_to_fit();
+        assert_eq!(km.root.children.capacity(), km.root.children.len());
+        assert_eq!(km.lookup("boo"), Found::Ambiguous(3, true),);
         assert_eq!(km.lookup("boom!"), Found::Exact(4, false),);
     }
 

@@ -1030,19 +1030,12 @@ pub fn merge_history_with_prefix(
     // suggestion's `name` array. The IR keeps the selected spelling plus its
     // primary spelling; those are the alias identities that survive the
     // flattening step (displayName is presentation text, not an alias).
-    let static_names: HashSet<String> = result
-        .suggestions
-        .iter()
-        .flat_map(suggestion_name_spellings)
-        .map(str::to_string)
+    let static_names: HashSet<&str> = result.suggestions.iter().flat_map(suggestion_name_spellings).collect();
+    let fresh: Vec<Suggestion> = history
+        .into_iter()
+        .filter(|item| !static_names.contains(item.name.as_str()))
         .collect();
-
-    for item in history {
-        if static_names.contains(&item.name) {
-            continue;
-        }
-        result.suggestions.push(item);
-    }
+    result.suggestions.extend(fresh);
 }
 
 fn matching_term(result: &CompleteResult) -> &str {

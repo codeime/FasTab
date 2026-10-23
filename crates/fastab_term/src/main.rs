@@ -39,7 +39,6 @@ use fastab_settings::state;
 use fastab_util::env_var::{Q_LOG_LEVEL, Q_SHELL, Q_TERM, QTERM_SESSION_ID};
 use fastab_util::process_info::{Pid, PidExt};
 use fastab_util::{PRODUCT_NAME, PTY_BINARY_NAME, directories, terminal::current_terminal};
-use flume::{Receiver, Sender};
 #[cfg(unix)]
 use nix::unistd::execvp;
 use portable_pty::PtySize;
@@ -312,8 +311,6 @@ impl MainLoopControl<'_> {
             MainLoopEvent::UnsetCsiU => {
                 self.csi_u.desired = false;
             },
-            // SSH remote-install prompting is currently disabled.
-            MainLoopEvent::PromptSSH { .. } => {},
         }
         Ok(())
     }
@@ -363,9 +360,7 @@ async fn process_pty_bytes(
             let end = index + 1;
             control.stdout.write_all(&bytes[forwarded..end]).await?;
             forwarded = end;
-            control.bracketed_paste = term
-                .mode()
-                .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+            control.bracketed_paste = bracketed_paste_enabled(term);
             control.drain_local(events).await?;
             if boundary {
                 control.flush_csi_u().await?;
@@ -379,9 +374,7 @@ async fn process_pty_bytes(
     let delayed_count = term.get_delayed_events_count();
     if delayed_count > 0 && delayed_count == old_delayed_count {
         term.flush_delayed_events();
-        control.bracketed_paste = term
-            .mode()
-            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        control.bracketed_paste = bracketed_paste_enabled(term);
         control.drain_local(events).await?;
     }
     if processor.is_output_boundary() {
@@ -390,6 +383,11 @@ async fn process_pty_bytes(
     control.stdout.flush().await?;
     record_sync_output(processor);
     Ok(())
+}
+
+fn bracketed_paste_enabled<T: EventListener>(term: &Term<T>) -> bool {
+    term.mode()
+        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
 }
 
 fn record_sync_output(processor: &Processor) {
@@ -420,9 +418,7 @@ async fn finish_pty_sync(
     // The Windows prompt grace has already lasted through this timeout. Do
     // not require another PTY read to publish prompt events replayed above.
     term.flush_delayed_events();
-    control.bracketed_paste = term
-        .mode()
-        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+    control.bracketed_paste = bracketed_paste_enabled(term);
     control.drain_local(events).await?;
     if processor.is_output_boundary() {
         control.flush_csi_u().await?;
@@ -499,12 +495,6 @@ pub(crate) enum MainLoopEvent {
     },
     UnlockInterception,
     SetImmediateMode(bool),
-    // SSH remote-install prompt path is currently commented out at the match site.
-    #[allow(dead_code)]
-    PromptSSH {
-        uuid: String,
-        remote_host: String,
-    },
     SetCsiU,
     UnsetCsiU,
 }
@@ -627,81 +617,6 @@ fn get_cursor_coordinates(terminal: &dyn Terminal) -> Option<TerminalCursorCoord
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn _should_install_remote_ssh_integration(
-    uuid: String,
-    remote_host: String,
-    main_loop_tx: Sender<MainLoopEvent>,
-    remote_receiver: Receiver<RemoteIncoming>,
-    remote_sender: RemoteSender,
-    term: &Term<EventHandler>,
-    pty_master: &mut Box<dyn crate::pty::AsyncMasterPty + Send + Sync>,
-    key_interceptor: &mut KeyInterceptor,
-) -> Option<bool> {
-    use fastab_proto::remote::clientbound;
-
-    let remote_install_setting = fastab_settings::settings::get_string_or("ssh.remote-prompt", "ask".into());
-    if remote_install_setting == "never" {
-        return Some(false);
-    }
-
-    let key = format!("ssh.remote-prompt.disable-host.{remote_host}");
-    let disable_host = fastab_settings::state::get_bool_or(key, false);
-    if disable_host {
-        return Some(false);
-    }
-
-    let prompt_timeout: u64 = fastab_settings::settings::get_int_or("ssh.remote-prompt.timeout", 2000)
-        .try_into()
-        .unwrap_or(2000);
-
-    // Wait for child ssh session to connect to local desktop instance.
-    let got_child_connection = tokio::time::timeout(tokio::time::Duration::from_millis(prompt_timeout), async {
-        loop {
-            if let Ok(incoming) = remote_receiver.recv_async().await {
-                reconcile_remote_state(&remote_sender, key_interceptor);
-                let response_sender = remote_sender.for_generation(incoming.generation);
-                if !response_sender.is_current_ready() {
-                    continue;
-                }
-                let msg = incoming.message;
-                if let Some(clientbound::Packet::NotifyChildSessionStarted(clientbound::NotifyChildSessionStarted {
-                    parent_id,
-                })) = msg.packet
-                {
-                    if parent_id == uuid {
-                        return true;
-                    }
-                } else {
-                    process_remote_message(
-                        msg,
-                        main_loop_tx.clone(),
-                        response_sender,
-                        incoming.permit,
-                        term,
-                        pty_master,
-                        key_interceptor,
-                    )
-                    .await
-                    .ok();
-                }
-            }
-        }
-    })
-    .await
-    .is_ok();
-
-    if got_child_connection {
-        return Some(false);
-    }
-
-    if remote_install_setting == "always" {
-        return Some(true);
-    }
-
-    None
-}
-
 /// Process titles from the pre hook are `zsh (fterm)`. Older and sibling PTYs
 /// also wrap shell names; matching must see the inner name.
 fn without_pty_wrapper_suffix(name: &str) -> &str {
@@ -717,16 +632,17 @@ fn can_send_edit_buffer<T>(term: &Term<T>) -> bool
 where
     T: EventListener,
 {
+    // Nested PTY titles are `zsh (fterm)` (or an older/sibling PTY name).
+    let shell = term
+        .shell_state()
+        .get_context()
+        .shell
+        .as_deref()
+        .map(without_pty_wrapper_suffix);
     let shell_enabled = ["bash", "zsh", "fish", "nu", "dash"]
         .into_iter()
         .chain(USER_ENABLED_SHELLS.iter().map(|s| s.as_str()))
-        .any(|s| {
-            let shell_raw = term.shell_state().get_context().shell.as_deref();
-            // Nested PTY titles are `zsh (fterm)` (or an older/sibling PTY name).
-            let shell = shell_raw.map(without_pty_wrapper_suffix);
-
-            shell == Some(s)
-        });
+        .any(|s| shell == Some(s));
     let preexec = term.shell_state().preexec;
 
     let mut handle = INSERTION_LOCK.lock().unwrap();
@@ -770,7 +686,7 @@ fn autocomplete_enabled(env: &Env) -> bool {
 
 static AUTOCOMPLETE_ENABLED: LazyLock<bool> = LazyLock::new(|| autocomplete_enabled(&Env::new()));
 
-async fn send_edit_buffer<T>(
+fn send_edit_buffer<T>(
     term: &Term<T>,
     sender: &RemoteSender,
     cursor_coordinates: Option<TerminalCursorCoordinates>,
@@ -1037,7 +953,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
         #[cfg(target_os = "windows")]
         term.set_windows_delay_end_prompt(true);
 
-        let mut write_buffer: Vec<u8> = vec![0; BUFFER_SIZE];
+        let mut pty_read_buffer: Vec<u8> = vec![0; BUFFER_SIZE];
 
         let mut key_interceptor = KeyInterceptor::new();
         key_interceptor.load_key_intercepts()?;
@@ -1071,6 +987,23 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 
         let mut csi_u = CsiUState::default();
 
+        // Every arm that applies controls borrows the same loop state.
+        macro_rules! main_loop_control {
+            () => {
+                MainLoopControl {
+                    remote_sender: &remote_sender,
+                    master: master.as_mut(),
+                    deferred_pty_input: &mut deferred_pty_input,
+                    deferred_inserts: &mut deferred_inserts,
+                    key_interceptor: &mut key_interceptor,
+                    terminal: &mut terminal,
+                    stdout: &mut stdout,
+                    csi_u: &mut csi_u,
+                    bracketed_paste: bracketed_paste_enabled(&term),
+                }
+            };
+        }
+
         let result: Result<()> = 'select_loop: loop {
             if first_time && term.shell_state().has_seen_prompt {
                 trace!("Has seen prompt and first time");
@@ -1094,7 +1027,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                 (
                     main_loop_rx.recv_async(),
                     input_rx.recv_async(),
-                    master.read(&mut write_buffer),
+                    master.read(&mut pty_read_buffer),
                     remote_receiver.recv_async(),
                     incoming_receiver.recv_async(),
                     async {
@@ -1110,74 +1043,32 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
             .await;
             let select_result: Result<()> = match ready {
                 MainLoopReady::SyncTimeout => {
-                    let mut control = MainLoopControl {
-                        remote_sender: &remote_sender,
-                        master: master.as_mut(),
-                        deferred_pty_input: &mut deferred_pty_input,
-                        deferred_inserts: &mut deferred_inserts,
-                        key_interceptor: &mut key_interceptor,
-                        terminal: &mut terminal,
-                        stdout: &mut stdout,
-                        csi_u: &mut csi_u,
-                        bracketed_paste: term
-                            .mode()
-                            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
-                    };
+                    let mut control = main_loop_control!();
                     finish_pty_sync(&mut processor, &mut term, &local_events, &mut control).await?;
                     if can_send_edit_buffer(&term) {
                         let cursor_coordinates = get_cursor_coordinates(&terminal);
-                        if let Err(err) = send_edit_buffer(&term, &remote_sender, cursor_coordinates).await {
+                        if let Err(err) = send_edit_buffer(&term, &remote_sender, cursor_coordinates) {
                             warn!("Failed to send edit buffer after synchronized output: {err}");
                         }
                     }
                     Ok(())
                 },
-                MainLoopReady::RemoteStateChanged => {
+                MainLoopReady::RemoteStateChanged | MainLoopReady::KeyDeliveryChanged => {
                     reconcile_remote_state(&remote_sender, &mut key_interceptor);
-                    let bracketed_paste = term
-                        .mode()
-                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
                     flush_settled_pty_input(
                         &remote_sender,
                         master.as_mut(),
                         &mut deferred_pty_input,
                         &mut deferred_inserts,
                         &mut key_interceptor,
-                        bracketed_paste,
-                    )
-                    .await
-                },
-                MainLoopReady::KeyDeliveryChanged => {
-                    reconcile_remote_state(&remote_sender, &mut key_interceptor);
-                    let bracketed_paste = term
-                        .mode()
-                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
-                    flush_settled_pty_input(
-                        &remote_sender,
-                        master.as_mut(),
-                        &mut deferred_pty_input,
-                        &mut deferred_inserts,
-                        &mut key_interceptor,
-                        bracketed_paste,
+                        bracketed_paste_enabled(&term),
                     )
                     .await
                 },
                 MainLoopReady::Control(res) => {
                     match res {
                         Ok(event) => {
-                            let mut control = MainLoopControl {
-                                remote_sender: &remote_sender,
-                                master: master.as_mut(),
-                                deferred_pty_input: &mut deferred_pty_input,
-                                deferred_inserts: &mut deferred_inserts,
-                                key_interceptor: &mut key_interceptor,
-                                terminal: &mut terminal,
-                                stdout: &mut stdout,
-                                csi_u: &mut csi_u,
-                                bracketed_paste: term
-                                    .mode()
-                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
-                            };
+                            let mut control = main_loop_control!();
                             control.apply(event).await?;
                             if processor.is_output_boundary() {
                                 control.flush_csi_u().await?;
@@ -1239,8 +1130,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                                     &mut deferred_pty_input,
                                                     &mut deferred_inserts,
                                                     &mut key_interceptor,
-                                                    term.mode()
-                                                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                                    bracketed_paste_enabled(&term),
                                                 )
                                                 .await?;
                                                 if !deferred_pty_input.is_empty() {
@@ -1320,10 +1210,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                     },
                                     Ok((None, InputEvent::Paste(string))) => {
                                         // Pass through bracketed pastes.
-                                        if term
-                                            .mode()
-                                            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
-                                        {
+                                        if bracketed_paste_enabled(&term) {
                                             write_buffer.extend(b"\x1b[200~");
                                             write_buffer.extend(string.replace('\x1b', "").as_bytes());
                                             write_buffer.extend(b"\x1b[201~");
@@ -1356,8 +1243,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 &mut deferred_pty_input,
                                 &mut deferred_inserts,
                                 &mut key_interceptor,
-                                term.mode()
-                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                bracketed_paste_enabled(&term),
                             )
                             .await?;
                             if input_res.is_err() {
@@ -1367,8 +1253,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                     &mut deferred_pty_input,
                                     &mut deferred_inserts,
                                     &mut key_interceptor,
-                                    term.mode()
-                                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                    bracketed_paste_enabled(&term),
                                 )
                                 .await?;
                             }
@@ -1380,8 +1265,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                                 &mut deferred_pty_input,
                                 &mut deferred_inserts,
                                 &mut key_interceptor,
-                                term.mode()
-                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+                                bracketed_paste_enabled(&term),
                             )
                             .await?;
                             break 'select_loop Ok(());
@@ -1400,21 +1284,9 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                         Ok(size) => {
                             trace!("Read {size} bytes from master");
 
-                            let mut control = MainLoopControl {
-                                remote_sender: &remote_sender,
-                                master: master.as_mut(),
-                                deferred_pty_input: &mut deferred_pty_input,
-                                deferred_inserts: &mut deferred_inserts,
-                                key_interceptor: &mut key_interceptor,
-                                terminal: &mut terminal,
-                                stdout: &mut stdout,
-                                csi_u: &mut csi_u,
-                                bracketed_paste: term
-                                    .mode()
-                                    .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
-                            };
+                            let mut control = main_loop_control!();
                             process_pty_bytes(
-                                &write_buffer[..size],
+                                &pty_read_buffer[..size],
                                 &mut processor,
                                 &mut term,
                                 &local_events,
@@ -1424,7 +1296,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 
                             if can_send_edit_buffer(&term) {
                                 let cursor_coordinates = get_cursor_coordinates(&terminal);
-                                if let Err(err) = send_edit_buffer(&term, &remote_sender, cursor_coordinates).await {
+                                if let Err(err) = send_edit_buffer(&term, &remote_sender, cursor_coordinates) {
                                     warn!("Failed to send edit buffer: {err}");
                                 }
                             }
@@ -1466,44 +1338,8 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                 },
                 MainLoopReady::Local(msg) => {
                     match msg {
-                        Ok(LocalIncoming { mut message, reply }) => {
+                        Ok(LocalIncoming { message, reply }) => {
                             debug!("Received message from figterm listener: {message:?}");
-                            if matches!(
-                                &message.request,
-                                Some(
-                                    fastab_proto::figterm::figterm_request_message::Request::NotifySshSessionStarted(_)
-                                )
-                            ) {
-                                let Some(
-                                    fastab_proto::figterm::figterm_request_message::Request::NotifySshSessionStarted(
-                                        notification,
-                                    ),
-                                ) = message.request.take()
-                                else {
-                                    unreachable!()
-                                };
-                                let mut control = MainLoopControl {
-                                    remote_sender: &remote_sender,
-                                    master: master.as_mut(),
-                                    deferred_pty_input: &mut deferred_pty_input,
-                                    deferred_inserts: &mut deferred_inserts,
-                                    key_interceptor: &mut key_interceptor,
-                                    terminal: &mut terminal,
-                                    stdout: &mut stdout,
-                                    csi_u: &mut csi_u,
-                                    bracketed_paste: term
-                                        .mode()
-                                        .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
-                                };
-                                control
-                                    .apply(MainLoopEvent::PromptSSH {
-                                        uuid: notification.uuid,
-                                        remote_host: notification.remote_host,
-                                    })
-                                    .await?;
-                                reply.complete(None);
-                                continue 'select_loop;
-                            }
                             process_figterm_message(
                                 message,
                                 main_loop_tx.clone(),
@@ -1529,7 +1365,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
                     let send_eb = INSERTION_LOCK.lock().unwrap().is_some();
                     if send_eb && can_send_edit_buffer(&term) {
                         let cursor_coordinates = get_cursor_coordinates(&terminal);
-                        if let Err(err) = send_edit_buffer(&term, &remote_sender, cursor_coordinates).await {
+                        if let Err(err) = send_edit_buffer(&term, &remote_sender, cursor_coordinates) {
                             warn!(%err, "Failed to send edit buffer");
                         }
                     }
@@ -1609,6 +1445,7 @@ mod tests {
         use std::future::Future;
         use std::task::Poll;
 
+        use flume::Receiver;
         use tokio::io::AsyncReadExt;
         use tokio::net::UnixStream;
 

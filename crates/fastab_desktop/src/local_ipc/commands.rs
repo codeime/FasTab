@@ -20,7 +20,6 @@ use crate::event::{Event, WindowEvent};
 use crate::jev::diagnostics::{self, Metric};
 use crate::platform::PlatformState;
 use crate::webview::DASHBOARD_SIZE;
-use crate::webview::notification::WebviewNotificationsState;
 use crate::{AUTOCOMPLETE_ID, DASHBOARD_ID, EventLoopProxy, platform};
 
 pub async fn debug(command: DebugModeCommand, proxy: &EventLoopProxy) -> LocalResult {
@@ -259,7 +258,6 @@ pub async fn logout(proxy: &EventLoopProxy) -> LocalResult {
 pub async fn dump_state(
     command: DumpStateCommand,
     figterm_state: &FigtermState,
-    webview_notifications_state: &WebviewNotificationsState,
     platform_state: &PlatformState,
     proxy: &EventLoopProxy,
 ) -> LocalResult {
@@ -273,8 +271,9 @@ pub async fn dump_state(
         DumpStateType::DumpStateFigterm => {
             serde_json::to_string_pretty(&figterm_state).unwrap_or_else(|err| format!("unable to dump: {err}"))
         },
-        DumpStateType::DumpStateWebNotifications => serde_json::to_string_pretty(&webview_notifications_state)
-            .unwrap_or_else(|err| format!("unable to dump: {err}")),
+        // No WebView window subscribes any more; report the empty set this
+        // component has always returned since the overlay went native.
+        DumpStateType::DumpStateWebNotifications => "{}".to_owned(),
         DumpStateType::DumpStatePlatform => {
             serde_json::to_string_pretty(&platform_state).unwrap_or_else(|err| format!("unable to dump: {err}"))
         },
@@ -403,7 +402,6 @@ mod tests {
         let engine = EngineClient::spawn(dir.path().to_path_buf()).expect("lazy worker");
         let (proxy, events) = crate::event_loop::channel();
         let figterm = FigtermState::new();
-        let notifications = WebviewNotificationsState::default();
         let platform = PlatformState::new(proxy.clone());
         let serve = async {
             let Event::EngineDiagnostics { reply } = events.recv_async().await.expect("diagnostic event") else {
@@ -416,7 +414,6 @@ mod tests {
                 r#type: DumpStateType::DumpStateEngine.into(),
             },
             &figterm,
-            &notifications,
             &platform,
             &proxy,
         );
@@ -437,7 +434,6 @@ mod tests {
         let response = dump_state(
             DumpStateCommand { r#type: i32::MAX },
             &FigtermState::new(),
-            &WebviewNotificationsState::default(),
             &PlatformState::new(proxy.clone()),
             &proxy,
         )
