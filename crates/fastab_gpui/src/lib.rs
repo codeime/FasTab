@@ -15,15 +15,19 @@ mod resource_ownership_tests;
 
 /// Install once per application to retire shared UI caches after the last
 /// window is destroyed. The overlay's existing hidden grace remains unchanged.
-pub fn install_idle_cache_release(cx: &gpui::App) {
-    cx.on_window_closed(|cx| {
+/// `on_release` runs after each release, once the memory is back in malloc.
+pub fn install_idle_cache_release(cx: &gpui::App, on_release: impl Fn() + 'static) {
+    let on_release = std::rc::Rc::new(on_release);
+    cx.on_window_closed(move |cx| {
+        let on_release = on_release.clone();
         // GPUI emits this notification before dropping the removed Window.
         // Defer until its scenes and text buffers have returned their leases,
         // then recheck every window slot in case another window opened meanwhile.
-        cx.defer(|cx| {
+        cx.defer(move |cx| {
             if let Some(released) = cx.release_idle_caches() {
                 icons::clear_named_icon_cache();
                 tracing::debug!(?released, "Released idle UI cache references");
+                on_release();
             }
         });
     })

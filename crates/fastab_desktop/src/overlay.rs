@@ -564,6 +564,8 @@ impl OverlayController {
     }
 
     fn notify_input_ended(&self, session_id: Uuid) {
+        // Starts the engine's idle grace, so the heap relief has to wait it out.
+        crate::heap_trim::note_activity();
         if let Err(error) = self.engine.end_input(SessionId::new(session_id.as_u128())) {
             debug!(%error, "Failed to notify engine that input ended");
         }
@@ -1271,6 +1273,7 @@ impl OverlayController {
         let complete = self
             .engine
             .complete_for_session(SessionId::new(session_id.as_u128()), request);
+        crate::heap_trim::note_activity();
         let proxy = self.proxy.clone();
         let executor = cx.background_executor().clone();
 

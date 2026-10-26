@@ -2,6 +2,7 @@ mod cli;
 mod event;
 mod event_loop;
 mod gpui_host;
+mod heap_trim;
 mod jev;
 mod overlay;
 #[cfg(test)]
@@ -91,6 +92,7 @@ fn main() -> ExitCode {
     // onto the main queue it was already draining. That livelock pinned the
     // desktop process at 100% CPU with the overlay frozen on `···`.
     let _runtime = runtime.enter();
+    heap_trim::start();
     match gpui_host::start_application(setup) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

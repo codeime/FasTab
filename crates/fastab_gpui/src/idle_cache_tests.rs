@@ -168,7 +168,11 @@ async fn late_asset_completion_does_not_replace_a_new_load(cx: &mut TestAppConte
 
 #[gpui::test]
 async fn last_window_hook_defers_release_and_rechecks_reopened_windows(cx: &mut TestAppContext) {
-    cx.update(|cx| crate::install_idle_cache_release(cx));
+    let releases = Rc::new(Cell::new(0));
+    cx.update(|cx| {
+        let releases = releases.clone();
+        crate::install_idle_cache_release(cx, move || releases.set(releases.get() + 1));
+    });
     let first = cx.add_window(|_, _| Empty);
     let second = cx.add_window(|_, _| Empty);
     let source = GatedSource::default();
@@ -196,10 +200,12 @@ async fn last_window_hook_defers_release_and_rechecks_reopened_windows(cx: &mut 
         })
         .unwrap();
     assert!(weak.upgrade().is_some());
+    assert_eq!(releases.get(), 0, "no release while a window is still open");
     let reopened = reopened
         .get()
         .expect("the queued window should open before the idle hook");
     reopened.update(cx, |_, window, _| window.remove_window()).unwrap();
     assert!(weak.upgrade().is_none());
+    assert_eq!(releases.get(), 1, "the release callback follows the actual release");
     assert_eq!(cx.update(|cx| cx.release_idle_caches().unwrap()).assets, 0);
 }
