@@ -176,6 +176,11 @@ export async function captureHookBaselines({
       }
     } else {
       for (const item of baselines) {
+        // --check accepts a timeout case recorded as an immediate error, and
+        // which one a run records depends on the machine. Leave an equivalent
+        // file as it was recorded so an update touches only real drift.
+        const current = await readFile(item.path, "utf8").catch(() => null);
+        if (current !== null && baselineTextsEquivalent(current, item.text)) continue;
         await mkdir(dirname(item.path), { recursive: true });
         await writeFile(item.path, item.text);
       }

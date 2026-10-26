@@ -137,6 +137,27 @@ test("timeout-case error spelling does not fail --check", async () => {
   });
 });
 
+test("--update keeps an equivalently spelled timeout case as recorded", async () => {
+  await withFixture(factorySource(), async (roots) => {
+    await updateHookBaselines(roots);
+    const names = await readdir(join(roots.baselinesDir, "postProcess"));
+    const file = join(roots.baselinesDir, "postProcess", names[0]);
+    const baseline = JSON.parse(await readFile(file, "utf8"));
+    baseline.cases.find((item) => item.id === "timeout").expected = { kind: "error", value: "Error" };
+    const recorded = stableStringify(baseline);
+    await writeFile(file, recorded);
+
+    await updateHookBaselines(roots);
+    assert.equal(await readFile(file, "utf8"), recorded);
+
+    // Real drift is still rewritten.
+    await writeFile(file, recorded.replace("factory", "tampered"));
+    await updateHookBaselines(roots);
+    assert.notEqual(await readFile(file, "utf8"), recorded.replace("factory", "tampered"));
+    await checkHookBaselines(roots);
+  });
+});
+
 test("mock delayMs triggers a parent timeout", async () => {
   await withFixture(factorySource(), async ({ sourceRoot, irRoot }) => {
     await withReferenceAudit({ sourceRoot, irRoot }, async (audit) => {
