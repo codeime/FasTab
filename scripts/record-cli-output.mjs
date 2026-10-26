@@ -7,7 +7,7 @@
  * only readonly allowlisted commands on the developer machine.
  */
 import { execFile } from "node:child_process";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -708,12 +708,17 @@ export async function recordCliOutputs({
   redact = true,
   executeArgv,
   extras,
+  // Record only argv without a valid sample and delete samples no argv names.
+  // A spec change then touches just its own samples instead of re-recording
+  // every command on whatever machine runs the update.
+  missingOnly = false,
 } = {}) {
   const argvList = await collectCliArgvList({ irRoot, inputsDir });
   const samples = [];
   for (const argv of argvList) {
-    const sample = await recordOneArgv(argv, { executeArgv, redact, extras });
     const path = join(outputDir, `${argvDigest(argv)}.json`);
+    if (missingOnly && (await hasValidSample(path, argv))) continue;
+    const sample = await recordOneArgv(argv, { executeArgv, redact, extras });
     const text = stableStringify(sample);
     samples.push({ argv, sample, path, text });
     if (write) {
@@ -721,12 +726,37 @@ export async function recordCliOutputs({
       await writeFile(path, text);
     }
   }
+  const pruned = [];
+  if (missingOnly) {
+    const expected = new Set(argvList.map((argv) => `${argvDigest(argv)}.json`));
+    let names = [];
+    try {
+      names = (await readdir(outputDir)).filter((name) => name.endsWith(".json"));
+    } catch {
+      names = [];
+    }
+    for (const name of names) {
+      if (expected.has(name)) continue;
+      pruned.push(name);
+      if (write) await rm(join(outputDir, name));
+    }
+  }
   return {
     count: samples.length,
     recorded: samples.filter((item) => item.sample.skipped !== true).length,
     skipped: samples.filter((item) => item.sample.skipped === true).length,
+    pruned: pruned.length,
     samples,
   };
+}
+
+async function hasValidSample(path, argv) {
+  try {
+    const sample = validateCliOutputSample(JSON.parse(await readFile(path, "utf8")));
+    return argvDigest(sample.argv) === argvDigest(argv);
+  } catch {
+    return false;
+  }
 }
 
 export async function checkCliOutputs({
@@ -804,16 +834,21 @@ const isMain =
 if (isMain) {
   const check = process.argv.includes("--check");
   const update = process.argv.includes("--update");
+  const missing = process.argv.includes("--missing");
   const redactOnly = process.argv.includes("--redact") && !update && !check;
-  if ([check, update, redactOnly].filter(Boolean).length !== 1) {
+  if ([check, update, missing, redactOnly].filter(Boolean).length !== 1) {
     process.stderr.write(
-      "error: choose exactly one of --check, --update, or --redact\n",
+      "error: choose exactly one of --check, --update, --missing, or --redact\n",
     );
     process.exitCode = 2;
-  } else if (update) {
-    const result = await recordCliOutputs({ write: true, redact: true });
+  } else if (update || missing) {
+    const result = await recordCliOutputs({
+      write: true,
+      redact: true,
+      missingOnly: missing,
+    });
     process.stdout.write(
-      `Recorded CLI output samples: ${result.count} argv, ${result.recorded} executed, ${result.skipped} skipped\n`,
+      `Recorded CLI output samples: ${result.count} argv, ${result.recorded} executed, ${result.skipped} skipped, ${result.pruned} pruned\n`,
     );
   } else if (redactOnly) {
     const result = await redactExistingCliOutputs();

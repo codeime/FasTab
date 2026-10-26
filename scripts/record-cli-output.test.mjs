@@ -191,6 +191,57 @@ test("record + check writes digest-named files and fails after tamper", async ()
   }
 });
 
+test("missing-only recording keeps existing samples and prunes stale ones", async () => {
+  const irRoot = await mkdtemp(join(tmpdir(), "easy-complete-cli-ir-"));
+  const inputsDir = await mkdtemp(join(tmpdir(), "easy-complete-cli-in-"));
+  const outputDir = await mkdtemp(join(tmpdir(), "easy-complete-cli-out-"));
+  const writeSpec = (scripts) =>
+    writeFile(
+      join(irRoot, "demo.json"),
+      JSON.stringify({
+        names: ["demo"],
+        args: scripts.map((script, index) => ({ script, jsPostProcess: `demo#postProcess#${index}` })),
+      }),
+    );
+  const executed = [];
+  const executeArgv = async (argv) => {
+    executed.push(argv.join(" "));
+    return { stdout: `out ${argv.join(" ")}`, stderr: "", status: 0 };
+  };
+  try {
+    await writeSpec([["git", "branch"], ["git", "tag", "--list"]]);
+    await recordCliOutputs({ irRoot, inputsDir, outputDir, write: true, executeArgv });
+    const kept = join(outputDir, `${argvDigest(["git", "branch"])}.json`);
+    const keptText = await readFile(kept, "utf8");
+
+    // The spec swaps one script: only the new argv runs, the dropped one goes.
+    await writeSpec([["git", "branch"], ["git", "branch", "-a"]]);
+    executed.length = 0;
+    const result = await recordCliOutputs({
+      irRoot,
+      inputsDir,
+      outputDir,
+      write: true,
+      executeArgv,
+      missingOnly: true,
+    });
+    assert.deepEqual(executed, ["git branch -a"]);
+    assert.equal(result.pruned, 1);
+    assert.equal(await readFile(kept, "utf8"), keptText);
+    await assert.rejects(
+      readFile(join(outputDir, `${argvDigest(["git", "tag", "--list"])}.json`)),
+      { code: "ENOENT" },
+    );
+    await checkCliOutputs({ irRoot, inputsDir, outputDir });
+  } finally {
+    await Promise.all([
+      rm(irRoot, { recursive: true, force: true }),
+      rm(inputsDir, { recursive: true, force: true }),
+      rm(outputDir, { recursive: true, force: true }),
+    ]);
+  }
+});
+
 test("finalizeCliOutputSample marks truncated output", () => {
   const sample = finalizeCliOutputSample({
     argv: ["echo", "x"],

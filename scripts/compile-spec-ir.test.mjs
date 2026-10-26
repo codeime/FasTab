@@ -196,6 +196,68 @@ test("compiler emits shared hook modules that preserve closures and custom recei
   }
 });
 
+test("a git script with a shaper keeps its argv instead of a native builtin", async () => {
+  const srcDir = await mkdtemp(join(tmpdir(), "easy-complete-git-builtin-src-"));
+  const outDir = await mkdtemp(join(tmpdir(), "easy-complete-git-builtin-ir-"));
+  try {
+    await writeFile(
+      join(srcDir, "git.js"),
+      `const branches = ["git", "--no-optional-locks", "branch", "-a", "--no-color", "--sort=-committerdate"];
+       export default {
+         name: "git",
+         subcommands: [
+           {
+             name: "checkout",
+             args: {
+               name: "branch",
+               generators: {
+                 script: branches,
+                 postProcess: (out) => out.split("\\n").map((name) => ({ name: name.trim() })),
+               },
+             },
+           },
+           { name: "log", args: { name: "commit", generators: { script: ["git", "log", "--oneline"], splitOn: "\\n" } } },
+           { name: "bare", args: { name: "branch", generators: { script: ["git", "branch", "--no-color"] } } },
+         ],
+       };
+      `,
+    );
+    await compileSpecsIr({ srcDir, outDir });
+    const ir = JSON.parse(await readFile(join(outDir, "git.json"), "utf8"));
+    const generator = (name) =>
+      ir.subcommands.find((sub) => sub.names.includes(name)).args[0].generators[0];
+
+    // Fig ran this exact argv and shaped it with postProcess; a builtin listing
+    // would starve the hook of the current-branch marker and recency order.
+    const checkout = generator("checkout");
+    assert.deepEqual(checkout.script, [
+      "git",
+      "--no-optional-locks",
+      "branch",
+      "-a",
+      "--no-color",
+      "--sort=-committerdate",
+    ]);
+    assert.ok(checkout.jsPostProcess);
+    assert.equal(checkout.builtin, undefined);
+
+    const log = generator("log");
+    assert.deepEqual(log.script, ["git", "log", "--oneline"]);
+    assert.equal(log.splitOn, "\n");
+    assert.equal(log.builtin, undefined);
+
+    // Fig shows nothing for an unshaped script; the builtin is pure gain there.
+    const bare = generator("bare");
+    assert.equal(bare.builtin, "git-branches");
+    assert.equal(bare.script, undefined);
+  } finally {
+    await Promise.all([
+      rm(srcDir, { recursive: true, force: true }),
+      rm(outDir, { recursive: true, force: true }),
+    ]);
+  }
+});
+
 test("closure modules bind ids to compiler-selected paths when texts collide", async () => {
   const srcDir = await mkdtemp(join(tmpdir(), "easy-complete-binding-src-"));
   const outDir = await mkdtemp(join(tmpdir(), "easy-complete-binding-ir-"));

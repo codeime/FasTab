@@ -1184,12 +1184,22 @@ async function convertGenerator(gen, ctx, argName) {
   const templates = templatesOf(gen.template);
   if (templates.length) out.templates = templates;
   const fromScript = scriptOf(gen);
-  const builtin = inferBuiltinFromScript(
-    ctx.rootName,
-    ctx.nodeNames ?? [],
-    argName,
-    fromScript,
-  );
+  // Fig shapes a script's stdout with splitOn, else postProcess, else shows
+  // nothing. A shaped script keeps its own argv so the typed postProcess sees
+  // the output it was written for: `git branch -a --sort=-committerdate` gives
+  // it the current-branch marker, remote prefixes and recency order that a
+  // builtin's `for-each-ref` listing does not. A builtin only stands in for a
+  // script Fig would have shown nothing for.
+  const shapesOutput =
+    typeof gen.postProcess === "function" || splitOnOf(gen) !== undefined;
+  const builtin = shapesOutput
+    ? null
+    : inferBuiltinFromScript(
+        ctx.rootName,
+        ctx.nodeNames ?? [],
+        argName,
+        fromScript,
+      );
   if (builtin) out.builtin = builtin;
   else if (fromScript.length) out.script = fromScript;
   const splitOn = splitOnOf(gen);
