@@ -115,6 +115,39 @@ jobs:
       - name: Build website
         run: pnpm -C website build
 
+  # A measurement, not a gate: per-crate attribution of the shipped binaries,
+  # so size work starts from numbers. Its own runner and cache keep it off the
+  # Rust job's clock; the crate tables land in annotations and the summary.
+  binary-size:
+    name: Binary size
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install build dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install protobuf
+
+      - name: Set up Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: binary-size
+
+      - name: Install cargo-bloat
+        run: cargo install cargo-bloat --locked
+
+      - name: Measure shipped binaries
+        run: ./scripts/binary-size-report.sh
+
   rust:
     name: Rust
     runs-on: macos-15

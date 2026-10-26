@@ -55,7 +55,13 @@ info "Creating DMG: $OUT"
 #   App icon center  → (165, 275)
 #   Applications     → (495, 275)
 #   create-dmg picks up background@2x.png automatically when it sits next to background.png
+#
+# ULMO is LZMA. Against create-dmg's default UDZO (zlib-9) it shrinks this
+# bundle from ~23.6 MB to an estimated ~17 MB, almost all of it in the Mach-O
+# binaries. It needs macOS 10.15 to mount; LSMinimumSystemVersion is 12.0.
+DMG_FORMAT="ULMO"
 create-dmg \
+  --format          "$DMG_FORMAT" \
   --volname         "$VOL_NAME" \
   --background      "$BG" \
   --window-pos      200 120 \
@@ -68,4 +74,9 @@ create-dmg \
   "$OUT" \
   "$APP"
 
-info "Done: $OUT"
+# An older create-dmg would ignore the format or fail on it; check the result.
+actual_format="$(hdiutil imageinfo -format "$OUT")"
+[ "$actual_format" = "$DMG_FORMAT" ] \
+  || { echo "error: $OUT is $actual_format, expected $DMG_FORMAT" >&2; exit 1; }
+
+info "Done: $OUT ($(du -h "$OUT" | cut -f1), $DMG_FORMAT)"
