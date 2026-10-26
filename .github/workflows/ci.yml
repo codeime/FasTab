@@ -53,16 +53,25 @@ jobs:
 
       - name: Compile and audit bundled spec IR
         run: |
-          node scripts/compile-spec-ir.mjs
-          node scripts/audit-spec-hooks.mjs
-          node scripts/spec-pair.mjs
-          node scripts/capture-typed-trigger-reference.mjs --check
-          node scripts/capture-typed-trigger-reference.mjs --get-query-term --check
-          node scripts/capture-typed-reference.mjs --field getQueryTerm --check
-          node scripts/capture-typed-reference.mjs --field postProcess --check
-          node scripts/capture-typed-reference.mjs --field script --check
-          node scripts/capture-typed-reference.mjs --field filterTemplateSuggestions --check
-          ./scripts/assert-no-runtime-js.sh
+          set -o pipefail
+          log="$(mktemp)"
+          # A child shell keeps errexit: inside a `||` list bash ignores it.
+          bash -eux -c '
+            node scripts/compile-spec-ir.mjs
+            node scripts/audit-spec-hooks.mjs
+            node scripts/spec-pair.mjs
+            node scripts/capture-typed-trigger-reference.mjs --check
+            node scripts/capture-typed-trigger-reference.mjs --get-query-term --check
+            node scripts/capture-typed-reference.mjs --field getQueryTerm --check
+            node scripts/capture-typed-reference.mjs --field postProcess --check
+            node scripts/capture-typed-reference.mjs --field script --check
+            node scripts/capture-typed-reference.mjs --field filterTemplateSuggestions --check
+            ./scripts/assert-no-runtime-js.sh
+          ' 2>&1 | tee "$log" || {
+            # Logs need a GitHub login; annotations do not.
+            python3 scripts/annotate-ci-failure.py tail "$log" 60 || true
+            exit 1
+          }
 
       - name: Verify native hook inventory
         run: node scripts/classify-native-hooks.mjs --check
@@ -243,7 +252,13 @@ jobs:
           set -euo pipefail
           resource_log="$(mktemp)"
           trap 'rm -f "$resource_log"' EXIT
-          cargo test --workspace --locked --no-fail-fast --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 2>&1 | tee "$resource_log"
+          status=0
+          cargo test --workspace --locked --no-fail-fast --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 2>&1 | tee "$resource_log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            # Logs need a GitHub login; annotations do not.
+            python3 scripts/annotate-ci-failure.py cargo-test "$resource_log" || true
+            exit "$status"
+          fi
           # GPUI is not a workspace member. Its private ownership fixtures run
           # through fastab_gpui's test-support dependency, without needing a GPU.
           # Fail if feature/cfg drift silently removes a CPU-only regression.
