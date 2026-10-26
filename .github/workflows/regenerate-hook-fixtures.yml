@@ -62,17 +62,32 @@ jobs:
       - name: Update native hook inventory
         run: node scripts/classify-native-hooks.mjs --update
 
+      # Each typed-hook reference pins pairSha256, the hash of the bundled
+      # source + IR pair, so any compiler change that alters IR moves them.
+      - name: Update typed hook references
+        run: |
+          node scripts/capture-typed-trigger-reference.mjs --update
+          node scripts/capture-typed-trigger-reference.mjs --get-query-term --update
+          for field in getQueryTerm postProcess script filterTemplateSuggestions; do
+            node scripts/capture-typed-reference.mjs --field "$field" --update
+          done
+
       - name: Verify regenerated fixtures
         run: |
           node scripts/record-cli-output.mjs --check
           node scripts/capture-hook-baseline.mjs --check
           node scripts/classify-native-hooks.mjs --check
+          node scripts/capture-typed-trigger-reference.mjs --check
+          node scripts/capture-typed-trigger-reference.mjs --get-query-term --check
+          for field in getQueryTerm postProcess script filterTemplateSuggestions; do
+            node scripts/capture-typed-reference.mjs --field "$field" --check
+          done
 
       - name: Commit regenerated fixtures
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          git add crates/fastab_engine/testdata/native-hooks
+          git add crates/fastab_engine/testdata/native-hooks crates/fastab_engine/testdata/typed-hooks
           if git diff --cached --quiet; then
             echo "No fixture changes"
             exit 0

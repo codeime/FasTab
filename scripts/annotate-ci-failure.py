@@ -27,8 +27,9 @@ def escape_property(text: str) -> str:
     return escape_data(text).replace(":", "%3A").replace(",", "%2C")
 
 
-def annotate(title: str, lines: list[str]) -> None:
-    body = "\n".join(lines[:MAX_LINES]) or "(no output)"
+def annotate(title: str, lines: list[str], keep_last: bool = False) -> None:
+    kept = lines[-MAX_LINES:] if keep_last else lines[:MAX_LINES]
+    body = "\n".join(kept) or "(no output)"
     print(f"::error title={escape_property(title)}::{escape_data(body)}")
 
 
@@ -67,7 +68,8 @@ def cargo_test(lines: list[str]) -> int:
 
 
 def tail(lines: list[str], count: int) -> int:
-    annotate("last output lines", lines[-count:])
+    # The error is at the end; keep the end when trimming to MAX_LINES.
+    annotate("last output lines", lines[-count:], keep_last=True)
     return 0
 
 
