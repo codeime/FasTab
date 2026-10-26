@@ -230,6 +230,13 @@ jobs:
       - name: Enforce zero runtime JavaScript
         run: ./scripts/assert-no-runtime-js.sh
 
+      # build-app.sh refuses a stale THIRD_PARTY_NOTICES.txt, but only on a
+      # release tag. Check here so a dependency change fails on its own commit.
+      - name: Check third-party notices
+        run: |
+          ./scripts/fetch-sparkle.sh >/dev/null
+          node scripts/generate-third-party-notices.mjs --check
+
       - name: Test
         shell: bash
         run: |
