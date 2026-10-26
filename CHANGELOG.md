@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.16
+
+- change: return freed memory to the system once the app has been idle for 15 seconds, so the desktop app no longer stays near its peak memory use long after the last completion.
+
 ## v0.0.15
 
 - change: pasting a large block of text into a running command no longer stalls the terminal; input parsing now grows linearly with the paste.
