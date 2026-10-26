@@ -49,16 +49,10 @@ resolve_ec() {
         printf '%s\n' "$EC_BIN"
         return
     fi
-    if [[ -x "$ROOT/target/debug/ftab" ]]; then
-        printf '%s\n' "$ROOT/target/debug/ftab"
-        return
-    fi
-    if [[ -x "$ROOT/target/release/ftab" ]]; then
-        printf '%s\n' "$ROOT/target/release/ftab"
-        return
-    fi
-    echo "building ftab (cargo build -p fastab_cli)..." >&2
-    cargo build -p fastab_cli --quiet
+    # `engine` exists only with the engine-cli feature, so an ftab already in
+    # target/ may lack it. Building is a no-op when the feature build is current.
+    echo "building ftab (cargo build -p fastab_cli --features engine-cli)..." >&2
+    cargo build -p fastab_cli --features engine-cli --quiet
     printf '%s\n' "$ROOT/target/debug/ftab"
 }
 

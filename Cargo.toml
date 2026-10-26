@@ -98,8 +98,8 @@ r2d2_sqlite = "0.25.0"
 rand = "0.10.2"
 regex = "1.7.0"
 reqwest = { version = "0.12.14", default-features = false, features = [
-    # defaults except tls
-    "http2",
+    # defaults except tls and http2: telemetry, downloads and the AI client
+    # all work over HTTP/1.1, and h2 was ~360 KB of every binary using this.
     "charset",
     # tls backend
     "rustls-tls",

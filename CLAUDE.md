@@ -27,7 +27,7 @@ cargo run --bin ftab -- <subcommand>
 cargo run --bin fastab
 
 # Headless completion (uses bundle/specs-ir)
-cargo run --bin ftab -- engine complete --buffer "git ch"
+cargo run --bin ftab --features engine-cli -- engine complete --buffer "git ch"
 
 # Lint (CI enforces -D warnings)
 cargo clippy --locked --workspace --color always -- -D warnings
@@ -257,6 +257,20 @@ To keep the bundle small, the sync script supports excluding whole namespaces vi
 - **Trim more**: `BUNDLED_SPECS_EXCLUDE="aws,gcloud,az" node scripts/sync-bundled-specs.mjs` (saves another ~26 MB)
 
 `build-app.sh` only auto-syncs when `bundle/specs/index.json` is missing, so it reuses whatever filtered set is already on disk. Re-run the sync script after changing the exclusion list.
+
+### Binary and package size
+
+The DMG is ULMO (LZMA), not create-dmg's default UDZO: compressed, the bundle is mostly Mach-O code, and LZMA was estimated at ~17 MB against 23.6 MB. `make-dmg.sh` fails if the image it produced is any other format. Spec JSON compresses ~11x inside the DMG, so trimming specs barely moves the download; it moves installed size. Do not compress `specs-ir` on disk to save installed space: the user ruled out decompressing at load time.
+
+The CI `Binary size` job (main only, not a gate) builds the dist profile with symbols, runs `scripts/binary-size-report.sh` (cargo-bloat `--crates`, then `strip -x` and an LZMA size), and posts each binary's crate table as an annotation. Measure there before cutting a dependency. On the 2026-10-26 baseline, `fastab` was 20.2 MB stripped, `ftab` 14.4 MB, `fterm` 6.2 MB. That run is why these three are trimmed:
+
+- GPUI's `image` keeps only `png`, `gif` and `webp` (GPUI names the GIF and WebP decoders directly), and `resvg` is built without `text`. Both are patches in `vendor/gpui` (see its `FASTAB_PATCHES.md`). Do not re-enable them for a format the app never decodes.
+- The workspace `reqwest` has no `http2`. GPUI's own `gpui_http_client` still enables it on `zed-reqwest`, so `h2` stays in the desktop graph.
+- `ftab engine complete` exists only with the `engine-cli` feature. CI lints and tests with `--features fastab_cli/engine-cli`; the shipped `ftab` is built without it.
+
+A dependency change that alters the runtime graph also changes `THIRD_PARTY_NOTICES.txt`, which `build-app.sh` checks at release. Regenerate it with the Third-Party Notices workflow. When crates only leave the graph, deleting exactly their sections also works: walk `cargo metadata --offline --locked --filter-platform aarch64-apple-darwin` from the four runtime roots the way the generator does, and drop the `name version` blocks no longer reached. That is how the 2026-10-26 trim was done.
+
+`prost_reflect` (~430 KB in each of `fastab`, `ftab` and `fterm`) is the next large item. It runs through the IPC framing (`fastab_ipc` receive paths, `ReflectMessage` in local IPC), so removing it is a refactor, not a feature flag.
 
 ## Key Crates
 

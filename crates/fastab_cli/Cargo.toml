@@ -17,6 +17,10 @@ workspace = true
 [features]
 default = []
 wayland = ["arboard/wayland-data-control"]
+# `ftab engine complete`, the headless completion engine. A development tool
+# (scripts/replay-sessions.sh); off in shipped builds, where it linked the
+# whole engine (~1.1 MB of code) into the CLI.
+engine-cli = []
 
 [dependencies]
 anstream.workspace = true

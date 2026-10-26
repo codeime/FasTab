@@ -205,7 +205,7 @@ jobs:
           test -d "$swap_root/exclusive-existing"
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 --color always -- -D warnings
+        run: cargo clippy --locked --workspace --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 --color always -- -D warnings
 
       # The engine's typed-hook provenance tests verify the checked-in
       # reference baselines against the compiled bundle/specs-ir pair, which is
@@ -236,7 +236,7 @@ jobs:
           set -euo pipefail
           resource_log="$(mktemp)"
           trap 'rm -f "$resource_log"' EXIT
-          cargo test --workspace --locked --no-fail-fast --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 2>&1 | tee "$resource_log"
+          cargo test --workspace --locked --no-fail-fast --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 2>&1 | tee "$resource_log"
           # GPUI is not a workspace member. Its private ownership fixtures run
           # through fastab_gpui's test-support dependency, without needing a GPU.
           # Fail if feature/cfg drift silently removes a CPU-only regression.

@@ -280,6 +280,12 @@ package = "gpui_http_client"
 
 [dependencies.image]
 version = "0.25.1"
+features = [
+    "png",
+    "gif",
+    "webp",
+]
+default-features = false
 
 [dependencies.inventory]
 version = "0.3.19"
@@ -332,11 +338,6 @@ package = "gpui_refineable"
 
 [dependencies.resvg]
 version = "0.45.0"
-features = [
-    "text",
-    "system-fonts",
-    "memmap-fonts",
-]
 default-features = false
 
 [dependencies.schemars]

@@ -1,3 +1,5 @@
+#![cfg(feature = "engine-cli")]
+
 mod common;
 
 use common::*;

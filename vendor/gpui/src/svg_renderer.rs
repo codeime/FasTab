@@ -1,9 +1,6 @@
 use crate::{AssetSource, DevicePixels, IsZero, Result, SharedString, Size};
 use resvg::tiny_skia::Pixmap;
-use std::{
-    hash::Hash,
-    sync::{Arc, LazyLock},
-};
+use std::{hash::Hash, sync::Arc};
 
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
@@ -27,30 +24,12 @@ pub enum SvgSize {
 
 impl SvgRenderer {
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
-        static FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
-            let mut db = usvg::fontdb::Database::new();
-            db.load_system_fonts();
-            Arc::new(db)
-        });
-        let default_font_resolver = usvg::FontResolver::default_font_selector();
-        let font_resolver = Box::new(
-            move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
-                if db.is_empty() {
-                    *db = FONT_DB.clone();
-                }
-                default_font_resolver(font, db)
-            },
-        );
-        let options = usvg::Options {
-            font_resolver: usvg::FontResolver {
-                select_font: font_resolver,
-                select_fallback: usvg::FontResolver::default_fallback_selector(),
-            },
-            ..Default::default()
-        };
+        // Fastab builds usvg without `text`: its icons carry no <text>, and the
+        // shaper and system font database cost ~0.5 MB of code (see
+        // FASTAB_PATCHES.md). A <text> element is not drawn.
         Self {
             asset_source,
-            usvg_options: Arc::new(options),
+            usvg_options: Arc::new(usvg::Options::default()),
         }
     }
 

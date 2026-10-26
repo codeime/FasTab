@@ -2,7 +2,8 @@
 
 This directory contains the crates.io `gpui` 0.2.2 release, licensed under
 Apache-2.0 (see `LICENSE-APACHE`). The original published, normalized
-`Cargo.toml`, source, build inputs, examples and tests are retained. Cargo's
+`Cargo.toml` (except the two dependency entries below), source, build inputs,
+examples and tests are retained. Cargo's
 `.cargo-ok`, `.cargo_vcs_info.json` and nested `Cargo.lock` are omitted.
 
 Provenance:
@@ -197,6 +198,19 @@ also leave the device's retain count settled, which is what catches a consumed
 device argument. They require hardware explicitly;
 missing Metal never silently turns a test into a pass. Their execution and a
 new installed build's footprint comparison remain separate acceptance steps.
+
+Fastab trims two dependencies in `Cargo.toml` to cut code it never runs
+(measured with `scripts/binary-size-report.sh`, `.text` of the `fastab` binary):
+
+- `image` drops its default features and keeps `png`, `gif` and `webp`. GPUI
+  names `GifDecoder` and `WebPDecoder` directly; the app only decodes PNG. The
+  exr, jpeg, tiff, bmp and other decoders were ~0.7 MB. Those formats still
+  parse as `ImageFormat` variants and now fail to decode at runtime.
+- `resvg` no longer enables `text`, `system-fonts` or `memmap-fonts`, which
+  removes rustybuzz, fontdb and ttf-parser. `src/svg_renderer.rs` therefore
+  builds `usvg::Options::default()` instead of installing a lazily loaded
+  system font database. The app's SVG icons contain no `<text>`; a `<text>`
+  element is now not drawn.
 
 Run the hardware tests on a Metal-capable macOS host from a temporary verification
 copy of this repository for the older vendor-only fixtures described above.
