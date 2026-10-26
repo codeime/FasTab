@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "git",
+    "--no-optional-locks",
+    "status",
+    "--short"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "?? crates/fastab_engine/testdata/native-hooks/cli-output/0e7ed23c4eb0628daf6b1c571d588f0148e34fa6cdaf05d96545ae5e669b0129.json\n?? crates/fastab_engine/testdata/native-hooks/cli-output/4d8064e2ea62d13daab68f8d92fd6d91782ab3f12706048597989a4550492b3e.json\n?? crates/fastab_engine/testdata/native-hooks/cli-output/bc436649e64dbbfc0aa2b65b6bc2044583a30d8e1fd7c9ddcb23b0fcb8bed6fb.json\n"
+}

@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "git",
+    "--no-optional-locks",
+    "tag",
+    "--list",
+    "--sort=-committerdate"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": "v0.0.16\nv0.0.15\nv0.0.6\nv0.0.5\nv0.0.4\nv0.0.3\nv0.0.2\nv0.0.1\nv0.0.10\nv0.0.11\nv0.0.12\nv0.0.13\nv0.0.14\nv0.0.7\nv0.0.8\nv0.0.9\n"
+}

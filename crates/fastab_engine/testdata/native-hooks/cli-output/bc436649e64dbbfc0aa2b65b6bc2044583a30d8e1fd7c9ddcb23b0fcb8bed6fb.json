@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "git",
+    "--no-optional-locks",
+    "diff",
+    "--cached",
+    "--name-only"
+  ],
+  "status": 0,
+  "stderr": "",
+  "stdout": ""
+}

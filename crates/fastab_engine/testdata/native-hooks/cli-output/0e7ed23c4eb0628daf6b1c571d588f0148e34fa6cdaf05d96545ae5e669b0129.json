@@ -1,6 +1,7 @@
 {
   "argv": [
     "git",
+    "--no-optional-locks",
     "stash",
     "list"
   ],

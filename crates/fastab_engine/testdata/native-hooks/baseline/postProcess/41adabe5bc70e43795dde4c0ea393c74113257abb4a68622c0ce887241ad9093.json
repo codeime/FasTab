@@ -111,7 +111,8 @@
         }
       ],
       "expected": {
-        "kind": "timeout"
+        "kind": "error",
+        "value": "Error"
       },
       "id": "timeout",
       "timeoutMs": 50
