@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.18
+
+- fix: quitting or updating FasTab no longer stops the input method helper. macOS ended it a few seconds after the app quit, which left Ghostty, Kitty, Otty and similar terminals without cursor tracking until their windows were reopened. The app now also restarts the helper if it exits while enabled.
+
 ## v0.0.17
 
 - fix: git completions run the spec's own commands again, as the WebView version and Fig did. `git checkout` and other branch arguments list the current branch first, show remote branches without their `origin/` prefix, and order the rest by most recent commit; commit, tag, remote, stash and changed-file suggestions get their original formatting back.
