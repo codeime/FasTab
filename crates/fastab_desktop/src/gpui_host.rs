@@ -679,11 +679,16 @@ pub fn start_application(
                     tokio::spawn(async move {
                         let input_method = InputMethod::default();
                         match input_method.restore_if_chosen().await {
-                            Ok(false) => return,
-                            Ok(true) => {},
-                            Err(err) => warn!(%err, "Failed to restore the previously installed input method"),
+                            Ok(false) => {},
+                            Ok(true) => crate::permissions::spawn_check(&proxy),
+                            Err(err) => {
+                                warn!(%err, "Failed to restore the previously installed input method");
+                                crate::permissions::spawn_check(&proxy);
+                            },
                         }
-                        crate::permissions::spawn_check(&proxy);
+                        // The launch-time restore is a single check; keep the
+                        // chosen IME running after it, too.
+                        crate::ime_watch::run(input_method).await;
                     });
                 })
                 .detach();

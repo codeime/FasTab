@@ -4,7 +4,7 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::Bool;
 use objc2::{ClassType, msg_send};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-use objc2_foundation::{NSBundle, NSString, NSURL};
+use objc2_foundation::{NSBundle, NSString};
 
 #[derive(Debug)]
 pub struct MacOSApplication {
@@ -94,15 +94,10 @@ pub fn unique_running_application_version(bundle_identifier: &str) -> Option<Str
     }
 }
 
-pub fn launch_application(bundle_path: &str) {
-    autoreleasepool(|_| {
-        let bundle_nsstring = NSString::from_str(bundle_path);
-        let bundle_nsurl = unsafe { NSURL::fileURLWithPath_isDirectory(&bundle_nsstring, true) };
-
-        let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-        unsafe { workspace.openURL(&bundle_nsurl) };
-    });
-}
+// There is deliberately no `launch_application`. `NSWorkspace` launches made
+// from our process record it as the new app's LaunchServices parent, and
+// loginwindow force-quits child apps after their parent exits. Launch helpers
+// with `/usr/bin/open` (see `fastab_integrations::input_method`).
 
 #[cfg(test)]
 mod tests {

@@ -3,6 +3,8 @@ mod event;
 mod event_loop;
 mod gpui_host;
 mod heap_trim;
+#[cfg(target_os = "macos")]
+mod ime_watch;
 mod jev;
 mod overlay;
 #[cfg(test)]

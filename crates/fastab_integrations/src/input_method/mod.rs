@@ -28,7 +28,7 @@ use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::Integration;
 use crate::error::{Error, ErrorExt, Result};
@@ -129,6 +129,20 @@ async fn operation_lock() -> Result<Flock<File>> {
 
 fn restore_on_launch(explicit: Option<bool>, legacy_enabled: Option<bool>, correct_symlink: bool) -> bool {
     explicit.unwrap_or(legacy_enabled == Some(true) || correct_symlink)
+}
+
+/// Launch through `/usr/bin/open`, never `NSWorkspace` from our own process.
+/// LaunchServices records the app that asks for a launch as the new app's
+/// parent (`lsappinfo info` shows `parentASN="FasTab"`), and loginwindow
+/// force-quits a parent's child apps about 3 s after the parent exits. Every
+/// desktop quit or update therefore killed the IME, and with it the IMK
+/// connection of every open Otty / Ghostty / Kitty window. `open` is not an
+/// app, so a helper it launches has no parent and outlives the desktop app.
+fn launch_without_parent_app(bundle: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/open");
+    // -g: a background-only helper must not take focus from the terminal.
+    command.arg("-g").arg(bundle);
+    command
 }
 
 fn running_and_enabled(running: bool, palette_enabled: bool) -> Result<(), InputMethodError> {
@@ -502,6 +516,11 @@ impl InputMethod {
         self.ensure_current_binary_running(&self.bundle_path);
     }
 
+    /// Process ids of every running instance of this input method.
+    pub fn running_process_ids(&self) -> Vec<i32> {
+        self.running_pids().into_iter().map(Pid::as_raw).collect()
+    }
+
     fn running_pids(&self) -> Vec<Pid> {
         let Ok(bundle_id) = self.bundle_id() else {
             return Vec::new();
@@ -570,8 +589,10 @@ impl InputMethod {
     /// read a perfectly current helper as stale and kill it.
     fn start_from(&self, bundle: &Path) {
         debug!("Launching input method...");
-        if let Some(path) = bundle.to_str() {
-            applications::launch_application(path);
+        match launch_without_parent_app(bundle).status() {
+            Ok(status) if status.success() => {},
+            Ok(status) => warn!(%status, bundle = %bundle.display(), "open failed to launch the input method"),
+            Err(error) => warn!(%error, bundle = %bundle.display(), "Could not run open for the input method"),
         }
         self.record_launched_binary();
     }
@@ -955,6 +976,17 @@ mod tests {
         let properties = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
         let sources = InputMethod::list_all_input_sources(Some(&properties), true).unwrap_or_default();
         sources.into_iter().next().unwrap()
+    }
+
+    /// An `NSWorkspace` launch from the desktop made the IME its LaunchServices
+    /// child, and loginwindow killed it ~3 s after every desktop quit. A
+    /// helper started by `open` has no parent app.
+    #[test]
+    fn the_ime_is_launched_by_open_so_no_app_owns_it() {
+        let command = launch_without_parent_app(Path::new(TEST_INPUT_METHOD_BUNDLE_URL));
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["-g", TEST_INPUT_METHOD_BUNDLE_URL]);
     }
 
     #[ignore]
