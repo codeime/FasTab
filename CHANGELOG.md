@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.0.17
+
+- fix: git completions run the spec's own commands again, as the WebView version and Fig did. `git checkout` and other branch arguments list the current branch first, show remote branches without their `origin/` prefix, and order the rest by most recent commit; commit, tag, remote, stash and changed-file suggestions get their original formatting back.
+- change: the download is smaller: the disk image uses LZMA compression, and the desktop app and CLI drop image decoders, SVG text shaping and HTTP/2 code they never used (about 6 MB less on disk).
+- change: the `ftab engine` debugging command is no longer included in the shipped CLI.
+
 ## v0.0.16
 
 - change: return freed memory to the system once the app has been idle for 15 seconds, so the desktop app no longer stays near its peak memory use long after the last completion.
