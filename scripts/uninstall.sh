@@ -75,9 +75,12 @@ fi
 pkill -x "${APP_NAME}"       2>/dev/null || true
 pkill -f "FastabInputMethod.app/Contents/MacOS/fastab_input_method" 2>/dev/null || true
 pkill -f "FastabInputMethod.app/Contents/MacOS/fig_input_method" 2>/dev/null || true
-# Keep the shorter name scoped to Fastab paths and its rewritten shell titles.
-# A different tool named `fterm` must not be stopped by this uninstaller.
-pkill -f 'Fastab[.]app/Contents/MacOS/(fterm|fastabterm)( |$)|(^|/)(bash|zsh|fish|nu) \((fterm|fastabterm)\)( |$)' 2>/dev/null || true
+# fterm is left running on purpose. Each one owns a terminal tab's PTY, so
+# killing it closes that tab and whatever runs in it, and this script usually
+# runs in such a tab: the hangup ended it before the bundle, CLI links and data
+# below were removed. With the desktop gone an fterm only passes bytes through,
+# it cannot recreate the deleted data directory (that happens once, at tab
+# start), and it exits when its tab closes.
 sleep 0.5
 
 # ── 3. Remove login item and Fastab LaunchAgent ──────────────────────────────
@@ -220,3 +223,6 @@ echo "    rmdir ~/.local/bin 2>/dev/null"
 echo ""
 echo "  Reload your shell to apply PATH changes:"
 echo "    exec \$SHELL"
+echo ""
+echo "  Terminal tabs opened before the uninstall keep the old ${APP_DISPLAY} wrapper"
+echo "  (shown as \"zsh (fterm)\") until you close them; new tabs start without it."
