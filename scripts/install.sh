@@ -25,6 +25,22 @@ file_sha() {
   fi
 }
 
+# Same rule as fastab_integrations::input_method::code_identity: the code
+# digest the IME's build script writes into its Info.plist, else (bundles from
+# before it) the executable's SHA-256. The executable changes on every release
+# even when the IME's code does not, so comparing it replaced the helper, and
+# cut every open terminal's IMK connection, on each install.
+ime_code_identity() {
+  local helper="$1/Contents/Helpers/FastabInputMethod.app"
+  local digest
+  digest="$(/usr/libexec/PlistBuddy -c 'Print :FastabCodeDigest' "${helper}/Contents/Info.plist" 2>/dev/null || true)"
+  if [ -n "${digest}" ]; then
+    printf 'code:%s\n' "${digest}"
+  else
+    file_sha "${helper}/Contents/MacOS/fastab_input_method"
+  fi
+}
+
 # Preserve unrelated tools when the shorter PTY name is already in use.
 link_pty_binary() {
   local name="$1" link="${LOCAL_BIN}/$1"
@@ -160,7 +176,8 @@ if [ "$(file_sha "${APP_BUNDLE}/${DESKTOP_BIN}")" = "$(file_sha "${STAGING_BUNDL
   desktop_changed=0
 fi
 ime_changed=1
-if [ "$(file_sha "${APP_BUNDLE}/${IME_BIN}")" = "$(file_sha "${STAGING_BUNDLE}/${IME_BIN}")" ]; then
+installed_ime="$(ime_code_identity "${APP_BUNDLE}")"
+if [ -n "${installed_ime}" ] && [ "${installed_ime}" = "$(ime_code_identity "${STAGING_BUNDLE}")" ]; then
   ime_changed=0
 fi
 

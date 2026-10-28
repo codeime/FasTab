@@ -20,6 +20,7 @@ input_method_type = "palette"
 [build-dependencies]
 plist = "1.7.1"
 serde.workspace = true
+sha2.workspace = true
 toml.workspace = true
 apple-bundle = "0.1.4"
 

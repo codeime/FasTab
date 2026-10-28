@@ -2,7 +2,7 @@
 
 ## v0.0.18
 
-- fix: quitting or updating FasTab no longer stops the input method helper. macOS ended it a few seconds after the app quit, which left Ghostty, Kitty, Otty and similar terminals without cursor tracking until their windows were reopened. The app now also restarts the helper if it exits while enabled.
+- fix: quitting or restarting FasTab no longer stops the input method helper. macOS ended it a few seconds after the app quit, which left Ghostty, Kitty, Otty and similar terminals without cursor tracking until their windows were reopened. The app now also restarts the helper if it exits while enabled.
 
 ## v0.0.17
 

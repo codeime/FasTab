@@ -1,5 +1,11 @@
 //! Identity of this mapped process, independent of files replaced by an update.
 //! Kept std-only so the IME can include this leaf without the desktop stack.
+//!
+//! The IME compiles this file with `build_identity_from_bundle` and reads its
+//! build facts from its own Info.plist instead of baking them in: a commit,
+//! date or version string in the executable would change it on every release,
+//! and installs replace a running IME (cutting every terminal window's IMK
+//! connection) only when its code digest changed.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -13,14 +19,10 @@ pub fn initialize() {
 
 pub fn json(component: &str) -> String {
     let (started, elapsed) = START.get_or_init(|| (SystemTime::now(), Instant::now()));
-    let fields = [
-        ("component", Some(component)),
-        ("version", Some(env!("CARGO_PKG_VERSION"))),
-        ("commit", option_env!("AMAZON_Q_BUILD_HASH")),
-        ("built_at", option_env!("AMAZON_Q_BUILD_DATETIME")),
-        ("target", option_env!("AMAZON_Q_BUILD_TARGET_TRIPLE")),
-        ("run_id", option_env!("FASTAB_BUILD_RUN_ID")),
-    ];
+    let build = build_fields();
+    let fields = [("component", Some(component))]
+        .into_iter()
+        .chain(build.iter().map(|(key, value)| (*key, value.as_deref())));
     let mut output = format!(
         "{{\"pid\":{},\"started_at_unix_ms\":{},\"uptime_ms\":{}",
         std::process::id(),
@@ -41,6 +43,55 @@ pub fn json(component: &str) -> String {
     }
     output.push('}');
     output
+}
+
+type BuildFields = [(&'static str, Option<String>); 5];
+
+#[cfg(not(build_identity_from_bundle))]
+fn build_fields() -> BuildFields {
+    [
+        ("version", Some(env!("CARGO_PKG_VERSION").to_owned())),
+        ("commit", option_env!("AMAZON_Q_BUILD_HASH").map(str::to_owned)),
+        ("built_at", option_env!("AMAZON_Q_BUILD_DATETIME").map(str::to_owned)),
+        ("target", option_env!("AMAZON_Q_BUILD_TARGET_TRIPLE").map(str::to_owned)),
+        ("run_id", option_env!("FASTAB_BUILD_RUN_ID").map(str::to_owned)),
+    ]
+}
+
+#[cfg(build_identity_from_bundle)]
+fn build_fields() -> BuildFields {
+    // `<bundle>/Contents/MacOS/<exe>` → `<bundle>/Contents/Info.plist`.
+    let plist = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("Info.plist")))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let value = |key| plist_string(&plist, key);
+    [
+        ("version", value("CFBundleShortVersionString")),
+        ("commit", value("FastabBuildCommit")),
+        ("built_at", value("FastabBuildDate")),
+        ("target", value("FastabBuildTarget")),
+        ("run_id", value("FastabBuildRunId")),
+    ]
+}
+
+/// The `<string>` after `<key>key</key>` in an XML property list. Enough for
+/// the flat Info.plist the IME's build script writes; not a general parser.
+#[cfg_attr(not(any(build_identity_from_bundle, test)), allow(dead_code))]
+fn plist_string(plist: &str, key: &str) -> Option<String> {
+    let marker = format!("<key>{key}</key>");
+    let rest = plist[plist.find(&marker)? + marker.len()..].trim_start();
+    let value = rest.strip_prefix("<string>")?;
+    let value = &value[..value.find("</string>")?];
+    Some(
+        value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
 }
 
 fn quote(value: &str, output: &mut String) {
@@ -102,6 +153,19 @@ fn mapped_image_uuid() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plist_strings_are_read_by_key() {
+        let plist = "<dict>\n\t<key>CFBundleShortVersionString</key>\n\t<string>0.0.19</string>\n\t\
+                     <key>FastabBuildCommit</key>\n\t<string>a&amp;b</string>\n\t\
+                     <key>FastabCodeDigest</key>\n\t<string>ff</string>\n</dict>";
+        assert_eq!(
+            super::plist_string(plist, "CFBundleShortVersionString").as_deref(),
+            Some("0.0.19")
+        );
+        assert_eq!(super::plist_string(plist, "FastabBuildCommit").as_deref(), Some("a&b"));
+        assert_eq!(super::plist_string(plist, "FastabBuildRunId"), None);
+    }
+
     #[test]
     fn identity_is_valid_json_and_describes_this_process() {
         let value: serde_json::Value = serde_json::from_str(&super::json("fixture\"\\\n")).unwrap();

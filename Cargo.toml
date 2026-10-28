@@ -166,6 +166,9 @@ webpki-roots = "=0.26.8"
 
 [workspace.lints.rust]
 future_incompatible = "warn"
+# Set by fastab_input_method's build script for the build_identity leaf it
+# includes by #[path]; fastab_util compiles the same file without it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(build_identity_from_bundle)"] }
 nonstandard_style = "warn"
 rust_2018_idioms = "warn"
 

@@ -83,9 +83,30 @@ pub struct InputMethod {
     pub bundle_path: PathBuf,
 }
 
-/// SHA-256 of the IME executable we last launched. Compared with the on-disk
-/// binary to decide whether an already-running process must be replaced.
+/// Code identity of the IME we last launched (see [`code_identity`]). Compared
+/// with the bundle on disk to decide whether a running process must be
+/// replaced. The key name predates the code digest.
 const LAUNCHED_BINARY_HASH_KEY: &str = "input-method.launched-binary-sha256";
+
+/// What decides whether a running IME is stale. Builds record
+/// `FastabCodeDigest` in the helper's Info.plist: a digest of the sources,
+/// locked crates and compiler that make up its code, which stays put across
+/// releases that do not touch the IME. The executable's own SHA-256 changes on
+/// every release (version bump, signature), so comparing it replaced the IME,
+/// and cut every open terminal's IMK connection, on each update. Bundles from
+/// before the digest fall back to that SHA-256.
+fn code_identity(bundle: &Path, executable: &Path) -> Option<String> {
+    plist::Value::from_file(bundle.join("Contents/Info.plist"))
+        .ok()
+        .and_then(|info| {
+            info.as_dictionary()?
+                .get("FastabCodeDigest")?
+                .as_string()
+                .filter(|digest| !digest.is_empty())
+                .map(|digest| format!("code:{digest}"))
+        })
+        .or_else(|| sha256_hex(executable))
+}
 /// An explicit uninstall must override an old symlink or the legacy enabled
 /// bit. `None` means this preference predates the restore-on-launch behavior.
 const RESTORE_ON_LAUNCH_KEY: &str = "input-method.restore-on-launch";
@@ -539,8 +560,8 @@ impl InputMethod {
         self.bundle_path.join("Contents/MacOS/fastab_input_method")
     }
 
-    fn on_disk_binary_hash(&self) -> Option<String> {
-        sha256_hex(&self.executable_path())
+    fn on_disk_code_identity(&self) -> Option<String> {
+        code_identity(&self.bundle_path, &self.executable_path())
     }
 
     fn launched_binary_hash() -> Option<String> {
@@ -548,17 +569,17 @@ impl InputMethod {
     }
 
     fn record_launched_binary(&self) {
-        if let Some(hash) = self.on_disk_binary_hash() {
-            state::set_value(LAUNCHED_BINARY_HASH_KEY, hash).ok();
+        if let Some(identity) = self.on_disk_code_identity() {
+            state::set_value(LAUNCHED_BINARY_HASH_KEY, identity).ok();
         }
     }
 
-    /// The process on the machine is from a different binary than the one in
-    /// this bundle. A missing tracker is not stale — see [`process_is_stale`].
+    /// The process on the machine runs different code than this bundle. A
+    /// missing tracker is not stale — see [`process_is_stale`].
     fn running_process_is_stale(&self) -> bool {
         process_is_stale(
             Self::launched_binary_hash().as_deref(),
-            self.on_disk_binary_hash().as_deref(),
+            self.on_disk_code_identity().as_deref(),
         )
     }
 
@@ -1123,6 +1144,39 @@ mod tests {
         // Reading the enabled list rather than the selected one is what stops a
         // selected-and-disabled leftover from passing for installed.
         assert!(prod.contains("fastab_hitoolbox::is_palette_enabled"));
+    }
+
+    /// Every release changed the IME executable's SHA-256 (version bump,
+    /// signature), so an update always replaced a helper whose code had not
+    /// changed. The digest the build records decides instead.
+    #[test]
+    fn code_identity_prefers_the_recorded_digest() {
+        let dir = std::env::temp_dir().join(format!("fastab-ime-identity-{}", std::process::id()));
+        let executable = dir.join("Contents/MacOS/fastab_input_method");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"release one").unwrap();
+        let plist = |extra: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                 <key>CFBundleShortVersionString</key><string>0.0.19</string>{extra}</dict></plist>"
+            )
+        };
+
+        // A bundle from before the digest keeps the old per-file hash.
+        std::fs::write(dir.join("Contents/Info.plist"), plist("")).unwrap();
+        assert_eq!(code_identity(&dir, &executable), sha256_hex(&executable));
+
+        std::fs::write(
+            dir.join("Contents/Info.plist"),
+            plist("<key>FastabCodeDigest</key><string>abc123</string>"),
+        )
+        .unwrap();
+        assert_eq!(code_identity(&dir, &executable).as_deref(), Some("code:abc123"));
+        // A rebuilt executable with the same code digest is not stale.
+        std::fs::write(&executable, b"release two").unwrap();
+        assert_eq!(code_identity(&dir, &executable).as_deref(), Some("code:abc123"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
