@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.19
+
+- fix: updating FasTab no longer restarts the input method helper unless the helper itself changed, so Ghostty, Kitty, Otty and similar terminal windows keep cursor tracking across updates. Updating to this version still restarts it once.
+- fix: the uninstall script now finishes every step and no longer closes open terminal tabs; tabs opened before uninstalling keep the old wrapper until they are closed.
+
 ## v0.0.18
 
 - fix: quitting or restarting FasTab no longer stops the input method helper. macOS ended it a few seconds after the app quit, which left Ghostty, Kitty, Otty and similar terminals without cursor tracking until their windows were reopened. The app now also restarts the helper if it exits while enabled.
