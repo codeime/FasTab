@@ -1,0 +1,111 @@
+name: Symbolicate release addresses
+
+# Shipped binaries are stripped, so a heap or crash stack from an installed app
+# shows our frames as `???`. Push a `symbolicate/**` branch whose
+# `symbolicate/request.env` names the release (tag, build identity) and whose
+# `symbolicate/addresses.txt` lists the live process's load address and frame
+# addresses. This job rebuilds that release with the same inputs but keeps the
+# symbol table, proves the code matches the published DMG byte for byte, and
+# posts `address -> function` as annotations, which the public API serves
+# without a login. Nothing is uploaded.
+
+on:
+  push:
+    branches: ["symbolicate/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  symbolicate:
+    name: Symbolicate
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read request
+        run: |
+          set -euo pipefail
+          # TAG, BUILD_HASH, BUILD_DATETIME, BUILD_RUN_ID, BINARY
+          cat symbolicate/request.env >> "$GITHUB_ENV"
+
+      # Build from the tag's own tree; only the request files come from this branch.
+      - name: Check out the release tree
+        run: |
+          set -euo pipefail
+          cp -R symbolicate "$RUNNER_TEMP/request"
+          git fetch --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          git checkout --force "${TAG}"
+          test "$(git rev-parse HEAD)" = "${BUILD_HASH}"
+
+      - name: Install build dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install protobuf
+
+      - name: Set up Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: symbolicate
+
+      # Same package set, profile and compile-time inputs as build-app.sh, so
+      # feature unification and every baked-in string match the release.
+      # Only the final strip is skipped.
+      - name: Build with symbols
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          AMAZON_Q_BUILD_HASH: ${{ env.BUILD_HASH }}
+          AMAZON_Q_BUILD_DATETIME: ${{ env.BUILD_DATETIME }}
+          AMAZON_Q_BUILD_TARGET_TRIPLE: aarch64-apple-darwin
+          FASTAB_BUILD_RUN_ID: ${{ env.BUILD_RUN_ID }}
+          POSTHOG_ENDPOINT: ${{ secrets.POSTHOG_ENDPOINT }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          CARGO_PROFILE_DIST_STRIP: none
+        run: |
+          cargo build --locked --profile dist \
+            -p fastab_desktop -p fastab_term -p fastab_cli -p fastab_input_method
+
+      - name: Prove the code matches the release
+        run: |
+          set -euo pipefail
+          dmg="$RUNNER_TEMP/release.dmg"
+          curl -fsSL -o "$dmg" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/Fastab-arm64.dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mount" >/dev/null
+          cp "$mount/Fastab.app/Contents/MacOS/${BINARY}" "$RUNNER_TEMP/shipped"
+          hdiutil detach "$mount" >/dev/null
+          # otool's hex dump depends only on section bytes and addresses once the
+          # first line, which names the file, is dropped.
+          section_hash() { otool -s __TEXT "$1" "$2" | tail -n +2 | shasum -a 256; }
+          for section in __text __const __cstring; do
+            a="$(section_hash "$section" "$RUNNER_TEMP/shipped")"
+            b="$(section_hash "$section" "target/dist/${BINARY}")"
+            echo "${section}: shipped ${a%% *} built ${b%% *}"
+            if [ "$a" != "$b" ]; then
+              echo "::error title=Rebuild differs::__TEXT,${section} does not match the shipped ${BINARY}; addresses would be wrong"
+              exit 1
+            fi
+          done
+
+      - name: Symbolicate
+        run: |
+          set -euo pipefail
+          request="$RUNNER_TEMP/request/addresses.txt"
+          load="$(sed -n 's/^load //p' "$request")"
+          grep -E '^0x[0-9a-f]+$' "$request" > "$RUNNER_TEMP/addrs"
+          xcrun atos -o "target/dist/${BINARY}" -arch arm64 -l "$load" -f "$RUNNER_TEMP/addrs" \
+            | xcrun c++filt > "$RUNNER_TEMP/symbols"
+          paste -d ' ' "$RUNNER_TEMP/addrs" "$RUNNER_TEMP/symbols" > "$RUNNER_TEMP/mapped"
+          wc -l < "$RUNNER_TEMP/mapped"
+          # Annotations are public; ten per step, so pack lines into chunks.
+          split -l 80 "$RUNNER_TEMP/mapped" "$RUNNER_TEMP/chunk."
+          index=0
+          for chunk in "$RUNNER_TEMP"/chunk.*; do
+            index=$((index + 1))
+            body="$(sed -e 's/%/%25/g' "$chunk" | awk '{printf "%s%%0A", $0}')"
+            echo "::notice title=symbols ${index}::${body}"
+          done
