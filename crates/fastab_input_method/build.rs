@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use apple_bundle::prelude::{InfoPlist as AppleInfoPlist, *};
@@ -121,7 +121,9 @@ fn intended_language_default() -> String {
 
 /// Digest of what decides this helper's behaviour: its sources, the files it
 /// includes by `#[path]`, `fastab_hitoolbox`, the locked external crates it
-/// links, their feature selections, and the compiler and profile.
+/// links (a git crate by its commit), the feature specs it and
+/// `fastab_hitoolbox` declare, the workspace's `[profile]` tables, and the
+/// compiler, target and deployment target.
 ///
 /// It is computed from inputs rather than from the built executable on
 /// purpose. Every release bumps the workspace version, which changes Cargo's
@@ -130,8 +132,25 @@ fn intended_language_default() -> String {
 /// across releases. Signing then binds the Info.plist, whose version changes
 /// too. Installs compare this digest, so an update whose IME code did not change
 /// leaves the running helper, and every terminal window bound to it, alone.
+///
+/// Two inputs are left out on purpose. Features another workspace member
+/// enables on a crate this helper also links reach it through Cargo's feature
+/// unification; in practice they add AppKit bindings and trait impls the helper
+/// never calls.
+/// The macOS SDK the linker uses moves whenever CI's Xcode does. Following
+/// either would replace the IME, and cut every open terminal's IMK
+/// connection, for changes nobody made to it.
 fn code_digest(manifest_dir: &Path) -> String {
-    let workspace = manifest_dir.join("../..");
+    // Not `manifest_dir.join("../..")`: `strip_prefix` compares components
+    // literally, so a base ending in `..` matched nothing below it and every
+    // file was hashed under its absolute path. The digest then depended on
+    // where the checkout lives, so moving between a CI build and a local build
+    // of the same code replaced the running IME.
+    let workspace = manifest_dir
+        .ancestors()
+        .nth(2)
+        .expect("fastab_input_method sits two levels below the workspace root")
+        .to_path_buf();
     let hitoolbox = workspace.join("crates/fastab_hitoolbox");
     let mut hasher = Sha256::new();
 
@@ -148,7 +167,15 @@ fn code_digest(manifest_dir: &Path) -> String {
     println!("cargo:rerun-if-changed={}", hitoolbox.display());
     for file in &files {
         println!("cargo:rerun-if-changed={}", file.display());
-        let relative = file.strip_prefix(&workspace).unwrap_or(file);
+        // Hash the location inside the workspace only; an input outside it
+        // would put this machine's path back into the digest.
+        let relative = file.strip_prefix(&workspace).unwrap_or_else(|_| {
+            panic!(
+                "IME digest input {} is outside the workspace {}",
+                file.display(),
+                workspace.display()
+            )
+        });
         hash_field(&mut hasher, "file", &relative.to_string_lossy());
         hash_field(&mut hasher, "contents", &fs::read_to_string(file).unwrap_or_default());
     }
@@ -181,6 +208,12 @@ fn code_digest(manifest_dir: &Path) -> String {
     for package in locked_closure(&lock, env!("CARGO_PKG_NAME"), &direct) {
         hash_field(&mut hasher, "locked", &package);
     }
+    // Profile settings the variables below do not carry: `PROFILE` reads
+    // `release` for `dist`, and lto, codegen-units and the panic strategy have
+    // no variable at all. Any profile edit counts; they are rare.
+    if let Some(profiles) = root_manifest.get("profile") {
+        hash_field(&mut hasher, "profiles", &profiles.to_string());
+    }
 
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
     let version = Command::new(rustc).arg("-vV").output().map_or_else(
@@ -188,7 +221,17 @@ fn code_digest(manifest_dir: &Path) -> String {
         |output| String::from_utf8_lossy(&output.stdout).into_owned(),
     );
     hash_field(&mut hasher, "rustc", &version);
-    for key in ["TARGET", "PROFILE", "OPT_LEVEL", "DEBUG", "CARGO_ENCODED_RUSTFLAGS"] {
+    // Cargo reruns this script when its own variables change, but not when
+    // the deployment target does.
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    for key in [
+        "TARGET",
+        "PROFILE",
+        "OPT_LEVEL",
+        "DEBUG",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "MACOSX_DEPLOYMENT_TARGET",
+    ] {
         hash_field(&mut hasher, key, &env::var(key).unwrap_or_default());
     }
 
@@ -220,8 +263,10 @@ fn collect_files(dir: &Path, out: &mut BTreeSet<PathBuf>) {
     }
 }
 
-/// Files a Rust source pulls in with `#[path = "..."]`, resolved like rustc
-/// does for an inline module: relative to the including file's directory.
+/// Files a Rust source pulls in with `#[path = "..."]` on a `mod` declared
+/// outside any inline module, resolved like rustc does: relative to the
+/// including file's directory. The `..` steps are folded away so the result
+/// can be made relative to the workspace.
 fn path_includes(source: &Path) -> Vec<PathBuf> {
     let Ok(text) = fs::read_to_string(source) else {
         return Vec::new();
@@ -230,8 +275,24 @@ fn path_includes(source: &Path) -> Vec<PathBuf> {
     text.lines()
         .filter_map(|line| line.trim().strip_prefix("#[path = \""))
         .filter_map(|rest| rest.split('"').next())
-        .map(|relative| dir.join(relative))
+        .map(|relative| normalize_lexically(&dir.join(relative)))
         .collect()
+}
+
+/// `a/b/../c` → `a/c` by spelling alone. The workspace root is spelled the
+/// same way, so both sides keep any symlink in the checkout's path.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {},
+            Component::ParentDir => {
+                out.pop();
+            },
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn runtime_dependency_names(manifest: &toml::Value) -> Vec<String> {
@@ -248,7 +309,8 @@ fn runtime_dependency_names(manifest: &toml::Value) -> Vec<String> {
 
 /// Every package reachable from `roots` through the lockfile, as `name` for
 /// workspace members (their sources are hashed above, and their version moves
-/// with every release) or `name version checksum` for locked crates.
+/// with every release), `name version checksum` for registry crates, or
+/// `name version source` for git crates, whose source names the commit.
 fn locked_closure(lock: &toml::Value, own: &str, roots: &[String]) -> BTreeSet<String> {
     let packages = lock
         .get("package")
@@ -312,10 +374,11 @@ fn locked_closure(lock: &toml::Value, own: &str, roots: &[String]) -> BTreeSet<S
         if !seen.insert(format!("{name} {version}")) {
             continue;
         }
-        match field(package, "checksum") {
-            Some(checksum) => out.insert(format!("{name} {version} {checksum}")),
-            None if package.get("source").is_some() => out.insert(format!("{name} {version}")),
-            None => out.insert(name.clone()),
+        match (field(package, "checksum"), field(package, "source")) {
+            (Some(checksum), _) => out.insert(format!("{name} {version} {checksum}")),
+            // A git crate keeps its version when the pinned commit moves.
+            (None, Some(source)) => out.insert(format!("{name} {version} {source}")),
+            (None, None) => out.insert(name.clone()),
         };
         for reference in dependencies_of(package) {
             queue.extend(resolve(&reference));

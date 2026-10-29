@@ -32,8 +32,14 @@ file_sha() {
 # cut every open terminal's IMK connection, on each install.
 ime_code_identity() {
   local helper="$1/Contents/Helpers/FastabInputMethod.app"
-  local digest
-  digest="$(/usr/libexec/PlistBuddy -c 'Print :FastabCodeDigest' "${helper}/Contents/Info.plist" 2>/dev/null || true)"
+  local plist="${helper}/Contents/Info.plist"
+  local digest=""
+  # Only ask PlistBuddy about a file that exists: for a missing one it prints
+  # "File Doesn't Exist, Will Create: ..." on stdout, which would read as a
+  # digest and skip the executable fallback.
+  if [ -f "${plist}" ]; then
+    digest="$(/usr/libexec/PlistBuddy -c 'Print :FastabCodeDigest' "${plist}" 2>/dev/null || true)"
+  fi
   if [ -n "${digest}" ]; then
     printf 'code:%s\n' "${digest}"
   else

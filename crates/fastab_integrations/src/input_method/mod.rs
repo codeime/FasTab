@@ -1,6 +1,3 @@
-// This is needed for objc
-#![allow(unexpected_cfgs)]
-
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
@@ -24,8 +21,6 @@ use macos_utils::applications;
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use objc::runtime::Object;
-use objc::{class, msg_send, sel, sel_impl};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{debug, info, trace, warn};
@@ -753,21 +748,6 @@ impl InputMethod {
     }
 }
 
-fn str_to_nsstring(str: &str) -> &Object {
-    const UTF8_ENCODING: usize = 4;
-    unsafe {
-        let ns_string: &mut Object = msg_send![class!(NSString), alloc];
-        let ns_string: &mut Object = msg_send![
-            ns_string,
-            initWithBytes: str.as_ptr()
-            length: str.len()
-            encoding: UTF8_ENCODING
-        ];
-        let _: () = msg_send![ns_string, autorelease];
-        ns_string
-    }
-}
-
 #[async_trait]
 impl Integration for InputMethod {
     async fn is_installed(&self) -> Result<()> {
@@ -812,43 +792,46 @@ impl Integration for InputMethod {
 
         let destination = self.target_bundle_path()?;
 
-        let binding = run_on_main(|| {
+        // Best effort. TIS cannot list sources in a process without an
+        // NSApplication, which is `ftab integrations uninstall` and so
+        // uninstall.sh. A failure here used to return before the palette
+        // entries, the process and the symlink were touched, while callers
+        // counted `CouldNotListInputSources` as a finished uninstall. The
+        // palette write below removes the source from both lists either way.
+        let tis = run_on_main(|| {
             let input_source = self.input_source()?;
-            input_source.deselect()?;
-            input_source.disable()?;
-
-            Ok::<_, InputMethodError>(input_source.bundle_id())
-        })?;
+            // Independent: a source that was never selected still gets disabled.
+            let deselected = input_source.deselect();
+            input_source.disable().and(deselected)
+        });
+        if let Err(error) = tis {
+            debug!(%error, "TIS could not deselect or disable the input source; removing its palette entries directly");
+        }
 
         // Key-scoped write, same crate as install. Whole-domain `defaults
         // export/import` is what raced the IME during install and can drop
         // every keyboard layout on a failed python3.
         let ours = self.bundle_id().unwrap_or_else(|_| "app.fastab.inputmethod".into());
-        let _ = fastab_hitoolbox::remove_palette_entries(&[&ours]);
+        let palette_removed = fastab_hitoolbox::remove_palette_entries(&[&ours]);
 
-        let binding = binding.ok_or_else(|| InputMethodError::InvalidBundle {
-            inner: "Could not get bundle id".into(),
-        })?;
+        // Every instance, and only once they are gone: the old Cocoa
+        // `terminate` asked the first one to quit and did not wait.
+        Self::stop(&self.running_pids());
 
-        // todo(mschrage): Terminate input method binary using Cocoa APIs
-        unsafe {
-            let bundle_id: &Object = str_to_nsstring(binding.as_str());
-            let running_input_method_array: &mut Object = msg_send![
-                class!(NSRunningApplication),
-                runningApplicationsWithBundleIdentifier: bundle_id
-            ];
-            let running_input_method_array_len: u64 = msg_send![running_input_method_array, count];
-
-            if running_input_method_array_len > 0 {
-                let running_input_method: &mut Object = msg_send![running_input_method_array, objectAtIndex: 0];
-
-                let _: () = msg_send![running_input_method, terminate];
-            }
+        // Already gone counts as removed, so running uninstall again succeeds.
+        match fs::remove_file(&destination).await {
+            Ok(()) => {},
+            Err(error) if error.kind() == ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
         }
 
-        // Remove symbolic link
-        fs::remove_file(destination).await?;
-
+        // Reported last, so a preferences write that did not stick still lets
+        // the process and the symlink go.
+        if !palette_removed {
+            return Err(Error::Custom(
+                "Could not remove the input method from the HIToolbox palette lists".into(),
+            ));
+        }
         Ok(())
     }
 

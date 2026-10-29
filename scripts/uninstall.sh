@@ -53,8 +53,11 @@ fi
 
 # ── 1. Uninstall integrations via CLI (must run before binary is removed) ─────
 info "Uninstalling input method integration..."
+ime_cli_uninstalled=0
 if command -v ftab &>/dev/null; then
-  ftab integrations uninstall input-method 2>/dev/null || true
+  if ftab integrations uninstall input-method 2>/dev/null; then
+    ime_cli_uninstalled=1
+  fi
 fi
 
 info "Uninstalling shell integration..."
@@ -98,12 +101,16 @@ if [[ -L "$IME_SYMLINK" || -d "$IME_SYMLINK" ]]; then
   rm -rf "$IME_SYMLINK"
 fi
 
-# `ftab integrations uninstall input-method` already dropped our palette
-# entries in-process. Do not fall back to `defaults export`/`import` of the
-# whole HIToolbox domain: that race is what dropped Easy Complete's palette
-# when install ran two writers. A leftover Fastab row after the CLI is gone
-# is inert.
-info "Input Method palette entries were removed in-process (no HIToolbox domain rewrite)."
+# `ftab integrations uninstall input-method` drops our palette entries
+# in-process. Do not fall back to `defaults export`/`import` of the whole
+# HIToolbox domain: that race is what dropped Easy Complete's palette when
+# install ran two writers. A leftover Fastab row after the CLI is gone is
+# inert, so only say which of the two happened.
+if [[ "${ime_cli_uninstalled}" -eq 1 ]]; then
+  info "Input Method palette entries were removed in-process (no HIToolbox domain rewrite)."
+else
+  warn "ftab could not finish uninstalling the Input Method; any leftover palette entry is inert."
+fi
 
 # ── 5. Remove app bundle ───────────────────────────────────────────────────────
 info "Removing /Applications/${APP_BUNDLE_NAME}..."

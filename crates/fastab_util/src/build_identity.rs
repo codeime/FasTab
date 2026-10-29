@@ -2,24 +2,28 @@
 //! Kept std-only so the IME can include this leaf without the desktop stack.
 //!
 //! The IME compiles this file with `build_identity_from_bundle` and reads its
-//! build facts from its own Info.plist instead of baking them in: a commit,
-//! date or version string in the executable would change it on every release,
-//! and installs replace a running IME (cutting every terminal window's IMK
-//! connection) only when its code digest changed.
+//! build facts from its own Info.plist, once at startup, instead of baking them
+//! in: a commit, date or version string in the executable would change it on
+//! every release, and installs replace a running IME (cutting every terminal
+//! window's IMK connection) only when its code digest changed.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static START: OnceLock<(SystemTime, Instant)> = OnceLock::new();
+static BUILD: OnceLock<BuildFields> = OnceLock::new();
 
 pub fn initialize() {
     START.get_or_init(|| (SystemTime::now(), Instant::now()));
+    // Read once, at startup. The IME's Info.plist is replaced under a helper
+    // that an install keeps running, and from then on describes the new build.
+    BUILD.get_or_init(build_fields);
 }
 
 pub fn json(component: &str) -> String {
     let (started, elapsed) = START.get_or_init(|| (SystemTime::now(), Instant::now()));
-    let build = build_fields();
+    let build = BUILD.get_or_init(build_fields);
     let fields = [("component", Some(component))]
         .into_iter()
         .chain(build.iter().map(|(key, value)| (*key, value.as_deref())));
