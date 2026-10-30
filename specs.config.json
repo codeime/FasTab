@@ -1,5 +1,5 @@
 {
-  "$comment": "Filter config for bundled completion specs. The source package/version is pinned in package.json and pnpm-lock.yaml. Edit exclude here, then run `node scripts/sync-bundled-specs.mjs` and commit the regenerated bundle/specs. Env vars BUNDLED_SPECS_EXCLUDE / BUNDLED_SPECS_PACKAGE / BUNDLED_SPECS_SOURCE still override one-off runs. See AGENTS.md > Bundled Specs.",
+  "$comment": "Filter config for bundled completion specs. The source package/version is pinned in package.json and pnpm-lock.yaml. Edit exclude here, then run `node scripts/sync-bundled-specs.mjs` and commit the regenerated bundle/specs. Env vars BUNDLED_SPECS_EXCLUDE / BUNDLED_SPECS_PACKAGE / BUNDLED_SPECS_SOURCE still override one-off runs. See CLAUDE.md > Bundled Specs.",
   "exclude": ["aws", "az"],
   "$iconsComment": "Named spec icons kept in bundle/specs/icons. crates/fastab_gpui/src/icons.rs embeds each of these with include_bytes!, so this list and that table have to be edited together or the Rust build fails on a missing file.",
   "icons": [
