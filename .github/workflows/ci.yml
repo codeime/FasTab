@@ -334,9 +334,15 @@ jobs:
           cp target/dist/fterm target/fterm-allocator-ab/fterm-mimalloc
           cargo build --locked --profile dist -p fastab_term --features system-allocator
           cp target/dist/fterm target/fterm-allocator-ab/fterm-system
-          python3 scripts/fterm-footprint-ab.py --rounds 5 \
-            mimalloc=target/fterm-allocator-ab/fterm-mimalloc \
-            system=target/fterm-allocator-ab/fterm-system | tee target/fterm-allocator-ab/footprint.txt
+          for size in 40x120 60x240; do
+            python3 scripts/fterm-footprint-ab.py --rounds 5 --size "$size" \
+              mimalloc=target/fterm-allocator-ab/fterm-mimalloc \
+              system=target/fterm-allocator-ab/fterm-system
+          done | tee target/fterm-allocator-ab/footprint.txt
+          # Job logs need a GitHub login; annotations are readable from the
+          # public API (escaping as in scripts/binary-size-report.sh).
+          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/fterm-allocator-ab/footprint.txt)"
+          echo "::notice title=fterm footprint by allocator::${table}"
 
       - name: Upload fterm allocator builds
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
