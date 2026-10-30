@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.0.20
+
+- change: the desktop app should give memory back to the system after completions. Its own allocations now use mimalloc, so short-lived completion and drawing work no longer shares memory pages with what macOS frameworks keep for the life of the app; on v0.0.19 that left about 12 MB held but unused after a session. The app also runs three fewer idle threads.
+- change: each terminal tab runs two fewer background threads and no longer wakes up every 30 seconds while idle.
+- fix: uninstalling the input method with `ftab integrations uninstall input-method` or the uninstall script now removes its input source entries, stops the helper and removes its link, instead of stopping at the first step.
+- fix: whether an update restarts the input method helper no longer depends on where the release was built. Updating to this version restarts it once.
+- change: each release also offers debug symbols (`Fastab-<version>-arm64-dSYMs.zip`) as a separate download; the app download is unchanged.
+
 ## v0.0.19
 
 - fix: updating FasTab no longer restarts the input method helper unless the helper itself changed, so Ghostty, Kitty, Otty and similar terminal windows keep cursor tracking across updates. Updating to this version still restarts it once.
