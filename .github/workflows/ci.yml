@@ -292,10 +292,10 @@ jobs:
 
       # This is the shipped configuration (strip = "symbols", all four packages
       # in one build), so check here that it still leaves a dSYM per binary
-      # for the release to attach, and that libmimalloc-sys still builds its C
-      # code as release: it defines NDEBUG only when its build script sees
-      # DEBUG=false, which cc also reads to decide on `-g`, so debug sections in
-      # libmimalloc.a mean the dist profile's line tables reached it.
+      # for the release to attach, and that libmimalloc-sys (ftab's allocator)
+      # still builds its C code as release: it defines NDEBUG only when its build
+      # script sees DEBUG=false, which cc also reads to decide on `-g`, so debug
+      # sections in libmimalloc.a mean the dist profile's line tables reached it.
       - name: Check dSYMs and the mimalloc release build
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
@@ -323,30 +323,16 @@ jobs:
           echo "$links"
           test "$links" = "/usr/lib/libSystem.B.dylib"
 
-      # Rebuilding only fastab_term reuses every other dist artifact; afterwards
-      # target/dist/fterm is the system-allocator build. A measurement, not a
-      # gate: a runner without `footprint` must not fail main.
-      - name: Compare fterm footprint (mimalloc vs system allocator)
+      # One fterm stays resident per terminal tab, so its footprint is tracked
+      # on every main push. Job logs need a GitHub login; the annotation is
+      # readable from the public API (escaping as in scripts/binary-size-report.sh).
+      # A measurement, not a gate: a runner without `footprint` must not fail main.
+      - name: Measure fterm footprint
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
-          mkdir -p target/fterm-allocator-ab
-          cp target/dist/fterm target/fterm-allocator-ab/fterm-mimalloc
-          cargo build --locked --profile dist -p fastab_term --features system-allocator
-          cp target/dist/fterm target/fterm-allocator-ab/fterm-system
           for size in 40x120 60x240; do
-            python3 scripts/fterm-footprint-ab.py --rounds 5 --size "$size" \
-              mimalloc=target/fterm-allocator-ab/fterm-mimalloc \
-              system=target/fterm-allocator-ab/fterm-system
-          done | tee target/fterm-allocator-ab/footprint.txt
-          # Job logs need a GitHub login; annotations are readable from the
-          # public API (escaping as in scripts/binary-size-report.sh).
-          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/fterm-allocator-ab/footprint.txt)"
-          echo "::notice title=fterm footprint by allocator::${table}"
-
-      - name: Upload fterm allocator builds
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v7
-        with:
-          name: fterm-allocator-ab
-          path: target/fterm-allocator-ab/
+            python3 scripts/fterm-footprint-ab.py --rounds 5 --size "$size" shipped=target/dist/fterm
+          done | tee target/fterm-footprint.txt
+          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/fterm-footprint.txt)"
+          echo "::notice title=fterm footprint::${table}"

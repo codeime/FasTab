@@ -1,4 +1,3 @@
-mod allocator;
 mod child_exit;
 #[cfg(target_os = "linux")]
 mod cleanup;

@@ -2779,7 +2779,6 @@ dependencies = [
  "fnv",
  "lazy_static",
  "memmem",
- "mimalloc",
  "nix 0.31.3",
  "num-traits",
  "pin-project",

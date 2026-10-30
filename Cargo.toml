@@ -264,8 +264,8 @@ panic = "abort"
 
 # libmimalloc-sys defines NDEBUG and MI_BUILD_RELEASE for its C code only when
 # Cargo hands its build script DEBUG=false, and DEBUG follows this package's
-# debuginfo. Keep it off so dist's line tables do not turn the allocator every
-# fterm and the desktop run into a non-release C build.
+# debuginfo. Keep it off so dist's line tables do not turn ftab's allocator
+# into a non-release C build.
 [profile.dist.package.libmimalloc-sys]
 debug = false
 

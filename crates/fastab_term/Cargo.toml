@@ -18,8 +18,6 @@ workspace = true
 # Tests that do not work on CI
 desktop-tests = []
 profiling_early_exit = []
-# Build with the system allocator instead of mimalloc, for footprint A/B runs.
-system-allocator = []
 
 [dependencies]
 alacritty_terminal = { path = "../alacritty_terminal" }
@@ -41,7 +39,6 @@ filedescriptor = "0.8"
 flume = "0.12.0"
 fnv = "1.0.7"
 memmem = "0.1.1"
-mimalloc.workspace = true
 num-traits = "0.2"
 pin-project = "1.1.10"
 portable-pty.workspace = true

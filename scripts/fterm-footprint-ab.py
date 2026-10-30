@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Compare the resident footprint of fterm builds.
 
-    scripts/fterm-footprint-ab.py mimalloc=target/dist/fterm system=/tmp/fterm-system
+    scripts/fterm-footprint-ab.py shipped=target/dist/fterm candidate=/tmp/fterm-candidate
     scripts/fterm-footprint-ab.py --rounds 5 --size 80x300 a=./fterm-a b=./fterm-b
 
 Each build runs in a fresh pty with `/bin/sh` as its shell (no desktop app is
 needed). After 3 s idle, and again after a burst of output plus some typing,
 `footprint` is sampled. Numbers are phys_footprint in KiB, the figure Activity
 Monitor shows. `heap-tagged` is the dirty memory under VM tag 100: mimalloc
-uses that tag on macOS, which footprint/vmmap print as "IOAccelerator".
+uses that tag on macOS, which footprint/vmmap print as "IOAccelerator". It is
+zero for the system allocator, which fterm uses.
 """
 
 import argparse
