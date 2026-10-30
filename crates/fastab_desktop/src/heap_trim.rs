@@ -9,11 +9,7 @@
 //!
 //! `malloc_zone_pressure_relief` returns pages that hold no live allocation.
 //! It cannot release a page pinned by one surviving object, and it does not
-//! touch what Metal, CoreText or AppKit cache inside the frameworks. That pin
-//! is why Rust's allocations now go to mimalloc (`allocator.rs`): measured on
-//! v0.0.19, the transient engine and GPUI allocations left ~12 MB of
-//! fragmentation among framework caches in the system zone. The same relief
-//! runs mimalloc's pending purges, so what they free goes back too.
+//! touch what Metal, CoreText or AppKit cache inside the frameworks.
 //!
 //! Every engine request and every UI cache release counts as activity. The
 //! relief runs once, [`QUIET`] after the last of them: later than the engine's
@@ -89,27 +85,8 @@ fn relieve() {
     // SAFETY: libmalloc takes each zone's lock itself; it makes this same call
     // from its memory-pressure handler on an arbitrary thread.
     let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
-    collect_rust_heap();
     tracing::debug!(released, "Returned free heap pages to the system");
 }
-
-/// mimalloc purges a page that empties out after a short delay, but it carries
-/// that purge out from inside its own calls, so an app that goes quiet right
-/// after a session can leave it pending. A forced collect runs every arena's
-/// pending purge, whichever thread freed the pages.
-#[cfg(all(target_os = "macos", not(feature = "system-allocator")))]
-fn collect_rust_heap() {
-    unsafe extern "C" {
-        /// `<mimalloc.h>`, linked through the `mimalloc` crate.
-        fn mi_collect(force: bool);
-    }
-    // SAFETY: callable from any thread at any time; it collects this thread's
-    // heap and the process-wide arenas under mimalloc's own locks.
-    unsafe { mi_collect(true) };
-}
-
-#[cfg(all(target_os = "macos", feature = "system-allocator"))]
-fn collect_rust_heap() {}
 
 #[cfg(not(target_os = "macos"))]
 fn relieve() {}

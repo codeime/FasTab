@@ -222,17 +222,28 @@ jobs:
         run: |
           set -euo pipefail
           # Symbols are worth having, not worth blocking a release for: a
-          # missing dSYM is reported and the release ships without the zip.
+          # missing dSYM is reported and the run keeps none.
           # Signing does not change the UUIDs these are matched by.
-          if ./scripts/collect-dsyms.sh dist/dSYMs \
+          if ! ./scripts/collect-dsyms.sh dist/dSYMs \
             build/Fastab.app/Contents/MacOS/fastab \
             build/Fastab.app/Contents/MacOS/ftab \
             build/Fastab.app/Contents/MacOS/fterm \
             build/Fastab.app/Contents/Helpers/FastabInputMethod.app/Contents/MacOS/fastab_input_method; then
-            ditto -c -k --keepParent dist/dSYMs dist/Fastab-arm64-dSYMs.zip
-          else
-            echo "::warning::This release ships without dSYMs; see the error above."
+            rm -rf dist/dSYMs
+            echo "::warning::No dSYMs for this release; see the error above."
           fi
+
+      # Debug symbols are for us, not for users: they stay a workflow artifact
+      # of this run and never become a release asset. Download them from the
+      # run's page to symbolicate a crash report or a malloc stack log.
+      - name: Upload dSYMs
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: Fastab-${{ github.ref_name }}-arm64-dSYMs
+          path: dist/dSYMs/
+          retention-days: 90
+          if-no-files-found: warn
 
       - name: Sign app bundle
         if: startsWith(github.ref, 'refs/tags/') && steps.caps.outputs.signing == 'true'
@@ -495,9 +506,6 @@ jobs:
           mkdir -p dist/upload
           cp dist/Fastab-arm64.dmg dist/upload/
           cp "dist/Fastab-${APP_VERSION}-arm64.dmg" dist/upload/
-          if [ -f dist/Fastab-arm64-dSYMs.zip ]; then
-            cp dist/Fastab-arm64-dSYMs.zip "dist/upload/Fastab-${APP_VERSION}-arm64-dSYMs.zip"
-          fi
           if [ -f dist/sparkle/appcast.xml ]; then
             cp dist/sparkle/appcast.xml dist/upload/
           fi

@@ -6,7 +6,6 @@
 - change: each terminal tab runs two fewer background threads and no longer wakes up every 30 seconds while idle.
 - fix: uninstalling the input method with `ftab integrations uninstall input-method` or the uninstall script now removes its input source entries, stops the helper and removes its link, instead of stopping at the first step.
 - fix: whether an update restarts the input method helper no longer depends on where the release was built. Updating to this version restarts it once.
-- change: each release also offers debug symbols (`Fastab-<version>-arm64-dSYMs.zip`) as a separate download; the app download is unchanged.
 
 ## v0.0.19
 

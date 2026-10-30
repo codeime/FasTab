@@ -1,6 +1,3 @@
-// Shared with fterm; see that file for why both resident processes use mimalloc.
-#[path = "../../fastab_term/src/allocator.rs"]
-mod allocator;
 mod cli;
 mod event;
 mod event_loop;

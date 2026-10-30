@@ -216,11 +216,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 --color always -- -D warnings
 
-      # The desktop's system-allocator build is its A/B and rollback path; lint
-      # it too, or that cfg branch stops compiling unnoticed.
-      - name: Clippy (desktop, system allocator)
-        run: cargo clippy --locked -p fastab_desktop --features system-allocator --color always -- -D warnings
-
       # The engine's typed-hook provenance tests verify the checked-in
       # reference baselines against the compiled bundle/specs-ir pair, which is
       # gitignored. Compile it here exactly as build-app.sh does.
