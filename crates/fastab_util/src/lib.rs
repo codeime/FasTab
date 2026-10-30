@@ -1,6 +1,8 @@
 pub mod directories;
 pub mod manifest;
 mod open;
+#[cfg(target_os = "macos")]
+pub mod process_exit;
 pub mod process_info;
 mod shell;
 pub mod system_info;

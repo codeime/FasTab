@@ -217,6 +217,23 @@ jobs:
           test "$(plutil -extract CFBundleName raw -o - "$names")" = "FasTab"
           test "$(plutil -extract CFBundleDisplayName raw -o - "$names")" = "FasTab"
 
+      - name: Collect dSYMs
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          # Symbols are worth having, not worth blocking a release for: a
+          # missing dSYM is reported and the release ships without the zip.
+          # Signing does not change the UUIDs these are matched by.
+          if ./scripts/collect-dsyms.sh dist/dSYMs \
+            build/Fastab.app/Contents/MacOS/fastab \
+            build/Fastab.app/Contents/MacOS/ftab \
+            build/Fastab.app/Contents/MacOS/fterm \
+            build/Fastab.app/Contents/Helpers/FastabInputMethod.app/Contents/MacOS/fastab_input_method; then
+            ditto -c -k --keepParent dist/dSYMs dist/Fastab-arm64-dSYMs.zip
+          else
+            echo "::warning::This release ships without dSYMs; see the error above."
+          fi
+
       - name: Sign app bundle
         if: startsWith(github.ref, 'refs/tags/') && steps.caps.outputs.signing == 'true'
         env:
@@ -478,6 +495,9 @@ jobs:
           mkdir -p dist/upload
           cp dist/Fastab-arm64.dmg dist/upload/
           cp "dist/Fastab-${APP_VERSION}-arm64.dmg" dist/upload/
+          if [ -f dist/Fastab-arm64-dSYMs.zip ]; then
+            cp dist/Fastab-arm64-dSYMs.zip "dist/upload/Fastab-${APP_VERSION}-arm64-dSYMs.zip"
+          fi
           if [ -f dist/sparkle/appcast.xml ]; then
             cp dist/sparkle/appcast.xml dist/upload/
           fi

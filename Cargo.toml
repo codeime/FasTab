@@ -251,12 +251,23 @@ lto = "off"
 # under their own profiles.
 [profile.dist]
 inherits = "release"
-debug = false
+# Line tables go to a dSYM beside each binary (rustc runs dsymutil before it
+# strips), so the shipped binaries stay stripped while a release's dSYMs can
+# name the Rust frames in crash reports and malloc stack logs.
+debug = "line-tables-only"
+split-debuginfo = "packed"
 incremental = false
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# libmimalloc-sys defines NDEBUG and MI_BUILD_RELEASE for its C code only when
+# Cargo hands its build script DEBUG=false, and DEBUG follows this package's
+# debuginfo. Keep it off so dist's line tables do not turn the allocator every
+# fterm and the desktop run into a non-release C build.
+[profile.dist.package.libmimalloc-sys]
+debug = false
 
 [profile.dev.package.insta]
 opt-level = 3

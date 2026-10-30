@@ -1,3 +1,6 @@
+// Shared with fterm; see that file for why both resident processes use mimalloc.
+#[path = "../../fastab_term/src/allocator.rs"]
+mod allocator;
 mod cli;
 mod event;
 mod event_loop;
@@ -24,6 +27,7 @@ mod update;
 mod utils;
 mod webview;
 
+use std::io::IsTerminal as _;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::ExitCode;
@@ -45,9 +49,6 @@ use tracing::{error, warn};
 use url::Url;
 use webview::WebviewManager;
 pub use webview::{AUTOCOMPLETE_ID, AUTOCOMPLETE_WINDOW_TITLE, DASHBOARD_ID};
-
-// #[global_allocator]
-// static GLOBAL: Jemalloc = Jemalloc;
 
 pub use event_loop::{EventLoopClosed, EventLoopProxy, EventLoopWindowTarget};
 
@@ -157,7 +158,9 @@ async fn async_main() -> Result<Launch, ExitCode> {
 
     let log_guard = initialize_logging(LogArgs {
         log_level: None,
-        log_to_stdout: true,
+        // A LaunchServices launch points stdout at /dev/null, where the stdout
+        // layer formatted every event twice and kept its own writer thread.
+        log_to_stdout: std::io::stdout().is_terminal(),
         log_file_path: Some(
             directories::logs_dir()
                 .expect("home dir must be set")

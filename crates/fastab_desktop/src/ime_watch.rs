@@ -8,16 +8,15 @@
 //! until the next launch. This watches the running IME and restores it again
 //! when it exits.
 //!
-//! The wait is a kqueue `EVFILT_PROC`/`NOTE_EXIT` registration polled through
-//! tokio's reactor: no thread, and no wakeups while the IME stays up.
+//! The wait is `fastab_util::process_exit`: a kqueue `NOTE_EXIT` registration
+//! polled through tokio's reactor, so no thread and no wakeups while the IME
+//! stays up.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use fastab_integrations::input_method::InputMethod;
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
+use fastab_util::process_exit::ExitWatch;
 use tracing::{debug, info, warn};
 
 /// Let whoever stopped the IME finish first: an install replaces the process
@@ -90,109 +89,16 @@ impl RelaunchBudget {
 
 /// Resolves when any of `pids` exits, at once if one already has.
 async fn wait_for_any_exit(pids: &[i32]) -> io::Result<()> {
-    let Some(queue) = ProcessExitQueue::watch(pids)? else {
-        return Ok(());
-    };
-    let queue = AsyncFd::with_interest(queue, Interest::READABLE)?;
-    // A kqueue descriptor turns readable once one of its events has fired.
-    let _ready = queue.readable().await?;
-    Ok(())
-}
-
-struct ProcessExitQueue(OwnedFd);
-
-impl AsRawFd for ProcessExitQueue {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-impl ProcessExitQueue {
-    /// `None` when one of `pids` has already exited.
-    fn watch(pids: &[i32]) -> io::Result<Option<Self>> {
-        // SAFETY: kqueue takes no arguments; a negative result is an error.
-        let raw = unsafe { libc::kqueue() };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `raw` is a descriptor we just created and nobody else owns.
-        let queue = Self(unsafe { OwnedFd::from_raw_fd(raw) });
-        for &pid in pids {
-            let Ok(ident) = libc::uintptr_t::try_from(pid) else {
-                continue;
-            };
-            let change = libc::kevent {
-                ident,
-                filter: libc::EVFILT_PROC,
-                flags: libc::EV_ADD | libc::EV_ONESHOT,
-                fflags: libc::NOTE_EXIT,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            // SAFETY: one valid change record, no output buffer, no timeout.
-            let result = unsafe { libc::kevent(raw, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    return Ok(None);
-                }
-                return Err(error);
-            }
-        }
-        Ok(Some(queue))
-    }
+    ExitWatch::new(pids)?.exited().await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use super::{MAX_RELAUNCHES_PER_WINDOW, RELAUNCH_WINDOW, RelaunchBudget, wait_for_any_exit};
+    use super::{MAX_RELAUNCHES_PER_WINDOW, RELAUNCH_WINDOW, RelaunchBudget};
 
-    fn spawn_sleep(seconds: &str) -> std::process::Child {
-        Command::new("/bin/sleep")
-            .arg(seconds)
-            .stdin(Stdio::null())
-            .spawn()
-            .expect("spawn sleep")
-    }
-
-    fn pid_of(child: &std::process::Child) -> i32 {
-        i32::try_from(child.id()).expect("pid fits")
-    }
-
-    #[tokio::test]
-    async fn an_exit_wakes_the_wait() {
-        let mut child = spawn_sleep("0.2");
-        let pid = pid_of(&child);
-        tokio::time::timeout(Duration::from_secs(5), wait_for_any_exit(&[pid]))
-            .await
-            .expect("exit observed before the timeout")
-            .expect("watch registered");
-        child.wait().expect("reap");
-    }
-
-    #[tokio::test]
-    async fn a_live_process_keeps_the_wait_pending() {
-        let mut child = spawn_sleep("30");
-        let pid = pid_of(&child);
-        let pending = tokio::time::timeout(Duration::from_millis(300), wait_for_any_exit(&[pid])).await;
-        assert!(pending.is_err(), "a running process must not look exited");
-        child.kill().expect("kill");
-        child.wait().expect("reap");
-    }
-
-    #[tokio::test]
-    async fn an_already_gone_process_returns_at_once() {
-        let mut child = spawn_sleep("0");
-        let pid = pid_of(&child);
-        child.wait().expect("reap");
-        tokio::time::timeout(Duration::from_secs(1), wait_for_any_exit(&[pid]))
-            .await
-            .expect("no wait for a process that is gone")
-            .expect("ESRCH is not an error");
-    }
+    // The exit wait itself is tested with `fastab_util::process_exit`.
 
     #[test]
     fn relaunches_are_capped_per_window() {

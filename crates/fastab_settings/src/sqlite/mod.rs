@@ -1,10 +1,10 @@
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use fastab_util::directories::fig_data_dir;
-use r2d2::Pool;
+use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::FromSql;
 use rusqlite::{Connection, Error, ToSql, params};
@@ -18,25 +18,26 @@ const STATE_TABLE_NAME: &str = "state";
 const AUTH_TABLE_NAME: &str = "auth_kv";
 const POOL_MAX_SIZE: u32 = 4;
 
-static LIGHT_POOL: AtomicBool = AtomicBool::new(false);
+static DIRECT_CONNECTIONS: AtomicBool = AtomicBool::new(false);
 /// Set once [`DATABASE`] starts opening, after which the pool shape is fixed.
 static DATABASE_OPENED: AtomicBool = AtomicBool::new(false);
 
-/// Opts this process into a pool that keeps nothing open between uses: one
-/// maintenance thread instead of r2d2's three, and no idle connection held.
+/// Opts this process out of the pool: each call opens its own connection and
+/// closes it when it returns, so nothing is held open between uses and no
+/// maintenance thread runs (r2d2 needs one, and its reaper woke every 30 s).
 /// For `fterm`, which stays resident once per terminal tab and only touches
 /// the database at startup and once per finished command. Takes effect only
 /// before the first [`database()`] call; a later call is a bug in the caller,
 /// so it is reported instead of being ignored silently.
-pub fn prefer_light_pool() {
-    LIGHT_POOL.store(true, Ordering::SeqCst);
+pub fn prefer_direct_connections() {
+    DIRECT_CONNECTIONS.store(true, Ordering::SeqCst);
     let too_late = DATABASE_OPENED.load(Ordering::SeqCst);
     if too_late {
-        warn!("prefer_light_pool() ran after the database was opened; the full pool stays");
+        warn!("prefer_direct_connections() ran after the database was opened; the pool stays");
     }
     debug_assert!(
         !too_late,
-        "prefer_light_pool() must run before the first database() call"
+        "prefer_direct_connections() must run before the first database() call"
     );
 }
 
@@ -84,7 +85,45 @@ const MIGRATIONS: &[Migration] = migrations![
 
 #[derive(Debug, Clone)]
 pub struct Db {
-    pub(crate) pool: Pool<SqliteConnectionManager>,
+    backend: Backend,
+}
+
+#[derive(Debug, Clone)]
+enum Backend {
+    Pool(Pool<SqliteConnectionManager>),
+    /// A connection per call; see [`prefer_direct_connections`]. Each costs an open
+    /// and the two pragmas of [`init_connection`], a fraction of a millisecond
+    /// at tab start and once per finished command. Closing the last connection
+    /// to a WAL database checkpoints it, but while the desktop runs its pool
+    /// holds a connection, so that only happens with the desktop gone.
+    Direct(Arc<Path>),
+}
+
+/// The connection one call works on: checked out of the pool, or opened for
+/// the call and closed when it is dropped.
+pub(crate) enum DbConnection {
+    Pooled(PooledConnection<SqliteConnectionManager>),
+    Direct(Connection),
+}
+
+impl Deref for DbConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Pooled(conn) => conn,
+            Self::Direct(conn) => conn,
+        }
+    }
+}
+
+impl DerefMut for DbConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self {
+            Self::Pooled(conn) => conn,
+            Self::Direct(conn) => conn,
+        }
+    }
 }
 
 impl Db {
@@ -97,19 +136,19 @@ impl Db {
     }
 
     fn open(path: &Path) -> Result<Self> {
-        Self::open_pool(
-            path,
-            std::time::Duration::from_secs(60),
-            LIGHT_POOL.load(Ordering::SeqCst),
-        )
+        if DIRECT_CONNECTIONS.load(Ordering::SeqCst) {
+            Self::open_direct(path)
+        } else {
+            Self::open_pool(path, std::time::Duration::from_secs(60))
+        }
     }
 
     #[cfg(test)]
     fn open_with_idle_timeout(path: &Path, idle_timeout: std::time::Duration) -> Result<Self> {
-        Self::open_pool(path, idle_timeout, false)
+        Self::open_pool(path, idle_timeout)
     }
 
-    fn open_pool(path: &Path, idle_timeout: std::time::Duration, light: bool) -> Result<Self> {
+    fn prepare_file(path: &Path) -> Result<()> {
         // make the parent dir if it doesnt exist
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -121,6 +160,42 @@ impl Db {
         // inherit its mode. Repair existing sidecars before any secret write.
         #[cfg(unix)]
         protect_database_files(path)?;
+        Ok(())
+    }
+
+    /// Opens nothing yet: [`DATABASE`] migrates right after, and that first
+    /// connection is where an unopenable file fails, without a probe
+    /// connection of its own on every tab start.
+    fn open_direct(path: &Path) -> Result<Self> {
+        Self::prepare_file(path)?;
+        Ok(Self {
+            backend: Backend::Direct(Arc::from(path)),
+        })
+    }
+
+    /// Later calls open the file without creating its directory, so a data
+    /// directory removed under a running fterm (uninstall) stays removed.
+    pub(crate) fn conn(&self) -> Result<DbConnection> {
+        match &self.backend {
+            Backend::Pool(pool) => Ok(DbConnection::Pooled(pool.get()?)),
+            Backend::Direct(path) => {
+                let mut conn = Connection::open(path)?;
+                init_connection(&mut conn)?;
+                Ok(DbConnection::Direct(conn))
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn pool(&self) -> &Pool<SqliteConnectionManager> {
+        match &self.backend {
+            Backend::Pool(pool) => pool,
+            Backend::Direct(_) => panic!("direct storage has no pool"),
+        }
+    }
+
+    fn open_pool(path: &Path, idle_timeout: std::time::Duration) -> Result<Self> {
+        Self::prepare_file(path)?;
 
         let conn = SqliteConnectionManager::file(path).with_init(init_connection);
         // The default r2d2 checkout timeout is 30s. The completion engine's
@@ -135,25 +210,28 @@ impl Db {
         // expired idle connections, then replenishes the one-connection floor;
         // it does not preserve a particular connection indefinitely. With the
         // production timeout, a fully idle pool shrinks after about 60-90s.
-        let mut builder = Pool::builder()
+        //
+        // One maintenance thread, not r2d2's default three: its jobs are that
+        // 30s reap and opening a replacement connection, milliseconds each.
+        let thread_pool = scheduled_thread_pool::ScheduledThreadPool::builder()
+            .num_threads(1)
+            .thread_name_pattern("sqlite-pool-{}")
+            .build();
+        let pool = Pool::builder()
             .max_size(POOL_MAX_SIZE)
-            .min_idle(Some(if light { 0 } else { 1 }))
+            .min_idle(Some(1))
             .idle_timeout(Some(idle_timeout))
-            .connection_timeout(std::time::Duration::from_secs(3));
-        if light {
-            let thread_pool = scheduled_thread_pool::ScheduledThreadPool::builder()
-                .num_threads(1)
-                .thread_name_pattern("sqlite-pool-{}")
-                .build();
-            builder = builder.thread_pool(Arc::new(thread_pool));
-        }
-        let pool = builder.build(conn)?;
+            .connection_timeout(std::time::Duration::from_secs(3))
+            .thread_pool(Arc::new(thread_pool))
+            .build(conn)?;
 
         // Also check sidecars created while the pool was initialized.
         #[cfg(unix)]
         protect_database_files(path)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            backend: Backend::Pool(pool),
+        })
     }
 
     /// Isolated SQLite storage for downstream credential tests; never opens
@@ -168,11 +246,13 @@ impl Db {
     pub(crate) fn mock() -> Self {
         let conn = SqliteConnectionManager::memory();
         let pool = Pool::builder().build(conn).unwrap();
-        Self { pool }
+        Self {
+            backend: Backend::Pool(pool),
+        }
     }
 
     pub fn migrate(&self) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.conn()?;
         let transaction = conn.transaction()?;
 
         let max_version = max_migration_version(&transaction);
@@ -201,7 +281,7 @@ impl Db {
     }
 
     fn get_value<T: FromSql>(&self, table: &'static str, key: impl AsRef<str>) -> Result<Option<T>> {
-        let conn = self.pool.get()?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!("SELECT value FROM {table} WHERE key = ?1"))?;
         match stmt.query_row([key.as_ref()], |row| row.get(0)) {
             Ok(data) => Ok(Some(data)),
@@ -219,7 +299,7 @@ impl Db {
     }
 
     fn set_value<T: ToSql>(&self, table: &'static str, key: impl AsRef<str>, value: T) -> Result<()> {
-        self.pool.get()?.execute(
+        self.conn()?.execute(
             &format!("INSERT OR REPLACE INTO {table} (key, value) VALUES (?1, ?2)"),
             params![key.as_ref(), value],
         )?;
@@ -235,8 +315,7 @@ impl Db {
     }
 
     fn unset_value(&self, table: &'static str, key: impl AsRef<str>) -> Result<()> {
-        self.pool
-            .get()?
+        self.conn()?
             .execute(&format!("DELETE FROM {table} WHERE key = ?1"), [key.as_ref()])?;
         Ok(())
     }
@@ -250,7 +329,7 @@ impl Db {
     }
 
     fn is_value_set(&self, table: &'static str, key: impl AsRef<str>) -> Result<bool> {
-        let conn = self.pool.get()?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!("SELECT value FROM {table} WHERE key = ?1"))?;
         match stmt.query_row([key.as_ref()], |_| Ok(())) {
             Ok(()) => Ok(true),
@@ -268,7 +347,7 @@ impl Db {
     }
 
     fn all_values(&self, table: &'static str) -> Result<Map<String, serde_json::Value>> {
-        let conn = self.pool.get()?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(&format!("SELECT key, value FROM {table}"))?;
         let rows = stmt.query_map([], |row| {
             let key: String = row.get(0)?;
@@ -295,7 +374,7 @@ impl Db {
         key: impl AsRef<str>,
         op: impl FnOnce(&Option<T>) -> Option<T>,
     ) -> Result<Option<T>> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
 
         let value = tx.query_row::<Option<T>, _, _>(
@@ -479,30 +558,42 @@ mod tests {
     fn file_pool_starts_small_and_grows_for_concurrent_checkouts() {
         let tempdir = tempfile::tempdir().unwrap();
         let db = Db::open(&tempdir.path().join("data.sqlite3")).unwrap();
-        assert_eq!(db.pool.state().connections, 1);
-        assert_eq!(db.pool.state().idle_connections, 1);
+        assert_eq!(db.pool().state().connections, 1);
+        assert_eq!(db.pool().state().idle_connections, 1);
 
-        let connections: Vec<_> = (0..POOL_MAX_SIZE).map(|_| db.pool.get().unwrap()).collect();
-        assert_eq!(db.pool.state().connections, POOL_MAX_SIZE);
-        assert_eq!(db.pool.state().idle_connections, 0);
-        assert!(db.pool.try_get().is_none());
+        let connections: Vec<_> = (0..POOL_MAX_SIZE).map(|_| db.pool().get().unwrap()).collect();
+        assert_eq!(db.pool().state().connections, POOL_MAX_SIZE);
+        assert_eq!(db.pool().state().idle_connections, 0);
+        assert!(db.pool().try_get().is_none());
         drop(connections);
     }
 
     #[test]
-    fn light_pool_opens_connections_on_demand_and_keeps_none_idle() {
+    fn direct_storage_works_without_a_pool_and_persists_across_connections() {
         let tempdir = tempfile::tempdir().unwrap();
-        let db = Db::open_pool(
-            &tempdir.path().join("data.sqlite3"),
-            std::time::Duration::from_secs(60),
-            true,
-        )
-        .unwrap();
-        assert_eq!(db.pool.min_idle(), Some(0));
-        assert_eq!(db.pool.state().connections, 0);
+        let path = tempdir.path().join("data.sqlite3");
+        let db = Db::open_direct(&path).unwrap();
+        assert!(matches!(db.backend, Backend::Direct(_)));
         db.migrate().unwrap();
         db.set_state_value("light", true).unwrap();
         assert_eq!(db.get_state_value("light").unwrap(), Some(serde_json::json!(true)));
+        // Every call above used its own connection; a pool reads what they wrote.
+        let pooled = Db::open(&path).unwrap();
+        assert_eq!(pooled.get_state_value("light").unwrap(), Some(serde_json::json!(true)));
+    }
+
+    #[test]
+    fn direct_storage_does_not_recreate_a_removed_data_directory() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let dir = tempdir.path().join("fastab");
+        let db = Db::open_direct(&dir.join("data.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(db.set_state_value("after", true).is_err());
+        assert!(
+            !dir.exists(),
+            "an fterm left running by uninstall must not bring the directory back"
+        );
     }
 
     #[test]
@@ -516,7 +607,7 @@ mod tests {
         db.migrate().unwrap();
         db.set_state_value("retained", "before").unwrap();
 
-        let mut connections: Vec<_> = (0..POOL_MAX_SIZE).map(|_| db.pool.get().unwrap()).collect();
+        let mut connections: Vec<_> = (0..POOL_MAX_SIZE).map(|_| db.pool().get().unwrap()).collect();
         let mut held = connections.pop().unwrap();
         let transaction = held.transaction().unwrap();
         transaction
@@ -532,7 +623,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let state = db.pool.state();
+            let state = db.pool().state();
             if state.connections == 2 && state.idle_connections == 1 {
                 break;
             }
@@ -696,7 +787,7 @@ mod tests {
         let db = mock();
 
         // assert migration count is correct
-        let max_migration = max_migration_version(&&*db.pool.get().unwrap());
+        let max_migration = max_migration_version(&&*db.pool().get().unwrap());
         assert_eq!(max_migration, Some(MIGRATIONS.len() as i64 - 1));
     }
 

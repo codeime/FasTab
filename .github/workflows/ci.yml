@@ -216,6 +216,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 --color always -- -D warnings
 
+      # The desktop's system-allocator build is its A/B and rollback path; lint
+      # it too, or that cfg branch stops compiling unnoticed.
+      - name: Clippy (desktop, system allocator)
+        run: cargo clippy --locked -p fastab_desktop --features system-allocator --color always -- -D warnings
+
       # The engine's typed-hook provenance tests verify the checked-in
       # reference baselines against the compiled bundle/specs-ir pair, which is
       # gitignored. Compile it here exactly as build-app.sh does.
@@ -289,6 +294,29 @@ jobs:
       - name: Build release binaries (dist profile)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo build --locked --profile dist -p fastab_desktop -p fastab_term -p fastab_cli -p fastab_input_method
+
+      # This is the shipped configuration (strip = "symbols", all four packages
+      # in one build), so check here that it still leaves a dSYM per binary
+      # for the release to attach, and that libmimalloc-sys still builds its C
+      # code as release: it defines NDEBUG only when its build script sees
+      # DEBUG=false, which cc also reads to decide on `-g`, so debug sections in
+      # libmimalloc.a mean the dist profile's line tables reached it.
+      - name: Check dSYMs and the mimalloc release build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          ./scripts/collect-dsyms.sh target/dist-dSYMs \
+            target/dist/fastab target/dist/ftab target/dist/fterm target/dist/fastab_input_method
+          libs=(target/dist/build/libmimalloc-sys-*/out/libmimalloc.a)
+          if [ ! -f "${libs[0]}" ]; then
+            echo "::error::the dist build left no libmimalloc.a" >&2
+            exit 1
+          fi
+          lib="$(ls -t "${libs[@]}" | head -1)"
+          if otool -l "$lib" | grep -q __debug_info; then
+            echo "::error::${lib} has debug info: libmimalloc-sys saw DEBUG=true and built mimalloc without NDEBUG" >&2
+            exit 1
+          fi
 
       # One fterm stays resident per terminal tab. It binds nothing outside
       # libSystem; a framework link that comes back costs every tab its

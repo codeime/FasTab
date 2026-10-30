@@ -2424,6 +2424,7 @@ dependencies = [
  "image",
  "libc",
  "macos-utils",
+ "mimalloc",
  "muda",
  "nix 0.31.3",
  "notify",

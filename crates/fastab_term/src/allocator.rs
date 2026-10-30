@@ -1,9 +1,15 @@
-//! fterm's global allocator.
+//! The global allocator of the two resident processes: fterm, and the desktop
+//! app, which compiles this file by `#[path]`.
 //!
 //! One fterm stays resident per terminal tab, so its allocator overhead is
-//! paid once per tab. mimalloc is the default; the `system-allocator` feature
-//! swaps in the system allocator so CI can measure both builds side by side
-//! (`scripts/fterm-footprint-ab.py`).
+//! paid once per tab. The desktop's Rust allocations are mostly transient
+//! (completion engine, GPUI frames); under the system allocator they shared
+//! pages with AppKit and CoreText caches that live forever, and about half the
+//! malloc zone stayed dirty as fragmentation after each session. mimalloc
+//! keeps each thread's allocations on its own pages and returns pages that
+//! empty out. mimalloc is the default; each crate's `system-allocator` feature
+//! swaps in the system allocator so both builds can be measured side by side
+//! (`scripts/fterm-footprint-ab.py` for fterm).
 
 #[cfg(not(feature = "system-allocator"))]
 #[global_allocator]
@@ -12,7 +18,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// mimalloc reserves 1 GiB per arena and keeps the arena's bitmaps in its
 /// first pages. A handful of set bits per 16 KiB page dirtied ~170 KB of every
 /// fterm, whose whole heap is ~3 MB. 32 MiB arenas keep that to a page or two;
-/// mimalloc reserves another arena if one ever fills.
+/// mimalloc reserves another arena if one ever fills, which the desktop's
+/// peaks may.
 #[cfg(all(target_os = "macos", not(feature = "system-allocator")))]
 mod arena_reserve {
     use std::ffi::{c_int, c_long};

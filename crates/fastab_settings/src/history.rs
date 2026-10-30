@@ -5,8 +5,6 @@ use std::time::SystemTime;
 
 use fastab_util::directories;
 use inner::Inner;
-use r2d2::PooledConnection;
-use r2d2_sqlite::SqliteConnectionManager;
 pub use rusqlite;
 use rusqlite::params;
 use rusqlite::types::ValueRef;
@@ -14,7 +12,7 @@ use serde_json::Value;
 use tracing::trace;
 
 use crate::Result;
-use crate::sqlite::{Db, database};
+use crate::sqlite::{Db, DbConnection, database};
 
 const ALL_COLUMNS: &str = "id, command, shell, pid, session_id, cwd, start_time, duration, hostname, exit_code";
 
@@ -83,8 +81,8 @@ impl History {
         }
     }
 
-    fn conn(&self) -> Result<PooledConnection<SqliteConnectionManager>> {
-        Ok(self.db()?.pool.get()?)
+    fn conn(&self) -> Result<DbConnection> {
+        self.db()?.conn()
     }
 
     pub fn insert_command_history(&self, command_info: &CommandInfo, legacy: bool) -> Result<()> {

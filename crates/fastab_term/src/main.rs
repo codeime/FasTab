@@ -1,4 +1,5 @@
 mod allocator;
+mod child_exit;
 #[cfg(target_os = "linux")]
 mod cleanup;
 pub mod cli;
@@ -892,14 +893,13 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
         logger::stdio_debug_log(format!("Parent pid: {pid}"));
     }
 
-    let mut child = pty.slave.spawn_command(command)?;
+    let child = pty.slave.spawn_command(command)?;
     info!("Shell: {:?}", child.process_id());
     if let Some(pid) = child.process_id() {
         logger::stdio_debug_log(format!("Child pid: {pid}"));
     }
 
     let (child_tx, mut child_rx) = oneshot::channel();
-    std::thread::spawn(move || child_tx.send(child.wait()));
 
     info!("Pid: {}", Pid::current());
     info!("Pty name: {pty_name}");
@@ -917,6 +917,12 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
             format!("{PTY_BINARY_NAME}-runtime-worker-{id}")
         })
         .build()?;
+
+    // On the reactor, so no thread sits in waitpid for the life of the tab.
+    {
+        let _runtime = runtime.enter();
+        child_exit::watch(child, child_tx);
+    }
 
     let runtime_result = runtime.block_on(async {
         update::check_for_update(&context);
@@ -1403,9 +1409,9 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 
 fn main() {
     // One fterm stays resident per terminal tab; it reads a few keys at
-    // startup and writes a history row per command. Do not keep r2d2's three
-    // maintenance threads and an idle SQLite connection alive in every tab.
-    fastab_settings::sqlite::prefer_light_pool();
+    // startup and writes a history row per command. No pool: no maintenance
+    // thread, no 30 s reaper wakeup, and no SQLite connection open between uses.
+    fastab_settings::sqlite::prefer_direct_connections();
     let cli = Cli::parse();
     let command = cli.command.as_deref();
 
