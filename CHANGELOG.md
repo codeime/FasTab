@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.21
+
+- change: each terminal tab uses about a third less memory, roughly 1.2 MB less per tab. The terminal process now uses the system memory allocator instead of mimalloc, which held about 2 MB for a tab that needs well under 1 MB.
+- fix: the desktop app is back on the system memory allocator. The switch to mimalloc in v0.0.20 did not give memory back as that entry said; measured on an installed build, it held several megabytes more after use.
+
 ## v0.0.20
 
 - change: the desktop app should give memory back to the system after completions. Its own allocations now use mimalloc, so short-lived completion and drawing work no longer shares memory pages with what macOS frameworks keep for the life of the app; on v0.0.19 that left about 12 MB held but unused after a session. The app also runs three fewer idle threads.
